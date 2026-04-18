@@ -1,0 +1,13 @@
+[package]
+name = "hypr-wayland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+calloop.workspace = true
+wayland-server.workspace = true
+hypr-core.workspace = true

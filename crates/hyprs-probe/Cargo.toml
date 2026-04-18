@@ -1,0 +1,13 @@
+[package]
+name = "hyprs-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hyprs-probe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+wayland-client = { workspace = true }

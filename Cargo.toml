@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hypr-core",
+    "crates/hypr-wayland",
+    "crates/hyprs",
+    "crates/hyprs-probe",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/magniff/hyperland-rs"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+calloop = "0.14"
+wayland-server = "0.31"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+
+hypr-core = { path = "crates/hypr-core" }
+hypr-wayland = { path = "crates/hypr-wayland" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
