@@ -14,3 +14,4 @@ khronos-egl.workspace = true
 glow.workspace = true
 libloading.workspace = true
 rustix.workspace = true
+png.workspace = true

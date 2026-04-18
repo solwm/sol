@@ -15,11 +15,14 @@ precision mediump float;
 uniform vec2 u_resolution;
 uniform float u_time;
 void main() {
-    float cell = 32.0 + 16.0 * sin(u_time);
+    // Cell size scales with resolution so it reads the same at 720p / 4K.
+    float cell = (u_resolution.y / 30.0) + 16.0 * sin(u_time);
     vec2 c = floor(gl_FragCoord.xy / cell);
     float on = mod(c.x + c.y, 2.0);
-    vec3 a = vec3(0.90, 0.32, 0.80);  // magenta-ish
-    vec3 b = vec3(0.10, 0.12, 0.16);  // charcoal
+    // Hue tint drifts across X so the image isn't monotone.
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    vec3 a = vec3(0.90, 0.32, 0.80) * (0.6 + 0.4 * uv.x);
+    vec3 b = vec3(0.10, 0.12, 0.16 + 0.15 * uv.y);
     vec3 col = mix(b, a, on);
     gl_FragColor = vec4(col, 1.0);
 }

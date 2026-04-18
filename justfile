@@ -80,6 +80,14 @@ demo-b2: build _prep clean-socket
 drm-info card=drm_card:
     cargo run --bin hyprs-drm-smoke -- info {{card}}
 
+# B3 gpu: render the checkerboard shader offscreen via GBM+EGL+GLES and write
+# the result to a PNG. Works from inside a live Wayland session because it
+# doesn't need DRM master — validates the whole GPU path that demo-b3 relies on.
+demo-b3-gpu card=drm_card out="/tmp/hyprs-gpu.png": build
+    cargo run --release --bin hyprs-drm-smoke -- gpu-render {{card}} {{out}}
+    @file {{out}}
+    @echo "tip: feh {{out}}  (or xdg-open)"
+
 # B3 demo: full DRM/GBM/GLES smoke test on a given card for N seconds.
 # MUST be run from a free TTY (Ctrl+Alt+F2..F6) — Hyprland holds DRM master
 # on the active VT. Prints a clear error if master can't be acquired.

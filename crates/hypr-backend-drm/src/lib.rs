@@ -356,6 +356,79 @@ pub fn run_smoke_test(
     Ok(())
 }
 
+/// Render a checkerboard frame via GBM+EGL+GLES2 without DRM master, read
+/// pixels back with glReadPixels, and write them to a PNG. Lets us prove the
+/// GPU path works (on the same hardware that would eventually scan out) while
+/// the actual compositor still holds master.
+pub fn run_offscreen_render(
+    device: &Path,
+    out_path: &Path,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    use glow::HasContext;
+
+    let card = Card::open(device)?;
+    // NB: no acquire_master_lock — offscreen render doesn't need it.
+
+    let gl_stack = GlStack::new(card, width, height)?;
+    let program = shader::build_checkerboard(&gl_stack.gl)?;
+
+    // One frame, t picked so we're clearly in the animated region.
+    draw_checkerboard(&gl_stack, &program, width as i32, height as i32, 2.5);
+    // Force the driver to actually submit before we read.
+    unsafe { gl_stack.gl.finish() };
+
+    let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+    unsafe {
+        gl_stack.gl.read_pixels(
+            0,
+            0,
+            width as i32,
+            height as i32,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(&mut pixels),
+        );
+    }
+    // GL origin is bottom-left; PNG is top-left, so flip row order.
+    flip_rows_rgba(&mut pixels, width as usize, height as usize);
+
+    // Also swap the GBM surface once so the driver isn't left with any
+    // half-scheduled work; ignore errors.
+    let _ = gl_stack
+        .egl
+        .swap_buffers(gl_stack.display, gl_stack.surface);
+
+    let file = std::fs::File::create(out_path)
+        .with_context(|| format!("create {}", out_path.display()))?;
+    let mut enc = png::Encoder::new(file, width, height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .context("png header")?
+        .write_image_data(&pixels)
+        .context("png write")?;
+    tracing::info!(
+        path = %out_path.display(),
+        width,
+        height,
+        "offscreen render written"
+    );
+    Ok(())
+}
+
+fn flip_rows_rgba(buf: &mut [u8], w: usize, h: usize) {
+    let stride = w * 4;
+    for y in 0..(h / 2) {
+        let top = y * stride;
+        let bot = (h - 1 - y) * stride;
+        for i in 0..stride {
+            buf.swap(top + i, bot + i);
+        }
+    }
+}
+
 fn clear_magenta(stack: &GlStack) {
     use glow::HasContext;
     unsafe {

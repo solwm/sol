@@ -283,6 +283,7 @@ dependencies = [
  "glow",
  "khronos-egl",
  "libloading",
+ "png",
  "rustix 0.38.44",
  "thiserror",
  "tracing",

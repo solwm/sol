@@ -1,8 +1,9 @@
 //! CLI wrapper around `hypr_backend_drm`.
 //!
-//! Two modes:
-//!   hyprs-drm-smoke info [DEVICE]        # list connectors/modes, no master
-//!   hyprs-drm-smoke run  [DEVICE] [SECS] # full modeset + render loop
+//! Three modes:
+//!   hyprs-drm-smoke info       [DEVICE]           # list connectors/modes (no master)
+//!   hyprs-drm-smoke gpu-render [DEVICE] [OUT]     # GBM+EGL+GLES offscreen -> PNG (no master)
+//!   hyprs-drm-smoke run        [DEVICE] [SECS]    # full modeset + render loop (needs free VT)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,15 @@ fn main() -> Result<()> {
 
     match mode.as_str() {
         "info" => hypr_backend_drm::describe_device(&device).context("describe_device"),
+        "gpu-render" => {
+            let out = args
+                .next()
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HYPRS_DRM_GPU_PNG").map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/tmp/hyprs-gpu.png"));
+            hypr_backend_drm::run_offscreen_render(&device, &out, 1280, 720)
+                .context("offscreen render")
+        }
         "run" => {
             let seconds: u64 = args
                 .next()
