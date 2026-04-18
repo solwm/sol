@@ -10,4 +10,8 @@ thiserror.workspace = true
 tracing.workspace = true
 calloop.workspace = true
 wayland-server.workspace = true
+wayland-protocols = { workspace = true }
+memmap2.workspace = true
+png.workspace = true
+rustix.workspace = true
 hypr-core.workspace = true

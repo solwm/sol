@@ -1,47 +1,58 @@
-//! Wayland server plumbing for hyperland-rs.
+//! Wayland server for hyperland-rs.
 //!
-//! Block B1: bring up a Wayland display, accept client connections, advertise
-//! the smallest set of globals a real client checks on startup. No surface or
-//! buffer handling yet — that lands in B2.
+//! B2 scope: bring up a Wayland display, accept clients, let them create
+//! wl_shm buffers and map xdg_toplevels, and composite mapped toplevels onto
+//! a headless canvas written to PNG.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use calloop::{
-    EventLoop, Interest, Mode, PostAction,
-    generic::Generic,
-};
+use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
+use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
-    Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
+    Display, DisplayHandle, Resource, Weak,
     backend::{ClientData, ClientId, DisconnectReason, GlobalId},
     protocol::{
-        wl_compositor::{self, WlCompositor},
-        wl_output::{self, WlOutput},
-        wl_seat::{self, WlSeat},
-        wl_shm::{self, WlShm},
-        wl_shm_pool::{self, WlShmPool},
-        wl_surface::{self, WlSurface},
-        wl_region::{self, WlRegion},
+        wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat, wl_shm::WlShm,
+        wl_surface::WlSurface,
     },
 };
 
-mod globals;
+mod compositor;
+mod output;
+mod render;
+mod seat;
+mod shm;
+mod xdg_shell;
 
-/// Versions we advertise for the core globals. Chosen conservatively so a
-/// wide range of clients will bind them. We don't implement every request at
-/// these versions yet; we just stop the client from giving up before we can
-/// observe it.
+use compositor::{SurfaceData, SurfaceRole};
+use render::Canvas;
+
 const COMPOSITOR_VERSION: u32 = 6;
 const SHM_VERSION: u32 = 1;
 const OUTPUT_VERSION: u32 = 4;
 const SEAT_VERSION: u32 = 7;
+const XDG_WM_BASE_VERSION: u32 = 5;
 
-/// Top-level compositor state. Holds the handle clients are bound to and any
-/// global ids we want to be able to tear down later.
+const CANVAS_WIDTH: u32 = output::OUTPUT_WIDTH as u32;
+const CANVAS_HEIGHT: u32 = output::OUTPUT_HEIGHT as u32;
+
+/// Top-level compositor state. Everything globally mutable lives here; it's
+/// what Dispatch impls receive as `&mut self`.
 pub struct State {
     pub display_handle: DisplayHandle,
     pub globals: Globals,
     pub clients_seen: u64,
+    /// Mapped xdg_toplevels in stacking order (bottom to top). Held as weak
+    /// refs so dead surfaces drop out on the next scan.
+    pub mapped_toplevels: Vec<Weak<WlSurface>>,
+    pub canvas: Canvas,
+    pub png_path: PathBuf,
+    pub needs_render: bool,
+    pub started: Instant,
+    pub next_serial: u32,
 }
 
 #[derive(Debug)]
@@ -50,9 +61,19 @@ pub struct Globals {
     pub shm: GlobalId,
     pub output: GlobalId,
     pub seat: GlobalId,
+    pub xdg_wm_base: GlobalId,
 }
 
-/// Per-client data. Logs connect + disconnect so we can watch the socket work.
+impl State {
+    pub fn elapsed_ms(&self) -> u32 {
+        self.started.elapsed().as_millis() as u32
+    }
+    pub fn next_serial(&mut self) -> u32 {
+        self.next_serial = self.next_serial.wrapping_add(1);
+        self.next_serial
+    }
+}
+
 #[derive(Default)]
 pub struct ClientState;
 
@@ -65,8 +86,80 @@ impl ClientData for ClientState {
     }
 }
 
-/// Runs the compositor's main loop. Blocks until the event loop exits or an
-/// unrecoverable error occurs.
+/// Pairs Display + State so calloop callbacks can mutate both.
+pub struct Compositor {
+    pub state: State,
+    pub display: Display<State>,
+}
+
+/// Walk mapped_toplevels, composite each surface's current buffer onto the
+/// canvas, write PNG.
+fn render_and_dump(comp: &mut Compositor) -> Result<()> {
+    comp.state.canvas.clear();
+
+    // Drop any toplevels whose WlSurface has been destroyed.
+    comp.state
+        .mapped_toplevels
+        .retain(|w| w.upgrade().is_ok());
+
+    let mut drawn = 0usize;
+    for weak in comp.state.mapped_toplevels.clone() {
+        let Ok(surface) = weak.upgrade() else {
+            continue;
+        };
+        let Some(sd) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
+            continue;
+        };
+        let sd = sd.lock().unwrap();
+        if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
+            continue;
+        }
+        let Some(buf_weak) = &sd.current.buffer else {
+            continue;
+        };
+        let Ok(buf) = buf_weak.upgrade() else {
+            continue;
+        };
+        let Some(buf_data) = buf.data::<shm::BufferData>() else {
+            continue;
+        };
+        let Some(format) = buf_data.pixel_format() else {
+            tracing::warn!(format = ?buf_data.format, "unsupported format, skipping blit");
+            continue;
+        };
+        let Some(bytes) = buf_data.bytes() else {
+            tracing::warn!("buffer range out of bounds, skipping");
+            continue;
+        };
+        // Simple placement: centre the toplevel on the canvas.
+        let x = (CANVAS_WIDTH as i32 - buf_data.width) / 2;
+        let y = (CANVAS_HEIGHT as i32 - buf_data.height) / 2;
+        comp.state.canvas.blit_argb(
+            x,
+            y,
+            bytes,
+            buf_data.width,
+            buf_data.height,
+            buf_data.stride,
+            format,
+        );
+        // Tell the client its buffer is no longer needed so it can reuse it.
+        buf.release();
+        drawn += 1;
+    }
+
+    comp.state
+        .canvas
+        .write_png(&comp.state.png_path)
+        .with_context(|| format!("write {}", comp.state.png_path.display()))?;
+    tracing::info!(
+        drawn,
+        path = %comp.state.png_path.display(),
+        "rendered frame"
+    );
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let mut event_loop: EventLoop<'static, Compositor> =
         EventLoop::try_new().context("create calloop event loop")?;
@@ -78,6 +171,7 @@ pub fn run() -> Result<()> {
         shm: dh.create_global::<State, WlShm, ()>(SHM_VERSION, ()),
         output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
         seat: dh.create_global::<State, WlSeat, ()>(SEAT_VERSION, ()),
+        xdg_wm_base: dh.create_global::<State, XdgWmBase, ()>(XDG_WM_BASE_VERSION, ()),
     };
     tracing::info!(?globals, "advertised globals");
 
@@ -89,25 +183,23 @@ pub fn run() -> Result<()> {
         .unwrap_or_else(|| "<anonymous>".into());
     tracing::info!(socket = %socket_name, "listening");
 
-    // Accept new client connections on the socket.
+    let png_path = std::env::var_os("HYPRS_PNG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/hyprs-headless.png"));
+    tracing::info!(path = %png_path.display(), "headless PNG output");
+
     event_loop
         .handle()
         .insert_source(
             Generic::new(listener, Interest::READ, Mode::Level),
-            |_readiness, listener, comp| {
+            |_ready, listener, comp| {
                 while let Some(stream) = listener.accept()? {
                     match comp
                         .state
                         .display_handle
                         .insert_client(stream, Arc::new(ClientState))
                     {
-                        Ok(_client) => {
-                            comp.state.clients_seen += 1;
-                            tracing::debug!(
-                                total = comp.state.clients_seen,
-                                "inserted client"
-                            );
-                        }
+                        Ok(_) => comp.state.clients_seen += 1,
                         Err(e) => tracing::warn!(error = %e, "insert_client failed"),
                     }
                 }
@@ -116,13 +208,12 @@ pub fn run() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("insert socket source: {e}"))?;
 
-    // Dispatch Wayland protocol traffic whenever the display fd is readable.
     let display_fd = display.backend().poll_fd().try_clone_to_owned()?;
     event_loop
         .handle()
         .insert_source(
             Generic::new(display_fd, Interest::READ, Mode::Level),
-            |_readiness, _fd, comp| {
+            |_ready, _fd, comp| {
                 comp.display
                     .dispatch_clients(&mut comp.state)
                     .map_err(std::io::Error::other)?;
@@ -134,242 +225,37 @@ pub fn run() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("insert display source: {e}"))?;
 
-    let mut compositor = Compositor {
-        state: State {
-            display_handle: dh,
-            globals,
-            clients_seen: 0,
-        },
-        display,
+    let state = State {
+        display_handle: dh,
+        globals,
+        clients_seen: 0,
+        mapped_toplevels: Vec::new(),
+        canvas: Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT),
+        png_path,
+        needs_render: false,
+        started: Instant::now(),
+        next_serial: 0,
     };
-
-    // Flush once so already-bound clients see initial events (e.g. globals).
+    let mut compositor = Compositor { state, display };
     let _ = compositor.display.flush_clients();
 
     tracing::info!(
-        "run: set WAYLAND_DISPLAY={} to connect a client",
+        socket = %socket_name,
+        "ready: export WAYLAND_DISPLAY={} and run a client",
         socket_name
     );
 
     event_loop
         .run(None, &mut compositor, |comp| {
+            if comp.state.needs_render {
+                comp.state.needs_render = false;
+                if let Err(e) = render_and_dump(comp) {
+                    tracing::error!(error = %e, "render failed");
+                }
+            }
             let _ = comp.display.flush_clients();
         })
         .context("event loop errored")?;
 
     Ok(())
-}
-
-/// Pairs the `Display` and mutable `State` so calloop callbacks can touch
-/// both through a single generic parameter.
-pub struct Compositor {
-    pub state: State,
-    pub display: Display<State>,
-}
-
-// --- protocol impls: stubs at B1 ----------------------------------------------
-//
-// At this block we only care that clients *bind* these globals without error.
-// The request handlers log and otherwise do nothing useful. Real behaviour
-// lands in later blocks.
-
-impl GlobalDispatch<WlCompositor, ()> for State {
-    fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<WlCompositor>,
-        _global_data: &(),
-        init: &mut DataInit<'_, Self>,
-    ) {
-        let r = init.init(resource, ());
-        tracing::info!(id = ?r.id(), "bind wl_compositor");
-    }
-}
-
-impl Dispatch<WlCompositor, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlCompositor,
-        request: wl_compositor::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        init: &mut DataInit<'_, Self>,
-    ) {
-        match request {
-            wl_compositor::Request::CreateSurface { id } => {
-                let _ = init.init(id, ());
-                tracing::debug!("wl_compositor.create_surface (stub)");
-            }
-            wl_compositor::Request::CreateRegion { id } => {
-                let _ = init.init(id, ());
-                tracing::debug!("wl_compositor.create_region (stub)");
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<WlSurface, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlSurface,
-        request: wl_surface::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
-    ) {
-        tracing::trace!(?request, "wl_surface request (ignored at B1)");
-    }
-}
-
-impl Dispatch<WlRegion, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlRegion,
-        request: wl_region::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
-    ) {
-        tracing::trace!(?request, "wl_region request (ignored at B1)");
-    }
-}
-
-impl GlobalDispatch<WlShm, ()> for State {
-    fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<WlShm>,
-        _global_data: &(),
-        init: &mut DataInit<'_, Self>,
-    ) {
-        let shm = init.init(resource, ());
-        // Advertise the two mandatory formats; that's all libwayland clients
-        // typically check on init.
-        shm.format(wl_shm::Format::Argb8888);
-        shm.format(wl_shm::Format::Xrgb8888);
-        tracing::info!(id = ?shm.id(), "bind wl_shm");
-    }
-}
-
-impl Dispatch<WlShm, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlShm,
-        request: wl_shm::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        init: &mut DataInit<'_, Self>,
-    ) {
-        if let wl_shm::Request::CreatePool { id, fd: _, size: _ } = request {
-            let _ = init.init(id, ());
-            tracing::debug!("wl_shm.create_pool (stub)");
-        }
-    }
-}
-
-impl Dispatch<WlShmPool, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlShmPool,
-        request: wl_shm_pool::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
-    ) {
-        tracing::trace!(?request, "wl_shm_pool request (ignored at B1)");
-    }
-}
-
-impl GlobalDispatch<WlOutput, ()> for State {
-    fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<WlOutput>,
-        _global_data: &(),
-        init: &mut DataInit<'_, Self>,
-    ) {
-        let output = init.init(resource, ());
-        // Send a minimal but realistic set of events so clients don't panic.
-        output.geometry(
-            0,
-            0,
-            300,
-            200,
-            wl_output::Subpixel::Unknown,
-            "hyperland-rs".into(),
-            "headless-0".into(),
-            wl_output::Transform::Normal,
-        );
-        output.mode(
-            wl_output::Mode::Current | wl_output::Mode::Preferred,
-            1920,
-            1080,
-            60_000,
-        );
-        if output.version() >= 2 {
-            output.scale(1);
-            output.done();
-        }
-        if output.version() >= 4 {
-            output.name("HEADLESS-0".into());
-            output.description("hyperland-rs B1 stub output".into());
-        }
-        tracing::info!(id = ?output.id(), "bind wl_output");
-    }
-}
-
-impl Dispatch<WlOutput, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlOutput,
-        request: wl_output::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
-    ) {
-        tracing::trace!(?request, "wl_output request (ignored at B1)");
-    }
-}
-
-impl GlobalDispatch<WlSeat, ()> for State {
-    fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<WlSeat>,
-        _global_data: &(),
-        init: &mut DataInit<'_, Self>,
-    ) {
-        let seat = init.init(resource, ());
-        // No capabilities yet — we haven't wired libinput.
-        seat.capabilities(wl_seat::Capability::empty());
-        if seat.version() >= 2 {
-            seat.name("seat0".into());
-        }
-        tracing::info!(id = ?seat.id(), "bind wl_seat");
-    }
-}
-
-impl Dispatch<WlSeat, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &WlSeat,
-        request: wl_seat::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
-    ) {
-        tracing::trace!(?request, "wl_seat request (ignored at B1)");
-    }
 }

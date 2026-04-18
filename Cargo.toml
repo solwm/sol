@@ -5,6 +5,7 @@ members = [
     "crates/hypr-wayland",
     "crates/hyprs",
     "crates/hyprs-probe",
+    "crates/hyprs-paint",
 ]
 
 [workspace.package]
@@ -22,7 +23,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 calloop = "0.14"
 wayland-server = "0.31"
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["server", "client", "staging", "unstable"] }
+memmap2 = "0.9"
+png = "0.17"
+rustix = { version = "0.38", features = ["fs", "mm"] }
 
 hypr-core = { path = "crates/hypr-core" }
 hypr-wayland = { path = "crates/hypr-wayland" }

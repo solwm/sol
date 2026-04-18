@@ -1,0 +1,16 @@
+[package]
+name = "hyprs-paint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hyprs-paint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+wayland-client.workspace = true
+wayland-protocols = { workspace = true }
+rustix.workspace = true
+memmap2.workspace = true
