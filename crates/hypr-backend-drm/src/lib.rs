@@ -1,0 +1,412 @@
+//! DRM/KMS + GBM + EGL/GLES smoke test for block B3.
+//!
+//! Opens a DRM card, selects a connected output, brings up a GBM surface and
+//! a GLES2 EGL context on it, then runs a render loop that clears to magenta
+//! for the first second and draws an animated checkerboard for the rest,
+//! using drmModePageFlip for vsynced presentation.
+//!
+//! Must run from a VT where nothing else holds DRM master. Switch to a free
+//! TTY (Ctrl+Alt+F2..F6) before running.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::os::fd::{AsFd, BorrowedFd};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use drm::Device as BasicDevice;
+use drm::control::{
+    Device as ControlDevice, Event, ModeTypeFlags, PageFlipFlags, connector,
+    framebuffer,
+};
+use gbm::{AsRaw, BufferObjectFlags, Format as GbmFormat};
+use khronos_egl as egl;
+use rustix::event::{PollFd, PollFlags, poll};
+
+mod shader;
+
+const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
+
+/// Wrapper that makes `File` satisfy drm-rs's trait set. drm-rs relies on
+/// implementors to provide an FD and lets the traits dispatch ioctls.
+#[derive(Debug, Clone)]
+pub struct Card(Arc<File>);
+
+impl Card {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        Ok(Card(Arc::new(file)))
+    }
+}
+impl AsFd for Card {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+impl BasicDevice for Card {}
+impl ControlDevice for Card {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OutputSelection {
+    pub connector: connector::Handle,
+    pub crtc: drm::control::crtc::Handle,
+    pub mode: drm::control::Mode,
+}
+
+/// Describe what's connected without touching master. Safe to run while
+/// another compositor (Hyprland, whatever) holds DRM master on the same VT.
+pub fn describe_device(device: &Path) -> Result<()> {
+    let card = Card::open(device)?;
+    let res = card.resource_handles().context("resource_handles")?;
+
+    println!("device: {}", device.display());
+    println!("  connectors: {}", res.connectors().len());
+    println!("  encoders:   {}", res.encoders().len());
+    println!("  crtcs:      {}", res.crtcs().len());
+
+    for &h in res.connectors() {
+        let conn = match card.get_connector(h, false) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("  connector {h:?}: <get_connector failed: {e}>");
+                continue;
+            }
+        };
+        println!(
+            "  connector {:?}: {:?} state={:?} modes={}",
+            h,
+            conn.interface(),
+            conn.state(),
+            conn.modes().len()
+        );
+        if conn.state() == connector::State::Connected {
+            for (i, m) in conn.modes().iter().enumerate().take(3) {
+                let (w, h) = m.size();
+                println!(
+                    "    mode[{i}]: {w}x{h}@{hz} {flags}",
+                    hz = m.vrefresh(),
+                    flags = if m.mode_type().contains(ModeTypeFlags::PREFERRED) {
+                        "(preferred)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            if conn.modes().len() > 3 {
+                println!("    ... {} more mode(s)", conn.modes().len() - 3);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn pick_output(card: &Card) -> Result<OutputSelection> {
+    let res = card.resource_handles().context("resource_handles")?;
+
+    for &connector_h in res.connectors() {
+        let conn = card
+            .get_connector(connector_h, false)
+            .with_context(|| format!("get_connector {connector_h:?}"))?;
+        if conn.state() != connector::State::Connected {
+            continue;
+        }
+        if conn.modes().is_empty() {
+            continue;
+        }
+        // Preferred mode > first mode.
+        let mode = conn
+            .modes()
+            .iter()
+            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .copied()
+            .unwrap_or_else(|| conn.modes()[0]);
+
+        // Find a CRTC that works with this connector's encoder.
+        let encoders = conn.encoders().to_vec();
+        for enc_h in encoders {
+            let enc = match card.get_encoder(enc_h) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let compatible_crtcs = res.filter_crtcs(enc.possible_crtcs());
+            if let Some(&crtc_h) = compatible_crtcs.first() {
+                tracing::info!(
+                    connector = ?conn.interface(),
+                    width = mode.size().0,
+                    height = mode.size().1,
+                    vrefresh = mode.vrefresh(),
+                    "selected output"
+                );
+                return Ok(OutputSelection {
+                    connector: connector_h,
+                    crtc: crtc_h,
+                    mode,
+                });
+            }
+        }
+    }
+    bail!("no connected connector with a usable CRTC found")
+}
+
+/// Wraps a `khronos_egl::DynamicInstance`, GBM surface, EGL display/context/
+/// surface, and a `glow::Context`. Holds everything alive for the duration of
+/// the smoke test.
+pub struct GlStack {
+    pub egl: egl::DynamicInstance<egl::EGL1_5>,
+    pub display: egl::Display,
+    pub context: egl::Context,
+    pub surface: egl::Surface,
+    pub gl: glow::Context,
+    pub gbm: gbm::Device<Card>,
+    pub gbm_surface: gbm::Surface<()>,
+}
+
+impl GlStack {
+    pub fn new(card: Card, width: u32, height: u32) -> Result<Self> {
+        let egl = unsafe {
+            egl::DynamicInstance::<egl::EGL1_5>::load_required()
+                .map_err(|e| anyhow!("load libEGL (need EGL 1.5): {e:?}"))?
+        };
+
+        let gbm = gbm::Device::new(card).context("gbm::Device::new")?;
+        let gbm_surface = gbm
+            .create_surface::<()>(
+                width,
+                height,
+                GbmFormat::Xrgb8888,
+                BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+            )
+            .context("create gbm surface")?;
+
+        // EGL_PLATFORM_GBM_KHR platform display.
+        let raw_gbm = gbm.as_raw() as *mut std::ffi::c_void;
+        let display = unsafe {
+            egl.get_platform_display(EGL_PLATFORM_GBM_KHR, raw_gbm, &[egl::ATTRIB_NONE])
+                .map_err(|e| anyhow!("get_platform_display: {e:?}"))?
+        };
+        let (major, minor) = egl
+            .initialize(display)
+            .map_err(|e| anyhow!("eglInitialize: {e:?}"))?;
+        tracing::info!(major, minor, "EGL initialized");
+        egl.bind_api(egl::OPENGL_ES_API)
+            .map_err(|e| anyhow!("bind_api: {e:?}"))?;
+
+        let config_attrs = [
+            egl::SURFACE_TYPE,
+            egl::WINDOW_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            0,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES2_BIT,
+            egl::NONE,
+        ];
+        let config = egl
+            .choose_first_config(display, &config_attrs)
+            .map_err(|e| anyhow!("choose config: {e:?}"))?
+            .ok_or_else(|| anyhow!("no matching EGL config"))?;
+
+        let ctx_attrs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+        let context = egl
+            .create_context(display, config, None, &ctx_attrs)
+            .map_err(|e| anyhow!("create_context: {e:?}"))?;
+
+        let raw_gbm_surface = gbm_surface.as_raw() as *mut std::ffi::c_void;
+        let surface = unsafe {
+            egl.create_window_surface(display, config, raw_gbm_surface, None)
+                .map_err(|e| anyhow!("create_window_surface: {e:?}"))?
+        };
+
+        egl.make_current(display, Some(surface), Some(surface), Some(context))
+            .map_err(|e| anyhow!("make_current: {e:?}"))?;
+
+        let gl = unsafe {
+            glow::Context::from_loader_function(|s| {
+                egl.get_proc_address(s)
+                    .map(|p| p as *const _)
+                    .unwrap_or(std::ptr::null())
+            })
+        };
+
+        Ok(Self {
+            egl,
+            display,
+            context,
+            surface,
+            gl,
+            gbm,
+            gbm_surface,
+        })
+    }
+}
+
+/// Run the smoke test. Blocks until the duration elapses or the `should_quit`
+/// flag flips.
+pub fn run_smoke_test(
+    device: &Path,
+    duration: Duration,
+    should_quit: Arc<AtomicBool>,
+) -> Result<()> {
+    let card = Card::open(device)?;
+
+    if let Err(e) = card.acquire_master_lock() {
+        tracing::warn!(error = ?e, "DRM_IOCTL_SET_MASTER failed — is another compositor on this VT?");
+        return Err(anyhow!(
+            "could not become DRM master on {}: {e:?}\n\
+             \n\
+             You're likely trying to run from the same VT as Hyprland (or any other\n\
+             compositor). Switch to a free TTY (Ctrl+Alt+F2..F6), log in there, and\n\
+             run the demo again.",
+            device.display()
+        ));
+    }
+
+    let sel = pick_output(&card)?;
+    let (w, h) = sel.mode.size();
+    let w = w as u32;
+    let h = h as u32;
+
+    let mut gl_stack = GlStack::new(card.clone(), w, h)?;
+    let program = shader::build_checkerboard(&gl_stack.gl)?;
+
+    // Pre-render + swap one frame so the GBM surface has a front buffer we
+    // can use for the initial modeset.
+    clear_magenta(&gl_stack);
+    gl_stack
+        .egl
+        .swap_buffers(gl_stack.display, gl_stack.surface)
+        .map_err(|e| anyhow!("initial swap: {e:?}"))?;
+
+    let mut fb_cache: HashMap<usize, framebuffer::Handle> = HashMap::new();
+    let first_fb = lock_and_register(&card, &mut gl_stack.gbm_surface, &mut fb_cache)?;
+
+    card.set_crtc(
+        sel.crtc,
+        Some(first_fb),
+        (0, 0),
+        &[sel.connector],
+        Some(sel.mode),
+    )
+    .context("set_crtc (initial modeset)")?;
+    tracing::info!("modeset done; beginning render loop");
+
+    let start = Instant::now();
+    let mut pending_flip: Option<(framebuffer::Handle,)> = None;
+    let mut last_front: Option<gbm::BufferObject<()>> = None;
+    let mut frame = 0u64;
+
+    while start.elapsed() < duration && !should_quit.load(Ordering::SeqCst) {
+        let t = start.elapsed().as_secs_f32();
+        if t < 1.0 {
+            clear_magenta(&gl_stack);
+        } else {
+            draw_checkerboard(&gl_stack, &program, w as i32, h as i32, t);
+        }
+
+        gl_stack
+            .egl
+            .swap_buffers(gl_stack.display, gl_stack.surface)
+            .map_err(|e| anyhow!("swap_buffers: {e:?}"))?;
+
+        let fb = lock_and_register(&card, &mut gl_stack.gbm_surface, &mut fb_cache)?;
+        card.page_flip(sel.crtc, fb, PageFlipFlags::EVENT, None)
+            .context("page_flip")?;
+
+        // Wait for flip event.
+        let mut pfd = [PollFd::new(&card, PollFlags::IN)];
+        let _ = poll(&mut pfd, 1000);
+        if let Ok(events) = card.receive_events() {
+            for event in events {
+                if matches!(event, Event::PageFlip(_)) {
+                    // previous front buffer can now be released back to the GBM pool
+                    last_front.take();
+                }
+            }
+        }
+        let _ = pending_flip.insert((fb,));
+
+        // The current front buffer (behind the flip) is held by the GBM
+        // surface; when we lock_front_buffer again next iteration, the
+        // previous bo is released automatically. We just need to keep a
+        // reference to *this* front until the next flip confirms.
+        last_front = Some(unsafe { gl_stack.gbm_surface.lock_front_buffer() }?);
+
+        frame += 1;
+        if frame.is_multiple_of(60) {
+            tracing::info!(frame, "rendered");
+        }
+    }
+
+    // Don't bother restoring the previous CRTC — kernel revokes our master
+    // when the fd closes, and whatever compositor we came from will re-modeset
+    // the next time it's foregrounded.
+    tracing::info!(frames = frame, "smoke test complete");
+    Ok(())
+}
+
+fn clear_magenta(stack: &GlStack) {
+    use glow::HasContext;
+    unsafe {
+        stack.gl.clear_color(1.0, 0.0, 1.0, 1.0);
+        stack.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+}
+
+fn draw_checkerboard(
+    stack: &GlStack,
+    program: &shader::CheckerProgram,
+    w: i32,
+    h: i32,
+    t: f32,
+) {
+    use glow::HasContext;
+    unsafe {
+        stack.gl.viewport(0, 0, w, h);
+        stack.gl.clear_color(0.05, 0.05, 0.08, 1.0);
+        stack.gl.clear(glow::COLOR_BUFFER_BIT);
+
+        stack.gl.use_program(Some(program.program));
+        stack.gl.uniform_2_f32(Some(&program.u_resolution), w as f32, h as f32);
+        stack.gl.uniform_1_f32(Some(&program.u_time), t);
+        stack.gl.bind_buffer(glow::ARRAY_BUFFER, Some(program.vbo));
+        stack.gl.enable_vertex_attrib_array(0);
+        stack
+            .gl
+            .vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+        stack.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        stack.gl.disable_vertex_attrib_array(0);
+    }
+}
+
+fn lock_and_register(
+    card: &Card,
+    gbm_surface: &mut gbm::Surface<()>,
+    cache: &mut HashMap<usize, framebuffer::Handle>,
+) -> Result<framebuffer::Handle> {
+    let bo = unsafe { gbm_surface.lock_front_buffer() }.context("lock_front_buffer")?;
+    // GBM reuses the same underlying bo pointer across lock cycles, so the raw
+    // pointer makes a stable identity key for our fb cache.
+    let key = bo.as_raw() as usize;
+    if let Some(fb) = cache.get(&key).copied() {
+        std::mem::forget(bo);
+        return Ok(fb);
+    }
+    let fb = card
+        .add_framebuffer(&bo, 24, 32)
+        .context("add_framebuffer")?;
+    cache.insert(key, fb);
+    std::mem::forget(bo);
+    Ok(fb)
+}

@@ -1,0 +1,16 @@
+[package]
+name = "hyprs-drm-smoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hyprs-drm-smoke"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ctrlc.workspace = true
+hypr-backend-drm.workspace = true

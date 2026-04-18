@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "crates/hypr-core",
     "crates/hypr-wayland",
+    "crates/hypr-backend-drm",
     "crates/hyprs",
     "crates/hyprs-probe",
     "crates/hyprs-paint",
+    "crates/hyprs-drm-smoke",
 ]
 
 [workspace.package]
@@ -26,7 +28,15 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "client", "staging", "unstable"] }
 memmap2 = "0.9"
 png = "0.17"
-rustix = { version = "0.38", features = ["fs", "mm"] }
+rustix = { version = "0.38", features = ["fs", "mm", "event"] }
+drm = "0.14"
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.14"
+libloading = "0.8"
+ctrlc = "3"
+
+hypr-backend-drm = { path = "crates/hypr-backend-drm" }
 
 hypr-core = { path = "crates/hypr-core" }
 hypr-wayland = { path = "crates/hypr-wayland" }

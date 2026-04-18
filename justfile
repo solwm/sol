@@ -3,6 +3,9 @@ set shell := ["bash", "-cu"]
 runtime := "/tmp/hyprs-run"
 socket  := "wayland-1"
 png     := "/tmp/hyprs-headless.png"
+# AMD card on this box has the monitor attached; card1 is the NVIDIA GPU with
+# no connected outputs. Override with HYPRS_DRM_DEVICE=... if you moved things.
+drm_card := env_var_or_default("HYPRS_DRM_DEVICE", "/dev/dri/card2")
 
 # list recipes
 default:
@@ -72,6 +75,26 @@ demo-b2: build _prep clean-socket
     ls -la {{png}}
     file {{png}}
     echo "tip: 'just view' to open it"
+
+# B3 info: list connectors/modes for the chosen DRM card (safe from inside any session)
+drm-info card=drm_card:
+    cargo run --bin hyprs-drm-smoke -- info {{card}}
+
+# B3 demo: full DRM/GBM/GLES smoke test on a given card for N seconds.
+# MUST be run from a free TTY (Ctrl+Alt+F2..F6) — Hyprland holds DRM master
+# on the active VT. Prints a clear error if master can't be acquired.
+demo-b3 card=drm_card seconds="8": build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    cargo run --release --bin hyprs-drm-smoke -- run {{card}} {{seconds}}
 
 # B2 verification: run demo-b2, then sample four pixels against expected colors
 verify-b2: demo-b2
