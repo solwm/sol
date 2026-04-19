@@ -280,91 +280,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
-name = "hypr-backend-drm"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "drm",
- "gbm",
- "glow",
- "hypr-core",
- "khronos-egl",
- "libloading",
- "png",
- "rustix 0.38.44",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "hypr-core"
-version = "0.0.1"
-dependencies = [
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "hypr-wayland"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "calloop",
- "hypr-backend-drm",
- "hypr-core",
- "input",
- "libc",
- "memmap2",
- "png",
- "rustix 0.38.44",
- "thiserror",
- "tracing",
- "wayland-protocols",
- "wayland-server",
- "xkbcommon",
-]
-
-[[package]]
-name = "hyprs"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "hypr-wayland",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "hyprs-drm-smoke"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "ctrlc",
- "hypr-backend-drm",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "hyprs-paint"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "memmap2",
- "rustix 0.38.44",
- "wayland-client",
- "wayland-protocols",
-]
-
-[[package]]
-name = "hyprs-probe"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "wayland-client",
-]
-
-[[package]]
 name = "input"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -834,6 +749,91 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "voidptr"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "tracing-subscriber",
+ "voidptr-wayland",
+]
+
+[[package]]
+name = "voidptr-backend-drm"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "drm",
+ "gbm",
+ "glow",
+ "khronos-egl",
+ "libloading",
+ "png",
+ "rustix 0.38.44",
+ "thiserror",
+ "tracing",
+ "voidptr-core",
+]
+
+[[package]]
+name = "voidptr-core"
+version = "0.0.1"
+dependencies = [
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "voidptr-drm-smoke"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "tracing",
+ "tracing-subscriber",
+ "voidptr-backend-drm",
+]
+
+[[package]]
+name = "voidptr-paint"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "memmap2",
+ "rustix 0.38.44",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
+name = "voidptr-probe"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "wayland-client",
+]
+
+[[package]]
+name = "voidptr-wayland"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "input",
+ "libc",
+ "memmap2",
+ "png",
+ "rustix 0.38.44",
+ "thiserror",
+ "tracing",
+ "voidptr-backend-drm",
+ "voidptr-core",
+ "wayland-protocols",
+ "wayland-server",
+ "xkbcommon",
+]
 
 [[package]]
 name = "wasm-bindgen"

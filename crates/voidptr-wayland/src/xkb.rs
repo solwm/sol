@@ -49,7 +49,7 @@ impl KeymapState {
         let bytes = text.as_bytes();
         let size = bytes.len() as u32;
 
-        let fd = memfd_create("hyprs-keymap", MemfdFlags::CLOEXEC).context("memfd_create keymap")?;
+        let fd = memfd_create("voidptr-keymap", MemfdFlags::CLOEXEC).context("memfd_create keymap")?;
         ftruncate(&fd, size as u64).context("ftruncate keymap")?;
         {
             // Use the same fd via a File to write; we keep the OwnedFd around.

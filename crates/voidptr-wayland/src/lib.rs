@@ -1,8 +1,8 @@
-//! Wayland server for hyperland-rs.
+//! Wayland server for voidptr.
 //!
 //! Handles protocol traffic in all backends; rendering is delegated to a
 //! `BackendState` value (software canvas -> PNG for headless, or a
-//! `hypr_backend_drm::DrmPresenter` for real hardware).
+//! `voidptr_backend_drm::DrmPresenter` for real hardware).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
-use hypr_backend_drm::DrmPresenter;
-use hypr_core::{Scene, SceneElement};
+use voidptr_backend_drm::DrmPresenter;
+use voidptr_core::{Scene, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
@@ -273,7 +273,7 @@ fn scene_from_buffers<'a>(
         scene.elements.push(SceneElement {
             buffer_key: CURSOR_SCENE_KEY,
             pixels: &cursor.pixels,
-            format: hypr_core::PixelFormat::Argb8888,
+            format: voidptr_core::PixelFormat::Argb8888,
             width: cursor.width,
             height: cursor.height,
             stride: cursor.width * 4,
@@ -696,8 +696,8 @@ pub fn run_drm(device: &Path) -> Result<()> {
 
 /// Back-compat entry: default to headless with the old PNG path.
 pub fn run() -> Result<()> {
-    let png_path = std::env::var_os("HYPRS_PNG_PATH")
+    let png_path = std::env::var_os("VOIDPTR_PNG_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/hyprs-headless.png"));
+        .unwrap_or_else(|| PathBuf::from("/tmp/voidptr-headless.png"));
     run_headless(png_path, 1920, 1080)
 }

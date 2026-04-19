@@ -1,9 +1,9 @@
-//! CLI wrapper around `hypr_backend_drm`.
+//! CLI wrapper around `voidptr_backend_drm`.
 //!
 //! Three modes:
-//!   hyprs-drm-smoke info       [DEVICE]           # list connectors/modes (no master)
-//!   hyprs-drm-smoke gpu-render [DEVICE] [OUT]     # GBM+EGL+GLES offscreen -> PNG (no master)
-//!   hyprs-drm-smoke run        [DEVICE] [SECS]    # full modeset + render loop (needs free VT)
+//!   voidptr-drm-smoke info       [DEVICE]           # list connectors/modes (no master)
+//!   voidptr-drm-smoke gpu-render [DEVICE] [OUT]     # GBM+EGL+GLES offscreen -> PNG (no master)
+//!   voidptr-drm-smoke run        [DEVICE] [SECS]    # full modeset + render loop (needs free VT)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,25 +25,25 @@ fn main() -> Result<()> {
     let device: PathBuf = args
         .next()
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HYPRS_DRM_DEVICE").map(PathBuf::from))
+        .or_else(|| std::env::var_os("VOIDPTR_DRM_DEVICE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/dev/dri/card1"));
 
     match mode.as_str() {
-        "info" => hypr_backend_drm::describe_device(&device).context("describe_device"),
+        "info" => voidptr_backend_drm::describe_device(&device).context("describe_device"),
         "gpu-render" => {
             let out = args
                 .next()
                 .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HYPRS_DRM_GPU_PNG").map(PathBuf::from))
-                .unwrap_or_else(|| PathBuf::from("/tmp/hyprs-gpu.png"));
-            hypr_backend_drm::run_offscreen_render(&device, &out, 1280, 720)
+                .or_else(|| std::env::var_os("VOIDPTR_DRM_GPU_PNG").map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/tmp/voidptr-gpu.png"));
+            voidptr_backend_drm::run_offscreen_render(&device, &out, 1280, 720)
                 .context("offscreen render")
         }
         "run" => {
             let seconds: u64 = args
                 .next()
                 .and_then(|s| s.parse().ok())
-                .or_else(|| std::env::var("HYPRS_DRM_DURATION").ok().and_then(|s| s.parse().ok()))
+                .or_else(|| std::env::var("VOIDPTR_DRM_DURATION").ok().and_then(|s| s.parse().ok()))
                 .unwrap_or(10);
             let should_quit = Arc::new(AtomicBool::new(false));
             {
@@ -55,7 +55,7 @@ fn main() -> Result<()> {
                 seconds,
                 "starting DRM smoke test"
             );
-            if let Err(e) = hypr_backend_drm::run_smoke_test(
+            if let Err(e) = voidptr_backend_drm::run_smoke_test(
                 &device,
                 Duration::from_secs(seconds),
                 should_quit,
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown mode: {other}\nusage: hyprs-drm-smoke [info|run] [DEVICE] [SECS]");
+            eprintln!("unknown mode: {other}\nusage: voidptr-drm-smoke [info|run] [DEVICE] [SECS]");
             std::process::exit(2);
         }
     }

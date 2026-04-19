@@ -1,5 +1,5 @@
 [package]
-name = "hypr-wayland"
+name = "voidptr-wayland"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,8 +14,8 @@ wayland-protocols = { workspace = true }
 memmap2.workspace = true
 png.workspace = true
 rustix.workspace = true
-hypr-core.workspace = true
-hypr-backend-drm.workspace = true
+voidptr-core.workspace = true
+voidptr-backend-drm.workspace = true
 input.workspace = true
 libc.workspace = true
 xkbcommon.workspace = true

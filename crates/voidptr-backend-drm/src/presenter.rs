@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use drm::Device as BasicDevice;
 use drm::control::{Device as ControlDevice, PageFlipFlags, framebuffer};
 use glow::HasContext;
-use hypr_core::{PixelFormat, Scene};
+use voidptr_core::{PixelFormat, Scene};
 
 use crate::{
     Card, GlStack, OutputSelection, get_or_add_fb, pick_output, quad::QuadProgram,
@@ -188,7 +188,7 @@ impl DrmPresenter {
 fn upload_texture(
     gl: &glow::Context,
     textures: &mut HashMap<u64, TextureEntry>,
-    elem: &hypr_core::SceneElement<'_>,
+    elem: &voidptr_core::SceneElement<'_>,
 ) -> Result<()> {
     let expected_bytes = (elem.stride as usize).saturating_mul(elem.height as usize);
     if elem.pixels.len() < expected_bytes {

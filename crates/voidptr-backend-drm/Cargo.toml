@@ -1,5 +1,5 @@
 [package]
-name = "hypr-backend-drm"
+name = "voidptr-backend-drm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,4 +15,4 @@ glow.workspace = true
 libloading.workspace = true
 rustix.workspace = true
 png.workspace = true
-hypr-core.workspace = true
+voidptr-core.workspace = true

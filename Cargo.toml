@@ -1,20 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/hypr-core",
-    "crates/hypr-wayland",
-    "crates/hypr-backend-drm",
-    "crates/hyprs",
-    "crates/hyprs-probe",
-    "crates/hyprs-paint",
-    "crates/hyprs-drm-smoke",
+    "crates/voidptr-core",
+    "crates/voidptr-wayland",
+    "crates/voidptr-backend-drm",
+    "crates/voidptr",
+    "crates/voidptr-probe",
+    "crates/voidptr-paint",
+    "crates/voidptr-drm-smoke",
 ]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
 license = "BSD-3-Clause"
-repository = "https://github.com/magniff/hyperland-rs"
+repository = "https://github.com/magniff/voidptr"
 rust-version = "1.80"
 
 [workspace.dependencies]
@@ -39,10 +39,10 @@ input = { version = "0.9", features = ["libinput_1_19"] }
 libc = "0.2"
 xkbcommon = "0.8"
 
-hypr-backend-drm = { path = "crates/hypr-backend-drm" }
+voidptr-backend-drm = { path = "crates/voidptr-backend-drm" }
 
-hypr-core = { path = "crates/hypr-core" }
-hypr-wayland = { path = "crates/hypr-wayland" }
+voidptr-core = { path = "crates/voidptr-core" }
+voidptr-wayland = { path = "crates/voidptr-wayland" }
 
 [profile.release]
 lto = "thin"

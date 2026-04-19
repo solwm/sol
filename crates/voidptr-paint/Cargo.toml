@@ -1,11 +1,11 @@
 [package]
-name = "hyprs-paint"
+name = "voidptr-paint"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "hyprs-paint"
+name = "voidptr-paint"
 path = "src/main.rs"
 
 [dependencies]

@@ -92,7 +92,7 @@ impl App {
 }
 
 fn make_memfd(size: usize) -> Result<OwnedFd> {
-    let fd = memfd_create("hyprs-paint", MemfdFlags::CLOEXEC).context("memfd_create")?;
+    let fd = memfd_create("voidptr-paint", MemfdFlags::CLOEXEC).context("memfd_create")?;
     ftruncate(&fd, size as u64).context("ftruncate")?;
     Ok(fd)
 }
@@ -162,8 +162,8 @@ fn main() -> Result<()> {
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let toplevel = xdg_surface.get_toplevel(&qh, ());
-    toplevel.set_title("hyprs-paint".into());
-    toplevel.set_app_id("rs.hyperland.paint".into());
+    toplevel.set_title("voidptr-paint".into());
+    toplevel.set_app_id("rs.voidptr.paint".into());
     surface.commit();
     app.surface = Some(surface);
     app.xdg_surface = Some(xdg_surface);
