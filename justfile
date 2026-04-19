@@ -92,7 +92,7 @@ demo-b3-gpu card=drm_card out="/tmp/hyprs-gpu.png": build
 # hyprs-paint, show its stripes on the physical panel. MUST be run from a
 # free TTY (Ctrl+Alt+F2..F6). Server runs in background, client paints, then
 # the script sleeps so you can see it, then tears everything down.
-demo-b4 card=drm_card hold="6": build _prep clean-socket
+demo-b4 card=drm_card hold="6": _prep clean-socket
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
@@ -103,27 +103,48 @@ demo-b4 card=drm_card hold="6": build _prep clean-socket
     EOF
         exit 1
     fi
+    # Pre-build everything up front so the server doesn't race cargo and
+    # any build errors show up before we start redirecting output.
+    echo "=== building ==="
+    cargo build --release --bin hyprs --bin hyprs-paint
+    echo "=== launching server (backend=drm, card={{card}}) ==="
     HYPRS_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
-        cargo run --release --bin hyprs -- --backend=drm \
+        ./target/release/hyprs --backend=drm \
         > {{runtime}}/hyprs.log 2>&1 &
     server_pid=$!
-    trap "kill $server_pid 2>/dev/null; wait 2>/dev/null || true" EXIT
-    # wait for the socket to appear
-    for _ in $(seq 1 50); do
+    cleanup() {
+        rc=$?
+        kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+        echo
+        echo "=== server log (exit rc=$rc) ==="
+        tail -200 {{runtime}}/hyprs.log 2>/dev/null || echo "<no log>"
+        if [[ -f {{runtime}}/paint.log ]]; then
+            echo "=== paint log ==="
+            tail -40 {{runtime}}/paint.log
+        fi
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    # Wait up to 10s for the socket to appear.
+    for _ in $(seq 1 100); do
         [[ -S {{runtime}}/{{socket}} ]] && break
+        # also bail fast if the server already died
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            echo "server exited before creating socket"
+            exit 1
+        fi
         sleep 0.1
     done
     if [[ ! -S {{runtime}}/{{socket}} ]]; then
-        echo "server did not create socket; log:" >&2
-        cat {{runtime}}/hyprs.log >&2
+        echo "server still alive but no socket after 10s"
         exit 1
     fi
+    echo "socket up; launching paint"
     XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
-        cargo run --release --bin hyprs-paint >/dev/null 2>&1 || true
+        ./target/release/hyprs-paint > {{runtime}}/paint.log 2>&1 || true
     echo "stripes should now be on screen; holding for {{hold}}s..."
     sleep {{hold}}
-    echo "=== server log tail ==="
-    tail -20 {{runtime}}/hyprs.log || true
 
 # B3 demo: full DRM/GBM/GLES smoke test on a given card for N seconds.
 # MUST be run from a free TTY (Ctrl+Alt+F2..F6) — Hyprland holds DRM master
