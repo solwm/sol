@@ -20,7 +20,8 @@ use wayland_server::{
     },
 };
 
-use crate::{State, render::PixelFormat};
+use crate::State;
+use hypr_core::PixelFormat;
 
 /// User data attached to a wl_shm_pool. Holds the mmap so buffers can read
 /// pixels even after the client destroys the pool resource (spec: pool is

@@ -281,6 +281,7 @@ dependencies = [
  "drm",
  "gbm",
  "glow",
+ "hypr-core",
  "khronos-egl",
  "libloading",
  "png",
@@ -303,6 +304,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "calloop",
+ "hypr-backend-drm",
  "hypr-core",
  "memmap2",
  "png",

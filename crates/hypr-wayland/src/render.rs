@@ -10,13 +10,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Wayland SHM pixel formats we can read. ARGB and XRGB both arrive as 32-bit
-/// little-endian words; the only difference is whether alpha is meaningful.
-#[derive(Clone, Copy, Debug)]
-pub enum PixelFormat {
-    Argb8888,
-    Xrgb8888,
-}
+pub use hypr_core::PixelFormat;
 
 pub struct Canvas {
     pub width: u32,

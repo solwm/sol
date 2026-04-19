@@ -26,7 +26,11 @@ use gbm::{AsRaw, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 use rustix::event::{PollFd, PollFlags, poll};
 
+mod presenter;
+mod quad;
 mod shader;
+
+pub use presenter::DrmPresenter;
 
 const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
 

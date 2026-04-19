@@ -1,15 +1,17 @@
 //! Wayland server for hyperland-rs.
 //!
-//! B2 scope: bring up a Wayland display, accept clients, let them create
-//! wl_shm buffers and map xdg_toplevels, and composite mapped toplevels onto
-//! a headless canvas written to PNG.
+//! Handles protocol traffic in all backends; rendering is delegated to a
+//! `BackendState` value (software canvas -> PNG for headless, or a
+//! `hypr_backend_drm::DrmPresenter` for real hardware).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
+use hypr_backend_drm::DrmPresenter;
+use hypr_core::{Scene, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
@@ -36,20 +38,19 @@ const OUTPUT_VERSION: u32 = 4;
 const SEAT_VERSION: u32 = 7;
 const XDG_WM_BASE_VERSION: u32 = 5;
 
-const CANVAS_WIDTH: u32 = output::OUTPUT_WIDTH as u32;
-const CANVAS_HEIGHT: u32 = output::OUTPUT_HEIGHT as u32;
-
-/// Top-level compositor state. Everything globally mutable lives here; it's
-/// what Dispatch impls receive as `&mut self`.
+/// Compositor state shared across Dispatch impls. Backend-specific resources
+/// (canvas, presenter) live on `Compositor` alongside this, not here.
 pub struct State {
     pub display_handle: DisplayHandle,
     pub globals: Globals,
     pub clients_seen: u64,
     /// Mapped xdg_toplevels in stacking order (bottom to top). Held as weak
-    /// refs so dead surfaces drop out on the next scan.
+    /// refs so dead surfaces drop out on the next render.
     pub mapped_toplevels: Vec<Weak<WlSurface>>,
-    pub canvas: Canvas,
-    pub png_path: PathBuf,
+    /// Logical screen size. Drives toplevel placement and (eventually) the
+    /// wl_output mode advertised to clients.
+    pub screen_width: u32,
+    pub screen_height: u32,
     pub needs_render: bool,
     pub started: Instant,
     pub next_serial: u32,
@@ -86,81 +87,117 @@ impl ClientData for ClientState {
     }
 }
 
-/// Pairs Display + State so calloop callbacks can mutate both.
+/// Backend-specific render target. Chosen at startup; does not switch at
+/// runtime.
+pub enum BackendState {
+    Headless { canvas: Canvas, png_path: PathBuf },
+    Drm(DrmPresenter),
+}
+
+/// Pairs Display + State + backend so calloop callbacks can reach everything.
 pub struct Compositor {
     pub state: State,
     pub display: Display<State>,
+    pub backend: BackendState,
 }
 
-/// Walk mapped_toplevels, composite each surface's current buffer onto the
-/// canvas, write PNG.
-fn render_and_dump(comp: &mut Compositor) -> Result<()> {
-    comp.state.canvas.clear();
-
-    // Drop any toplevels whose WlSurface has been destroyed.
-    comp.state
-        .mapped_toplevels
-        .retain(|w| w.upgrade().is_ok());
-
-    let mut drawn = 0usize;
-    for weak in comp.state.mapped_toplevels.clone() {
-        let Ok(surface) = weak.upgrade() else {
+/// Collects scene elements from mapped xdg_toplevels and the WlBuffers that
+/// back them. Returns the buffers alongside the scene so callers keep them
+/// alive for the duration of rendering.
+fn collect_scene(state: &State) -> Vec<wayland_server::protocol::wl_buffer::WlBuffer> {
+    let mut buffers = Vec::new();
+    for weak in state.mapped_toplevels.iter() {
+        let Ok(surface) = weak.upgrade() else { continue };
+        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let Some(sd) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
-            continue;
-        };
-        let sd = sd.lock().unwrap();
+        let sd = sd_arc.lock().unwrap();
         if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
             continue;
         }
-        let Some(buf_weak) = &sd.current.buffer else {
+        let Some(buf_weak) = sd.current.buffer.as_ref() else {
             continue;
         };
-        let Ok(buf) = buf_weak.upgrade() else {
-            continue;
-        };
-        let Some(buf_data) = buf.data::<shm::BufferData>() else {
-            continue;
-        };
-        let Some(format) = buf_data.pixel_format() else {
-            tracing::warn!(format = ?buf_data.format, "unsupported format, skipping blit");
-            continue;
-        };
-        let Some(bytes) = buf_data.bytes() else {
-            tracing::warn!("buffer range out of bounds, skipping");
-            continue;
-        };
-        // Simple placement: centre the toplevel on the canvas.
-        let x = (CANVAS_WIDTH as i32 - buf_data.width) / 2;
-        let y = (CANVAS_HEIGHT as i32 - buf_data.height) / 2;
-        comp.state.canvas.blit_argb(
+        if let Ok(buf) = buf_weak.upgrade() {
+            buffers.push(buf);
+        }
+    }
+    buffers
+}
+
+fn scene_from_buffers<'a>(
+    buffers: &'a [wayland_server::protocol::wl_buffer::WlBuffer],
+    screen_width: u32,
+    screen_height: u32,
+) -> Scene<'a> {
+    let mut scene = Scene::new();
+    for buf in buffers {
+        let Some(bd) = buf.data::<shm::BufferData>() else { continue };
+        let Some(bytes) = bd.bytes() else { continue };
+        let Some(format) = bd.pixel_format() else { continue };
+        // Centre the toplevel. Replace with a real layout in B6.
+        let x = (screen_width as i32 - bd.width) / 2;
+        let y = (screen_height as i32 - bd.height) / 2;
+        let key = (bd as *const shm::BufferData) as usize as u64;
+        scene.elements.push(SceneElement {
+            buffer_key: key,
+            pixels: bytes,
+            format,
+            width: bd.width,
+            height: bd.height,
+            stride: bd.stride,
             x,
             y,
-            bytes,
-            buf_data.width,
-            buf_data.height,
-            buf_data.stride,
-            format,
-        );
-        // Tell the client its buffer is no longer needed so it can reuse it.
-        buf.release();
-        drawn += 1;
+        });
+    }
+    scene
+}
+
+fn render_tick(comp: &mut Compositor) -> Result<()> {
+    // Prune dead weak refs each frame.
+    comp.state.mapped_toplevels.retain(|w| w.upgrade().is_ok());
+
+    let buffers = collect_scene(&comp.state);
+    let scene = scene_from_buffers(&buffers, comp.state.screen_width, comp.state.screen_height);
+    let drawn = scene.elements.len();
+
+    match &mut comp.backend {
+        BackendState::Headless { canvas, png_path } => {
+            canvas.clear();
+            for e in &scene.elements {
+                canvas.blit_argb(
+                    e.x,
+                    e.y,
+                    e.pixels,
+                    e.width,
+                    e.height,
+                    e.stride,
+                    e.format,
+                );
+            }
+            canvas
+                .write_png(png_path)
+                .with_context(|| format!("write {}", png_path.display()))?;
+            tracing::info!(drawn, path = %png_path.display(), "headless frame");
+        }
+        BackendState::Drm(presenter) => {
+            presenter.render_scene(&scene).context("drm render_scene")?;
+            tracing::debug!(drawn, "drm frame");
+        }
     }
 
-    comp.state
-        .canvas
-        .write_png(&comp.state.png_path)
-        .with_context(|| format!("write {}", comp.state.png_path.display()))?;
-    tracing::info!(
-        drawn,
-        path = %comp.state.png_path.display(),
-        "rendered frame"
-    );
+    // Scene is done; drop buffers to release them back to clients.
+    for buf in buffers {
+        buf.release();
+    }
     Ok(())
 }
 
-pub fn run() -> Result<()> {
+fn setup_event_loop(
+    backend: BackendState,
+    screen_width: u32,
+    screen_height: u32,
+) -> Result<()> {
     let mut event_loop: EventLoop<'static, Compositor> =
         EventLoop::try_new().context("create calloop event loop")?;
     let mut display: Display<State> = Display::new().context("create wayland display")?;
@@ -182,11 +219,6 @@ pub fn run() -> Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "<anonymous>".into());
     tracing::info!(socket = %socket_name, "listening");
-
-    let png_path = std::env::var_os("HYPRS_PNG_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/hyprs-headless.png"));
-    tracing::info!(path = %png_path.display(), "headless PNG output");
 
     event_loop
         .handle()
@@ -230,13 +262,17 @@ pub fn run() -> Result<()> {
         globals,
         clients_seen: 0,
         mapped_toplevels: Vec::new(),
-        canvas: Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT),
-        png_path,
+        screen_width,
+        screen_height,
         needs_render: false,
         started: Instant::now(),
         next_serial: 0,
     };
-    let mut compositor = Compositor { state, display };
+    let mut compositor = Compositor {
+        state,
+        display,
+        backend,
+    };
     let _ = compositor.display.flush_clients();
 
     tracing::info!(
@@ -249,7 +285,7 @@ pub fn run() -> Result<()> {
         .run(None, &mut compositor, |comp| {
             if comp.state.needs_render {
                 comp.state.needs_render = false;
-                if let Err(e) = render_and_dump(comp) {
+                if let Err(e) = render_tick(comp) {
                     tracing::error!(error = %e, "render failed");
                 }
             }
@@ -258,4 +294,31 @@ pub fn run() -> Result<()> {
         .context("event loop errored")?;
 
     Ok(())
+}
+
+/// Headless backend: software canvas, dumps a PNG every frame.
+pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
+    tracing::info!(path = %png_path.display(), width, height, "headless backend");
+    let backend = BackendState::Headless {
+        canvas: Canvas::new(width, height),
+        png_path,
+    };
+    setup_event_loop(backend, width, height)
+}
+
+/// DRM backend: takes master on `device`, renders via GLES to the screen.
+/// Must be called from a VT that doesn't already have a compositor.
+pub fn run_drm(device: &Path) -> Result<()> {
+    let presenter = DrmPresenter::new(device).context("initialise DrmPresenter")?;
+    let (w, h) = presenter.size();
+    tracing::info!(width = w, height = h, "drm backend");
+    setup_event_loop(BackendState::Drm(presenter), w, h)
+}
+
+/// Back-compat entry: default to headless with the old PNG path.
+pub fn run() -> Result<()> {
+    let png_path = std::env::var_os("HYPRS_PNG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/hyprs-headless.png"));
+    run_headless(png_path, 1920, 1080)
 }

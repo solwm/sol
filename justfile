@@ -88,6 +88,43 @@ demo-b3-gpu card=drm_card out="/tmp/hyprs-gpu.png": build
     @file {{out}}
     @echo "tip: feh {{out}}  (or xdg-open)"
 
+# B4 demo: run hyprs as a real compositor on the DRM backend, connect
+# hyprs-paint, show its stripes on the physical panel. MUST be run from a
+# free TTY (Ctrl+Alt+F2..F6). Server runs in background, client paints, then
+# the script sleeps so you can see it, then tears everything down.
+demo-b4 card=drm_card hold="6": build _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    HYPRS_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        cargo run --release --bin hyprs -- --backend=drm \
+        > {{runtime}}/hyprs.log 2>&1 &
+    server_pid=$!
+    trap "kill $server_pid 2>/dev/null; wait 2>/dev/null || true" EXIT
+    # wait for the socket to appear
+    for _ in $(seq 1 50); do
+        [[ -S {{runtime}}/{{socket}} ]] && break
+        sleep 0.1
+    done
+    if [[ ! -S {{runtime}}/{{socket}} ]]; then
+        echo "server did not create socket; log:" >&2
+        cat {{runtime}}/hyprs.log >&2
+        exit 1
+    fi
+    XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+        cargo run --release --bin hyprs-paint >/dev/null 2>&1 || true
+    echo "stripes should now be on screen; holding for {{hold}}s..."
+    sleep {{hold}}
+    echo "=== server log tail ==="
+    tail -20 {{runtime}}/hyprs.log || true
+
 # B3 demo: full DRM/GBM/GLES smoke test on a given card for N seconds.
 # MUST be run from a free TTY (Ctrl+Alt+F2..F6) — Hyprland holds DRM master
 # on the active VT. Prints a clear error if master can't be acquired.

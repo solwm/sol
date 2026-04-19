@@ -15,3 +15,4 @@ glow.workspace = true
 libloading.workspace = true
 rustix.workspace = true
 png.workspace = true
+hypr-core.workspace = true
