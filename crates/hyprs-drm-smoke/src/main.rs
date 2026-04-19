@@ -55,7 +55,22 @@ fn main() -> Result<()> {
                 seconds,
                 "starting DRM smoke test"
             );
-            hypr_backend_drm::run_smoke_test(&device, Duration::from_secs(seconds), should_quit)
+            if let Err(e) = hypr_backend_drm::run_smoke_test(
+                &device,
+                Duration::from_secs(seconds),
+                should_quit,
+            ) {
+                eprintln!("\nERROR: {e}");
+                let mut src = e.source();
+                let mut depth = 1;
+                while let Some(s) = src {
+                    eprintln!("  caused by [{depth}]: {s}");
+                    src = s.source();
+                    depth += 1;
+                }
+                std::process::exit(1);
+            }
+            Ok(())
         }
         other => {
             eprintln!("unknown mode: {other}\nusage: hyprs-drm-smoke [info|run] [DEVICE] [SECS]");

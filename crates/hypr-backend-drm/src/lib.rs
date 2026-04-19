@@ -278,20 +278,24 @@ pub fn run_smoke_test(
     let w = w as u32;
     let h = h as u32;
 
-    let mut gl_stack = GlStack::new(card.clone(), w, h)?;
+    let gl_stack = GlStack::new(card.clone(), w, h)?;
     let program = shader::build_checkerboard(&gl_stack.gl)?;
 
-    // Pre-render + swap one frame so the GBM surface has a front buffer we
-    // can use for the initial modeset.
+    let mut fb_cache: HashMap<usize, framebuffer::Handle> = HashMap::new();
+
+    // Initial frame: clear to magenta, swap, lock front, add fb, modeset.
+    // We keep the locked BO in `scanned_out` so it isn't returned to the
+    // pool while it's on screen — dropping it later calls
+    // gbm_surface_release_buffer.
     clear_magenta(&gl_stack);
     gl_stack
         .egl
         .swap_buffers(gl_stack.display, gl_stack.surface)
-        .map_err(|e| anyhow!("initial swap: {e:?}"))?;
+        .map_err(|e| anyhow!("initial swap_buffers: {e:?}"))?;
 
-    let mut fb_cache: HashMap<usize, framebuffer::Handle> = HashMap::new();
-    let first_fb = lock_and_register(&card, &mut gl_stack.gbm_surface, &mut fb_cache)?;
-
+    let first_bo = unsafe { gl_stack.gbm_surface.lock_front_buffer() }
+        .context("initial lock_front_buffer")?;
+    let first_fb = get_or_add_fb(&card, &first_bo, &mut fb_cache)?;
     card.set_crtc(
         sel.crtc,
         Some(first_fb),
@@ -300,14 +304,21 @@ pub fn run_smoke_test(
         Some(sel.mode),
     )
     .context("set_crtc (initial modeset)")?;
-    tracing::info!("modeset done; beginning render loop");
+    tracing::info!(
+        width = w, height = h, "modeset done; beginning render loop"
+    );
+    let mut scanned_out: Option<gbm::BufferObject<()>> = Some(first_bo);
 
     let start = Instant::now();
-    let mut pending_flip: Option<(framebuffer::Handle,)> = None;
-    let mut last_front: Option<gbm::BufferObject<()>> = None;
     let mut frame = 0u64;
 
     while start.elapsed() < duration && !should_quit.load(Ordering::SeqCst) {
+        // Don't start a new frame if GBM has no free back buffer. Waiting
+        // for the previous flip below is what frees one up.
+        if !gl_stack.gbm_surface.has_free_buffers() {
+            tracing::warn!("gbm pool exhausted — bug in buffer lifetime");
+        }
+
         let t = start.elapsed().as_secs_f32();
         if t < 1.0 {
             clear_magenta(&gl_stack);
@@ -320,28 +331,17 @@ pub fn run_smoke_test(
             .swap_buffers(gl_stack.display, gl_stack.surface)
             .map_err(|e| anyhow!("swap_buffers: {e:?}"))?;
 
-        let fb = lock_and_register(&card, &mut gl_stack.gbm_surface, &mut fb_cache)?;
-        card.page_flip(sel.crtc, fb, PageFlipFlags::EVENT, None)
+        let next_bo = unsafe { gl_stack.gbm_surface.lock_front_buffer() }
+            .context("lock_front_buffer in loop")?;
+        let next_fb = get_or_add_fb(&card, &next_bo, &mut fb_cache)?;
+        card.page_flip(sel.crtc, next_fb, PageFlipFlags::EVENT, None)
             .context("page_flip")?;
 
-        // Wait for flip event.
-        let mut pfd = [PollFd::new(&card, PollFlags::IN)];
-        let _ = poll(&mut pfd, 1000);
-        if let Ok(events) = card.receive_events() {
-            for event in events {
-                if matches!(event, Event::PageFlip(_)) {
-                    // previous front buffer can now be released back to the GBM pool
-                    last_front.take();
-                }
-            }
-        }
-        let _ = pending_flip.insert((fb,));
-
-        // The current front buffer (behind the flip) is held by the GBM
-        // surface; when we lock_front_buffer again next iteration, the
-        // previous bo is released automatically. We just need to keep a
-        // reference to *this* front until the next flip confirms.
-        last_front = Some(unsafe { gl_stack.gbm_surface.lock_front_buffer() }?);
+        // Block until the flip has completed, then drop the previous
+        // scanned-out buffer (now off-screen) back into the pool. Its Drop
+        // impl calls gbm_surface_release_buffer.
+        wait_for_page_flip(&card).context("wait_for_page_flip")?;
+        scanned_out = Some(next_bo); // old one is dropped here
 
         frame += 1;
         if frame.is_multiple_of(60) {
@@ -349,11 +349,36 @@ pub fn run_smoke_test(
         }
     }
 
-    // Don't bother restoring the previous CRTC — kernel revokes our master
-    // when the fd closes, and whatever compositor we came from will re-modeset
-    // the next time it's foregrounded.
+    // Hold scanned_out alive until we're done; kernel revokes master on fd
+    // close, which causes the current scan-out to stop cleanly.
+    drop(scanned_out);
+
     tracing::info!(frames = frame, "smoke test complete");
     Ok(())
+}
+
+fn wait_for_page_flip(card: &Card) -> Result<()> {
+    // Poll with a generous timeout so a missed vblank doesn't hang forever.
+    let mut pfd = [PollFd::new(card, PollFlags::IN)];
+    match poll(&mut pfd, 2000) {
+        Ok(_) => {}
+        Err(e) => bail!("poll on drm fd: {e}"),
+    }
+    let events = card.receive_events().context("receive_events")?;
+    for event in events {
+        if matches!(event, Event::PageFlip(_)) {
+            return Ok(());
+        }
+    }
+    // No event yet — try once more briefly; some drivers deliver a vblank
+    // ahead of the page flip event on the same readability.
+    let _ = poll(&mut pfd, 200);
+    for event in card.receive_events().context("receive_events")? {
+        if matches!(event, Event::PageFlip(_)) {
+            return Ok(());
+        }
+    }
+    bail!("no page flip event within timeout")
 }
 
 /// Render a checkerboard frame via GBM+EGL+GLES2 without DRM master, read
@@ -463,23 +488,21 @@ fn draw_checkerboard(
     }
 }
 
-fn lock_and_register(
+/// Return the framebuffer id for a given GBM BO, adding one to DRM on first
+/// sight. Keyed by the BO's raw pointer because GBM recycles the same bos
+/// through its pool, so adding a fb for each iteration would leak.
+fn get_or_add_fb(
     card: &Card,
-    gbm_surface: &mut gbm::Surface<()>,
+    bo: &gbm::BufferObject<()>,
     cache: &mut HashMap<usize, framebuffer::Handle>,
 ) -> Result<framebuffer::Handle> {
-    let bo = unsafe { gbm_surface.lock_front_buffer() }.context("lock_front_buffer")?;
-    // GBM reuses the same underlying bo pointer across lock cycles, so the raw
-    // pointer makes a stable identity key for our fb cache.
     let key = bo.as_raw() as usize;
     if let Some(fb) = cache.get(&key).copied() {
-        std::mem::forget(bo);
         return Ok(fb);
     }
     let fb = card
-        .add_framebuffer(&bo, 24, 32)
+        .add_framebuffer(bo, 24, 32)
         .context("add_framebuffer")?;
     cache.insert(key, fb);
-    std::mem::forget(bo);
     Ok(fb)
 }
