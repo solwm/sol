@@ -23,6 +23,8 @@ use wayland_server::{
 };
 
 mod compositor;
+mod cursor;
+mod input;
 mod output;
 mod render;
 mod seat;
@@ -30,6 +32,7 @@ mod shm;
 mod xdg_shell;
 
 use compositor::{SurfaceData, SurfaceRole};
+use input::{InputEvent, InputState};
 use render::Canvas;
 
 const COMPOSITOR_VERSION: u32 = 6;
@@ -54,6 +57,37 @@ pub struct State {
     pub needs_render: bool,
     pub started: Instant,
     pub next_serial: u32,
+    pub cursor: Cursor,
+    pub input: Option<InputState>,
+}
+
+/// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
+/// is always `(pos_x - hot_x, pos_y - hot_y)`. Rendered as the topmost scene
+/// element when visible.
+pub struct Cursor {
+    pub pos_x: f64,
+    pub pos_y: f64,
+    pub visible: bool,
+    pub pixels: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+}
+
+impl Cursor {
+    pub fn new(centre_x: f64, centre_y: f64) -> Self {
+        Self {
+            pos_x: centre_x,
+            pos_y: centre_y,
+            visible: true,
+            pixels: cursor::pixels(),
+            width: cursor::CURSOR_W,
+            height: cursor::CURSOR_H,
+            hot_x: cursor::CURSOR_HOT_X,
+            hot_y: cursor::CURSOR_HOT_Y,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -127,6 +161,7 @@ fn collect_scene(state: &State) -> Vec<wayland_server::protocol::wl_buffer::WlBu
 
 fn scene_from_buffers<'a>(
     buffers: &'a [wayland_server::protocol::wl_buffer::WlBuffer],
+    cursor: &'a Cursor,
     screen_width: u32,
     screen_height: u32,
 ) -> Scene<'a> {
@@ -150,15 +185,38 @@ fn scene_from_buffers<'a>(
             y,
         });
     }
+    // Cursor last so it always draws on top.
+    if cursor.visible {
+        scene.elements.push(SceneElement {
+            buffer_key: CURSOR_SCENE_KEY,
+            pixels: &cursor.pixels,
+            format: hypr_core::PixelFormat::Argb8888,
+            width: cursor.width,
+            height: cursor.height,
+            stride: cursor.width * 4,
+            x: cursor.pos_x as i32 - cursor.hot_x,
+            y: cursor.pos_y as i32 - cursor.hot_y,
+        });
+    }
     scene
 }
+
+/// Stable key the DRM renderer uses to avoid re-uploading the cursor
+/// sprite every frame. Anything outside the range of real BufferData
+/// pointers works; pick something unlikely to collide.
+const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
     // Prune dead weak refs each frame.
     comp.state.mapped_toplevels.retain(|w| w.upgrade().is_ok());
 
     let buffers = collect_scene(&comp.state);
-    let scene = scene_from_buffers(&buffers, comp.state.screen_width, comp.state.screen_height);
+    let scene = scene_from_buffers(
+        &buffers,
+        &comp.state.cursor,
+        comp.state.screen_width,
+        comp.state.screen_height,
+    );
     let drawn = scene.elements.len();
 
     match &mut comp.backend {
@@ -197,6 +255,7 @@ fn setup_event_loop(
     backend: BackendState,
     screen_width: u32,
     screen_height: u32,
+    input: Option<(InputState, std::os::fd::OwnedFd)>,
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, Compositor> =
         EventLoop::try_new().context("create calloop event loop")?;
@@ -257,6 +316,30 @@ fn setup_event_loop(
         )
         .map_err(|e| anyhow::anyhow!("insert display source: {e}"))?;
 
+    let (input_state, input_fd) = match input {
+        Some((s, fd)) => (Some(s), Some(fd)),
+        None => (None, None),
+    };
+    if let Some(fd) = input_fd {
+        event_loop
+            .handle()
+            .insert_source(
+                Generic::new(fd, Interest::READ, Mode::Level),
+                |_ready, _fd, comp| {
+                    let events = match comp.state.input.as_mut() {
+                        Some(i) => i.drain(),
+                        None => return Ok(PostAction::Continue),
+                    };
+                    for ev in events {
+                        apply_input(&mut comp.state, ev);
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("insert input source: {e}"))?;
+    }
+
+    let cursor = Cursor::new(screen_width as f64 / 2.0, screen_height as f64 / 2.0);
     let state = State {
         display_handle: dh,
         globals,
@@ -267,6 +350,8 @@ fn setup_event_loop(
         needs_render: false,
         started: Instant::now(),
         next_serial: 0,
+        cursor,
+        input: input_state,
     };
     let mut compositor = Compositor {
         state,
@@ -296,6 +381,34 @@ fn setup_event_loop(
     Ok(())
 }
 
+/// Apply one translated libinput event to the state. Updates the cursor and
+/// sets `needs_render`. Input->client routing lands in a later B5 substep.
+fn apply_input(state: &mut State, ev: InputEvent) {
+    match ev {
+        InputEvent::PointerMotion { dx, dy } => {
+            state.cursor.pos_x = (state.cursor.pos_x + dx)
+                .clamp(0.0, state.screen_width as f64 - 1.0);
+            state.cursor.pos_y = (state.cursor.pos_y + dy)
+                .clamp(0.0, state.screen_height as f64 - 1.0);
+            state.needs_render = true;
+        }
+        InputEvent::PointerMotionAbsolute { x_mm, y_mm } => {
+            // libinput reports absolute device coords as millimetres on the
+            // device surface. Without a device-size mapping we just treat
+            // them as screen-space until we wire up proper calibration.
+            state.cursor.pos_x = x_mm.clamp(0.0, state.screen_width as f64 - 1.0);
+            state.cursor.pos_y = y_mm.clamp(0.0, state.screen_height as f64 - 1.0);
+            state.needs_render = true;
+        }
+        InputEvent::PointerButton { button, pressed } => {
+            tracing::info!(button, pressed, "pointer button (not forwarded yet)");
+        }
+        InputEvent::Key { keycode, pressed } => {
+            tracing::info!(keycode, pressed, "key (not forwarded yet)");
+        }
+    }
+}
+
 /// Headless backend: software canvas, dumps a PNG every frame.
 pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
     tracing::info!(path = %png_path.display(), width, height, "headless backend");
@@ -303,7 +416,7 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
         canvas: Canvas::new(width, height),
         png_path,
     };
-    setup_event_loop(backend, width, height)
+    setup_event_loop(backend, width, height, None)
 }
 
 /// DRM backend: takes master on `device`, renders via GLES to the screen.
@@ -312,7 +425,16 @@ pub fn run_drm(device: &Path) -> Result<()> {
     let presenter = DrmPresenter::new(device).context("initialise DrmPresenter")?;
     let (w, h) = presenter.size();
     tracing::info!(width = w, height = h, "drm backend");
-    setup_event_loop(BackendState::Drm(presenter), w, h)
+
+    // libinput is DRM-only: a headless PNG dump has nowhere to point a cursor.
+    let input = match InputState::init("seat0") {
+        Ok(pair) => Some(pair),
+        Err(e) => {
+            tracing::warn!(error = %e, "libinput init failed; running without input");
+            None
+        }
+    };
+    setup_event_loop(BackendState::Drm(presenter), w, h, input)
 }
 
 /// Back-compat entry: default to headless with the old PNG path.

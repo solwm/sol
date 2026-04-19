@@ -35,6 +35,8 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.14"
 libloading = "0.8"
 ctrlc = "3"
+input = { version = "0.9", features = ["libinput_1_19"] }
+libc = "0.2"
 
 hypr-backend-drm = { path = "crates/hypr-backend-drm" }
 

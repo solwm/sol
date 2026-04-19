@@ -123,6 +123,12 @@ impl DrmPresenter {
             gl.clear_color(0.02, 0.02, 0.04, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
 
+            // Alpha blending for ARGB surfaces (notably the software cursor).
+            // XRGB surfaces set u_opaque=1.0 so alpha ends up 1.0 and the
+            // blend is a no-op for them.
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+
             gl.use_program(Some(self.quad.program));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad.vbo));
             gl.enable_vertex_attrib_array(0);
@@ -156,6 +162,7 @@ impl DrmPresenter {
             gl.disable_vertex_attrib_array(0);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
+            gl.disable(glow::BLEND);
         }
 
         self.present_and_flip()

@@ -88,6 +88,32 @@ demo-b3-gpu card=drm_card out="/tmp/hyprs-gpu.png": build
     @file {{out}}
     @echo "tip: feh {{out}}  (or xdg-open)"
 
+# B5 demo: compositor with a software cursor driven by libinput.
+# Needs root for /dev/input/event* unless you're in the 'input' group; we
+# elevate with sudo -E so your XDG_RUNTIME_DIR and HYPRS_* env survive.
+# Must run from a free TTY (Ctrl+Alt+F2..F6). Move the mouse to verify.
+demo-b5 card=drm_card seconds="12": _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    echo "=== building ==="
+    cargo build --release --bin hyprs --bin hyprs-paint
+    echo
+    echo "=== launching hyprs (needs sudo for /dev/input/event*) ==="
+    echo "move the mouse — a small red-and-white circular cursor should"
+    echo "follow. the process auto-exits after {{seconds}}s; ctrl+c is fine too."
+    echo
+    sudo -E HYPRS_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        timeout -s INT {{seconds}} ./target/release/hyprs --backend=drm \
+        || echo "(hyprs exited; rc=$?)"
+
 # B4 demo: run hyprs as a real compositor on the DRM backend, connect
 # hyprs-paint, show its stripes on the physical panel. MUST be run from a
 # free TTY (Ctrl+Alt+F2..F6). Server runs in background, client paints, then
