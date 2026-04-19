@@ -88,11 +88,11 @@ demo-b3-gpu card=drm_card out="/tmp/hyprs-gpu.png": build
     @file {{out}}
     @echo "tip: feh {{out}}  (or xdg-open)"
 
-# B5 demo: compositor with a software cursor driven by libinput.
-# Needs root for /dev/input/event* unless you're in the 'input' group; we
-# elevate with sudo -E so your XDG_RUNTIME_DIR and HYPRS_* env survive.
-# Must run from a free TTY (Ctrl+Alt+F2..F6). Move the mouse to verify.
-demo-b5 card=drm_card seconds="12": _prep clean-socket
+# B5 demo: compositor with a software cursor driven by libinput + an
+# interactive hyprs-paint window. Click the window (or press any key) to
+# cycle the stripe palette. Needs root for /dev/input/event* (same caveat
+# as demo-b4's DRM path). Must run from a free TTY (Ctrl+Alt+F2..F6).
+demo-b5 card=drm_card seconds="20": _prep clean-socket
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
@@ -106,13 +106,42 @@ demo-b5 card=drm_card seconds="12": _prep clean-socket
     echo "=== building ==="
     cargo build --release --bin hyprs --bin hyprs-paint
     echo
-    echo "=== launching hyprs (needs sudo for /dev/input/event*) ==="
-    echo "move the mouse — a small red-and-white circular cursor should"
-    echo "follow. the process auto-exits after {{seconds}}s; ctrl+c is fine too."
-    echo
+    echo "=== launching hyprs (sudo for /dev/input/event*) ==="
     sudo -E HYPRS_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
-        timeout -s INT {{seconds}} ./target/release/hyprs --backend=drm \
-        || echo "(hyprs exited; rc=$?)"
+        ./target/release/hyprs --backend=drm \
+        > {{runtime}}/hyprs.log 2>&1 &
+    server_pid=$!
+    cleanup() {
+        rc=$?
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+        echo
+        echo "=== server log (rc=$rc) ==="
+        tail -200 {{runtime}}/hyprs.log 2>/dev/null || echo "<no log>"
+        if [[ -f {{runtime}}/paint.log ]]; then
+            echo "=== paint log ==="
+            tail -60 {{runtime}}/paint.log
+        fi
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    for _ in $(seq 1 100); do
+        [[ -S {{runtime}}/{{socket}} ]] && break
+        if ! sudo kill -0 "$server_pid" 2>/dev/null; then
+            echo "server exited before creating socket"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
+    echo "=== launching hyprs-paint ==="
+    sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+        ./target/release/hyprs-paint > {{runtime}}/paint.log 2>&1 &
+    paint_pid=$!
+    echo "running for {{seconds}}s. move the mouse, click the stripes,"
+    echo "press keys — each should cycle the palette. ctrl+c to end early."
+    sleep {{seconds}}
+    sudo kill "$paint_pid" 2>/dev/null || true
 
 # B4 demo: run hyprs as a real compositor on the DRM backend, connect
 # hyprs-paint, show its stripes on the physical panel. MUST be run from a

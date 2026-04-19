@@ -37,6 +37,7 @@ libloading = "0.8"
 ctrlc = "3"
 input = { version = "0.9", features = ["libinput_1_19"] }
 libc = "0.2"
+xkbcommon = "0.8"
 
 hypr-backend-drm = { path = "crates/hypr-backend-drm" }
 

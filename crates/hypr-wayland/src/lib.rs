@@ -30,10 +30,16 @@ mod render;
 mod seat;
 mod shm;
 mod xdg_shell;
+mod xkb;
 
 use compositor::{SurfaceData, SurfaceRole};
 use input::{InputEvent, InputState};
 use render::Canvas;
+use wayland_server::protocol::{
+    wl_keyboard::{self, WlKeyboard},
+    wl_pointer::{self, WlPointer},
+};
+use xkb::KeymapState;
 
 const COMPOSITOR_VERSION: u32 = 6;
 const SHM_VERSION: u32 = 1;
@@ -59,6 +65,15 @@ pub struct State {
     pub next_serial: u32,
     pub cursor: Cursor,
     pub input: Option<InputState>,
+    pub keymap: Option<KeymapState>,
+    /// wl_pointer resources bound by clients. Cleaned on each tick.
+    pub pointers: Vec<WlPointer>,
+    /// wl_keyboard resources bound by clients.
+    pub keyboards: Vec<WlKeyboard>,
+    /// Surface currently under the cursor, if any.
+    pub pointer_focus: Option<WlSurface>,
+    /// Surface currently receiving keyboard events.
+    pub keyboard_focus: Option<WlSurface>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -106,6 +121,74 @@ impl State {
     pub fn next_serial(&mut self) -> u32 {
         self.next_serial = self.next_serial.wrapping_add(1);
         self.next_serial
+    }
+
+    /// Give this surface keyboard focus if no other surface currently has it.
+    /// Used when a toplevel first maps.
+    pub fn on_toplevel_mapped(&mut self, surface: &WlSurface) {
+        if self.keyboard_focus.is_none() {
+            self.set_keyboard_focus(Some(surface.clone()));
+        }
+    }
+
+    pub fn set_keyboard_focus(&mut self, new: Option<WlSurface>) {
+        if surface_eq(self.keyboard_focus.as_ref(), new.as_ref()) {
+            return;
+        }
+        if let Some(old) = self.keyboard_focus.take() {
+            if old.is_alive() {
+                let serial = self.next_serial();
+                for kb in &self.keyboards {
+                    if same_client(kb, &old) {
+                        kb.leave(serial, &old);
+                    }
+                }
+            }
+        }
+        if let Some(new) = new.as_ref() {
+            let serial = self.next_serial();
+            for kb in &self.keyboards {
+                if same_client(kb, new) {
+                    kb.enter(serial, new, Vec::new());
+                    // Send current modifier state so the client starts with
+                    // a correct shift/ctrl/etc view of the world.
+                    if let Some(km) = self.keymap.as_ref() {
+                        use xkbcommon::xkb as x;
+                        let serial = self.next_serial_const();
+                        kb.modifiers(
+                            serial,
+                            km.state.serialize_mods(x::STATE_MODS_DEPRESSED),
+                            km.state.serialize_mods(x::STATE_MODS_LATCHED),
+                            km.state.serialize_mods(x::STATE_MODS_LOCKED),
+                            km.state.serialize_layout(x::STATE_LAYOUT_EFFECTIVE),
+                        );
+                    }
+                }
+            }
+        }
+        self.keyboard_focus = new;
+    }
+
+    // Cheeky: hand back the current `next_serial` without mutating. Only
+    // used inside `set_keyboard_focus` where we just bumped it above and
+    // need a second matching value for the modifiers event.
+    fn next_serial_const(&self) -> u32 {
+        self.next_serial
+    }
+}
+
+fn same_client<A: Resource, B: Resource>(a: &A, b: &B) -> bool {
+    match (a.client(), b.client()) {
+        (Some(ca), Some(cb)) => ca.id() == cb.id(),
+        _ => false,
+    }
+}
+
+fn surface_eq(a: Option<&WlSurface>, b: Option<&WlSurface>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -340,6 +423,19 @@ fn setup_event_loop(
     }
 
     let cursor = Cursor::new(screen_width as f64 / 2.0, screen_height as f64 / 2.0);
+    // Only build the keymap when we have libinput. Headless has no keys to
+    // translate and no clients to hand the fd to in any useful way.
+    let keymap = if input_state.is_some() {
+        match KeymapState::new_us() {
+            Ok(km) => Some(km),
+            Err(e) => {
+                tracing::warn!(error = %e, "xkb keymap init failed; keyboard input disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let state = State {
         display_handle: dh,
         globals,
@@ -352,6 +448,11 @@ fn setup_event_loop(
         next_serial: 0,
         cursor,
         input: input_state,
+        keymap,
+        pointers: Vec::new(),
+        keyboards: Vec::new(),
+        pointer_focus: None,
+        keyboard_focus: None,
     };
     let mut compositor = Compositor {
         state,
@@ -381,9 +482,14 @@ fn setup_event_loop(
     Ok(())
 }
 
-/// Apply one translated libinput event to the state. Updates the cursor and
-/// sets `needs_render`. Input->client routing lands in a later B5 substep.
+/// Apply one translated libinput event to the state. Updates the cursor,
+/// sets `needs_render`, and forwards pointer/key events to the right
+/// Wayland client based on current focus.
 fn apply_input(state: &mut State, ev: InputEvent) {
+    // Drop dead resources so we don't try to send to them.
+    state.pointers.retain(|p| p.is_alive());
+    state.keyboards.retain(|k| k.is_alive());
+
     match ev {
         InputEvent::PointerMotion { dx, dy } => {
             state.cursor.pos_x = (state.cursor.pos_x + dx)
@@ -391,20 +497,171 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             state.cursor.pos_y = (state.cursor.pos_y + dy)
                 .clamp(0.0, state.screen_height as f64 - 1.0);
             state.needs_render = true;
+            update_pointer_focus_and_motion(state);
         }
         InputEvent::PointerMotionAbsolute { x_mm, y_mm } => {
-            // libinput reports absolute device coords as millimetres on the
-            // device surface. Without a device-size mapping we just treat
-            // them as screen-space until we wire up proper calibration.
             state.cursor.pos_x = x_mm.clamp(0.0, state.screen_width as f64 - 1.0);
             state.cursor.pos_y = y_mm.clamp(0.0, state.screen_height as f64 - 1.0);
             state.needs_render = true;
+            update_pointer_focus_and_motion(state);
         }
         InputEvent::PointerButton { button, pressed } => {
-            tracing::info!(button, pressed, "pointer button (not forwarded yet)");
+            send_pointer_button(state, button, pressed);
         }
         InputEvent::Key { keycode, pressed } => {
-            tracing::info!(keycode, pressed, "key (not forwarded yet)");
+            send_keyboard_key(state, keycode, pressed);
+        }
+    }
+}
+
+/// Hit-test the cursor against mapped toplevels (top of stack first) and
+/// return the surface plus cursor position in surface-local coords.
+fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
+    for weak in state.mapped_toplevels.iter().rev() {
+        let Ok(surface) = weak.upgrade() else { continue };
+        let hit = {
+            let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
+                continue;
+            };
+            let sd = sd_arc.lock().unwrap();
+            if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
+                None
+            } else if let Some(buf_weak) = sd.current.buffer.as_ref() {
+                if let Ok(buf) = buf_weak.upgrade() {
+                    if let Some(bd) = buf.data::<shm::BufferData>() {
+                        let x0 = (state.screen_width as i32 - bd.width) / 2;
+                        let y0 = (state.screen_height as i32 - bd.height) / 2;
+                        let lx = state.cursor.pos_x - x0 as f64;
+                        let ly = state.cursor.pos_y - y0 as f64;
+                        if lx >= 0.0
+                            && lx < bd.width as f64
+                            && ly >= 0.0
+                            && ly < bd.height as f64
+                        {
+                            Some((lx, ly))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((lx, ly)) = hit {
+            return Some((surface, lx, ly));
+        }
+    }
+    None
+}
+
+fn update_pointer_focus_and_motion(state: &mut State) {
+    let hit = surface_under_cursor(state);
+    let new_focus = hit.as_ref().map(|(s, _, _)| s.clone());
+    let focus_changed = !surface_eq(state.pointer_focus.as_ref(), new_focus.as_ref());
+
+    if focus_changed {
+        if let Some(old) = state.pointer_focus.take() {
+            if old.is_alive() {
+                let serial = state.next_serial();
+                for p in &state.pointers {
+                    if same_client(p, &old) {
+                        p.leave(serial, &old);
+                        pointer_frame(p);
+                    }
+                }
+            }
+        }
+        if let Some((surface, lx, ly)) = hit.as_ref() {
+            let serial = state.next_serial();
+            for p in &state.pointers {
+                if same_client(p, surface) {
+                    p.enter(serial, surface, *lx, *ly);
+                    pointer_frame(p);
+                }
+            }
+        }
+        state.pointer_focus = new_focus;
+    } else if let Some((surface, lx, ly)) = hit.as_ref() {
+        // Ordinary motion within the same surface.
+        let time = state.elapsed_ms();
+        for p in &state.pointers {
+            if same_client(p, surface) {
+                p.motion(time, *lx, *ly);
+                pointer_frame(p);
+            }
+        }
+    }
+}
+
+fn pointer_frame(p: &WlPointer) {
+    if p.version() >= 5 {
+        p.frame();
+    }
+}
+
+fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
+    let Some(focus) = state.pointer_focus.clone() else { return };
+    if !focus.is_alive() {
+        return;
+    }
+    let serial = state.next_serial();
+    let time = state.elapsed_ms();
+    let button_state = if pressed {
+        wl_pointer::ButtonState::Pressed
+    } else {
+        wl_pointer::ButtonState::Released
+    };
+    for p in &state.pointers {
+        if same_client(p, &focus) {
+            p.button(serial, time, button, button_state);
+            pointer_frame(p);
+        }
+    }
+}
+
+fn send_keyboard_key(state: &mut State, keycode: u32, pressed: bool) {
+    let Some(focus) = state.keyboard_focus.clone() else { return };
+    if !focus.is_alive() {
+        return;
+    }
+    // Update modifier state via xkb and emit wl_keyboard.modifiers if it
+    // changed (e.g. shift pressed/released).
+    let mods = state
+        .keymap
+        .as_mut()
+        .map(|km| km.feed_key(keycode, pressed));
+    let time = state.elapsed_ms();
+    let key_state = if pressed {
+        wl_keyboard::KeyState::Pressed
+    } else {
+        wl_keyboard::KeyState::Released
+    };
+
+    if let Some(mods) = mods {
+        let changed = state
+            .keymap
+            .as_mut()
+            .map(|km| km.mods_changed(mods))
+            .unwrap_or(false);
+        if changed {
+            let serial = state.next_serial();
+            for kb in &state.keyboards {
+                if same_client(kb, &focus) {
+                    kb.modifiers(serial, mods.depressed, mods.latched, mods.locked, mods.group);
+                }
+            }
+        }
+    }
+
+    let serial = state.next_serial();
+    for kb in &state.keyboards {
+        if same_client(kb, &focus) {
+            kb.key(serial, time, keycode, key_state);
         }
     }
 }

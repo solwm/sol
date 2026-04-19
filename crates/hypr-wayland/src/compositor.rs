@@ -124,10 +124,12 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
 
                 // Mark as mapped once we have a buffer + role.
                 let has_buffer = sd.current.buffer.is_some();
+                let mut just_mapped = false;
                 if let SurfaceRole::XdgToplevel { mapped } = &mut sd.role {
                     if has_buffer {
                         if !*mapped {
                             *mapped = true;
+                            just_mapped = true;
                             tracing::info!(id = ?surface.id(), "toplevel mapped");
                             state
                                 .mapped_toplevels
@@ -138,6 +140,12 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     }
                 }
                 drop(sd);
+
+                if just_mapped {
+                    // Give this toplevel keyboard focus if no one else has
+                    // it yet, so the user can type into it immediately.
+                    state.on_toplevel_mapped(surface);
+                }
 
                 // Fire frame callbacks immediately (headless, no real vblank).
                 let callbacks = std::mem::take(&mut data.lock().unwrap().frame_callbacks);
