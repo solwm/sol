@@ -35,6 +35,7 @@ mod seat;
 mod shm;
 mod subcompositor;
 mod xdg_decoration;
+mod xdg_output;
 mod xdg_shell;
 mod xkb;
 
@@ -43,6 +44,7 @@ use input::{InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
 use wayland_server::protocol::{
     wl_data_device_manager::WlDataDeviceManager,
@@ -174,6 +176,7 @@ pub struct Globals {
     pub layer_shell: GlobalId,
     pub subcompositor: GlobalId,
     pub data_device_manager: GlobalId,
+    pub xdg_output_manager: GlobalId,
 }
 
 impl State {
@@ -671,6 +674,10 @@ fn setup_event_loop(
         ),
         data_device_manager: dh.create_global::<State, WlDataDeviceManager, ()>(
             data_device::DATA_DEVICE_MANAGER_VERSION,
+            (),
+        ),
+        xdg_output_manager: dh.create_global::<State, ZxdgOutputManagerV1, ()>(
+            xdg_output::XDG_OUTPUT_MANAGER_VERSION,
             (),
         ),
     };
