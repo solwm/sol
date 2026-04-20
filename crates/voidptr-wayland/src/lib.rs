@@ -805,17 +805,23 @@ fn setup_event_loop(
         socket_name
     );
 
-    // Wire SIGINT/SIGTERM to stop the calloop run cleanly. Stopping here
-    // causes `run()` to return, which drops Compositor -> BackendState ->
-    // DrmPresenter, whose Drop restores the saved CRTC so the TTY unblanks.
-    // ctrlc::set_handler panics if called twice in the same process; that's
-    // fine, voidptr only sets up one event loop per invocation.
+    // External stop signals (SIGTERM, SIGHUP — the ones `killall voidptr`
+    // and `kill <pid>` send) trigger a clean shutdown: calloop returns
+    // from `run`, Compositor drops, DrmPresenter's Drop restores the
+    // saved CRTC so the TTY unblanks. ctrlc::set_handler with the
+    // termination feature registers for SIGINT+SIGTERM+SIGHUP; we
+    // immediately override SIGINT back to SIG_IGN below so Ctrl+C
+    // doesn't kill us — it should reach the focused client via
+    // libinput like any other keystroke.
     let loop_signal = event_loop.get_signal();
     if let Err(e) = ctrlc::set_handler(move || {
         tracing::info!("shutdown signal received; stopping event loop");
         loop_signal.stop();
     }) {
-        tracing::warn!(error = %e, "ctrlc handler install failed; Ctrl+C may not cleanly restore the TTY");
+        tracing::warn!(error = %e, "ctrlc handler install failed; `killall voidptr` won't cleanly restore the TTY");
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
 
     event_loop
