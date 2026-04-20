@@ -319,7 +319,21 @@ fn apply_layout(state: &mut State) {
 /// recently told the client, send a fresh xdg_toplevel.configure +
 /// xdg_surface.configure. Cached via `Window.pending_size` so steady-state
 /// render ticks don't re-send configures.
+///
+/// We send `Maximized` + `Activated` in the states list. `Maximized` tells
+/// the client it MUST obey the geometry (per xdg-shell spec, otherwise
+/// clients treat the size as a hint and fall back to their preferred
+/// default — alacritty defaults to ~80x24 cells, which is why cmatrix was
+/// tiny). `Activated` marks the focused window for styling hints; harmless
+/// on unfocused ones for now.
 fn send_pending_configures(state: &mut State) {
+    // xdg_toplevel::State values from xdg-shell.xml.
+    const STATE_MAXIMIZED: u32 = 1;
+    const STATE_ACTIVATED: u32 = 4;
+    let mut state_bytes: Vec<u8> = Vec::with_capacity(8);
+    state_bytes.extend_from_slice(&STATE_MAXIMIZED.to_ne_bytes());
+    state_bytes.extend_from_slice(&STATE_ACTIVATED.to_ne_bytes());
+
     let mut todo: Vec<(usize, i32, i32)> = Vec::new();
     for (i, win) in state.mapped_toplevels.iter().enumerate() {
         let target = (win.rect.w, win.rect.h);
@@ -346,7 +360,7 @@ fn send_pending_configures(state: &mut State) {
             (tl, xs)
         };
         let serial = state.next_serial();
-        tl.configure(w, h, Vec::new());
+        tl.configure(w, h, state_bytes.clone());
         xs.configure(serial);
         state.mapped_toplevels[i].pending_size = Some((w, h));
     }
