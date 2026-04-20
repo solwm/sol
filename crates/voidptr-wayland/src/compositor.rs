@@ -43,6 +43,13 @@ pub enum SurfaceRole {
         /// this state to request reconfiguration.
         initial_configure_sent: bool,
     },
+    /// `wl_subsurface` role. Subsurfaces are children of another
+    /// wl_surface, positioned at an offset, and drawn as part of the
+    /// parent's tree (popups, tooltips, cursor images). We accept the
+    /// role so GTK/Qt clients initialize cleanly; actual rendering of
+    /// subsurface trees is a later polish item — main-window content
+    /// via xdg_toplevel still works.
+    Subsurface,
 }
 
 #[derive(Default)]
@@ -200,7 +207,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                             *mapped = false;
                         }
                     }
-                    SurfaceRole::None => {}
+                    SurfaceRole::None | SurfaceRole::Subsurface => {}
                 }
                 drop(sd);
 

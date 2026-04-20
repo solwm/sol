@@ -32,6 +32,7 @@ mod output;
 mod render;
 mod seat;
 mod shm;
+mod subcompositor;
 mod xdg_decoration;
 mod xdg_shell;
 mod xkb;
@@ -45,6 +46,7 @@ use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLay
 use wayland_server::protocol::{
     wl_keyboard::{self, WlKeyboard},
     wl_pointer::{self, WlPointer},
+    wl_subcompositor::WlSubcompositor,
 };
 use xkb::KeymapState;
 
@@ -168,6 +170,7 @@ pub struct Globals {
     pub linux_dmabuf: GlobalId,
     pub xdg_decoration: GlobalId,
     pub layer_shell: GlobalId,
+    pub subcompositor: GlobalId,
 }
 
 impl State {
@@ -657,6 +660,10 @@ fn setup_event_loop(
         ),
         layer_shell: dh.create_global::<State, ZwlrLayerShellV1, ()>(
             layer_shell::LAYER_SHELL_VERSION,
+            (),
+        ),
+        subcompositor: dh.create_global::<State, WlSubcompositor, ()>(
+            subcompositor::SUBCOMPOSITOR_VERSION,
             (),
         ),
     };
