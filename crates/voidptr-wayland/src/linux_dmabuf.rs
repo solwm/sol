@@ -243,11 +243,11 @@ fn send_feedback(
 impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
     fn request(
         _state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &ZwpLinuxBufferParamsV1,
         request: zwp_linux_buffer_params_v1::Request,
         data: &ParamsData,
-        _dh: &DisplayHandle,
+        dh: &DisplayHandle,
         init: &mut DataInit<'_, Self>,
     ) {
         match request {
@@ -314,20 +314,52 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
                 );
             }
             zwp_linux_buffer_params_v1::Request::Create {
-                width: _,
-                height: _,
-                format: _,
+                width,
+                height,
+                format,
                 flags: _,
             } => {
-                // Async form sends `created`/`failed` events. Implementing
-                // `created` requires constructing a wl_buffer resource on
-                // the client's side without a DataInit; Mesa/alacritty use
-                // create_immed anyway, so B10.2 fails this path and lets
-                // the client fall back.
-                let mut inner = data.inner.lock().unwrap();
-                inner.consumed = true;
-                resource.failed();
-                tracing::debug!("dmabuf_params.create (async) -> failed (use create_immed)");
+                // Async form: server-side allocates a wl_buffer resource on
+                // behalf of the client, then signals via `created(buffer)`.
+                // Mesa uses this path on Wayland (not create_immed); failing
+                // it was why alacritty's EGL allocator stalled and the
+                // client never committed a frame.
+                let planes = {
+                    let mut inner = data.inner.lock().unwrap();
+                    if inner.consumed {
+                        resource.post_error(
+                            zwp_linux_buffer_params_v1::Error::AlreadyUsed,
+                            "params already consumed",
+                        );
+                        return;
+                    }
+                    inner.consumed = true;
+                    std::mem::take(&mut inner.planes)
+                };
+                match client.create_resource::<WlBuffer, DmabufBuffer, State>(
+                    dh,
+                    1,
+                    DmabufBuffer {
+                        width,
+                        height,
+                        format,
+                        planes,
+                    },
+                ) {
+                    Ok(buffer) => {
+                        resource.created(&buffer);
+                        tracing::info!(
+                            width,
+                            height,
+                            format = format_as_str(format),
+                            "dmabuf.create -> wl_buffer (async)"
+                        );
+                    }
+                    Err(e) => {
+                        resource.failed();
+                        tracing::warn!(error = ?e, "dmabuf.create: create_resource failed");
+                    }
+                }
             }
             zwp_linux_buffer_params_v1::Request::Destroy => {}
             _ => {}
