@@ -309,7 +309,18 @@ demo-b10 card=drm_card seconds="60": _prep clean-socket
     done
     [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
     echo "=== launching: $CMD ==="
-    sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+    # Turn on every Mesa/EGL/GL/Wayland debug channel so if alacritty hangs
+    # at startup (it did once due to dmabuf feedback issues) we actually
+    # see the reason in alacritty.log instead of an empty file.
+    sudo -E \
+        XDG_RUNTIME_DIR={{runtime}} \
+        WAYLAND_DISPLAY={{socket}} \
+        WAYLAND_DEBUG=1 \
+        EGL_LOG_LEVEL=debug \
+        LIBGL_DEBUG=verbose \
+        MESA_DEBUG=1 \
+        MESA_VERBOSE=all \
+        RUST_LOG=info \
         $CMD > {{runtime}}/alacritty.log 2>&1 &
     alacritty_pid=$!
     echo "running for {{seconds}}s. watch cmatrix rain — should be smooth now."

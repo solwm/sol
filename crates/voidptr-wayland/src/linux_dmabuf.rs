@@ -48,13 +48,18 @@ pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// falling back to llvmpipe.
 pub const DMABUF_VERSION: u32 = 4;
 
-/// Format + modifier pairs we advertise. `(format, modifier)`.
+/// Format + modifier pairs we advertise. `(format, modifier)`. Keep this
+/// minimal: Mesa deadlocks on empty buffer commits if it can't satisfy
+/// any advertised tranche with the paths it actually supports on the
+/// main device. XRGB8888 with INVALID (implicit) modifier is the
+/// maximally-compatible choice — Mesa lets the driver pick whatever
+/// tiling it prefers — and LINEAR is the universal fallback.
 fn supported_format_pairs() -> &'static [(u32, u64)] {
     &[
-        (FOURCC_ARGB8888, DRM_FORMAT_MOD_LINEAR),
-        (FOURCC_XRGB8888, DRM_FORMAT_MOD_LINEAR),
-        (FOURCC_ARGB8888, DRM_FORMAT_MOD_INVALID),
         (FOURCC_XRGB8888, DRM_FORMAT_MOD_INVALID),
+        (FOURCC_ARGB8888, DRM_FORMAT_MOD_INVALID),
+        (FOURCC_XRGB8888, DRM_FORMAT_MOD_LINEAR),
+        (FOURCC_ARGB8888, DRM_FORMAT_MOD_LINEAR),
     ]
 }
 
