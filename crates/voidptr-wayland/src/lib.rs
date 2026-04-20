@@ -104,6 +104,10 @@ pub struct State {
     /// implicit throttle keeps clients in lock-step with our vblank cadence
     /// instead of over-rendering at max CPU speed.
     pub pending_frame_callbacks: Vec<wayland_server::protocol::wl_callback::WlCallback>,
+    /// DRM device path used by the backend, so zwp_linux_dmabuf_v1 v4
+    /// feedback can stat it and hand Mesa the `main_device` dev_t. None
+    /// in headless mode; dmabuf clients won't get useful feedback.
+    pub drm_device_path: Option<PathBuf>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -533,6 +537,7 @@ fn setup_event_loop(
     screen_width: u32,
     screen_height: u32,
     input: Option<(InputState, std::os::fd::OwnedFd)>,
+    drm_device_path: Option<PathBuf>,
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, Compositor> =
         EventLoop::try_new().context("create calloop event loop")?;
@@ -656,6 +661,7 @@ fn setup_event_loop(
         pointer_focus: None,
         keyboard_focus: None,
         pending_frame_callbacks: Vec::new(),
+        drm_device_path,
     };
     let mut compositor = Compositor {
         state,
@@ -876,7 +882,7 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
         canvas: Canvas::new(width, height),
         png_path,
     };
-    setup_event_loop(backend, width, height, None)
+    setup_event_loop(backend, width, height, None, None)
 }
 
 /// DRM backend: takes master on `device`, renders via GLES to the screen.
@@ -894,7 +900,13 @@ pub fn run_drm(device: &Path) -> Result<()> {
             None
         }
     };
-    setup_event_loop(BackendState::Drm(presenter), w, h, input)
+    setup_event_loop(
+        BackendState::Drm(presenter),
+        w,
+        h,
+        input,
+        Some(device.to_path_buf()),
+    )
 }
 
 /// Back-compat entry: default to headless with the old PNG path.

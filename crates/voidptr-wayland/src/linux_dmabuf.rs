@@ -1,18 +1,27 @@
 //! zwp_linux_dmabuf_v1 — dmabuf-backed wl_buffers.
 //!
-//! B10.2 scope: protocol skeleton only. We advertise the global with a
-//! minimal format/modifier table (ARGB8888 + XRGB8888, LINEAR) so EGL
-//! clients pick this path over SHM. Plane info is collected via
-//! `create_params` → `add`, and `create_immed` hands back a `wl_buffer`
-//! whose user-data is a `DmabufBuffer` struct. We do NOT import the
-//! dmabuf server-side yet — rendering stays empty for dmabuf-backed
-//! surfaces until B10.3/B10.4 land EGLImage import and the renderer fork.
+//! Advertises the global at version 4 with full `zwp_linux_dmabuf_feedback_v1`
+//! support. Mesa's EGL on Wayland requires knowing the `main_device`
+//! (the DRM device the compositor drives) before it can open a render
+//! node and use hardware GL — without feedback it falls back to llvmpipe
+//! software rasterization, writes SHM buffers, and everything looks
+//! terrible. The feedback object hands over the format+modifier table
+//! (via memfd) and the device dev_t so Mesa picks the correct path.
+//!
+//! Legacy `format`/`modifier` events are still emitted for v1-v3 binds.
+//! Plane info collected via `create_params → add → create_immed` becomes
+//! a `DmabufBuffer` attached to the new `wl_buffer` as user-data. Import
+//! into GL textures happens in `voidptr_backend_drm::presenter`.
 
-use std::os::fd::OwnedFd;
+use std::io::Write;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Mutex;
 
+use anyhow::{Context, Result};
+use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
     zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},
 };
 use wayland_server::{
@@ -34,9 +43,20 @@ pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// without us having to enumerate driver-specific modifiers by hand.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
-/// Version 3 is the widely-supported level and avoids the v4+ feedback
-/// object machinery. B10.5 can bump to v4 if we want per-surface feedback.
-pub const DMABUF_VERSION: u32 = 3;
+/// Version 4 introduces per-surface feedback with main_device — required
+/// for Mesa EGL on Wayland to pick the hardware GL driver instead of
+/// falling back to llvmpipe.
+pub const DMABUF_VERSION: u32 = 4;
+
+/// Format + modifier pairs we advertise. `(format, modifier)`.
+fn supported_format_pairs() -> &'static [(u32, u64)] {
+    &[
+        (FOURCC_ARGB8888, DRM_FORMAT_MOD_LINEAR),
+        (FOURCC_XRGB8888, DRM_FORMAT_MOD_LINEAR),
+        (FOURCC_ARGB8888, DRM_FORMAT_MOD_INVALID),
+        (FOURCC_XRGB8888, DRM_FORMAT_MOD_INVALID),
+    ]
+}
 
 #[derive(Debug)]
 pub struct DmabufPlane {
@@ -84,16 +104,19 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for State {
         let d = init.init(resource, ());
         tracing::info!(id = ?d.id(), version = d.version(), "bind zwp_linux_dmabuf_v1");
 
-        // v1–v3 legacy format / modifier events. Clients binding at v4+
-        // expect to use get_default_feedback; we only advertise up to v3.
-        d.format(FOURCC_ARGB8888);
-        d.format(FOURCC_XRGB8888);
-        if d.version() >= 3 {
-            for modifier in [DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID] {
-                let mhi = (modifier >> 32) as u32;
-                let mlo = (modifier & 0xffff_ffff) as u32;
-                d.modifier(FOURCC_ARGB8888, mhi, mlo);
-                d.modifier(FOURCC_XRGB8888, mhi, mlo);
+        // Legacy format / modifier events for v1-v3 clients. The spec marks
+        // these deprecated at v4+ (clients use feedback instead); send them
+        // only for older binds so v4 clients get a clean feedback flow.
+        if d.version() < 4 {
+            d.format(FOURCC_ARGB8888);
+            d.format(FOURCC_XRGB8888);
+            if d.version() >= 3 {
+                for modifier in [DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID] {
+                    let mhi = (modifier >> 32) as u32;
+                    let mlo = (modifier & 0xffff_ffff) as u32;
+                    d.modifier(FOURCC_ARGB8888, mhi, mlo);
+                    d.modifier(FOURCC_XRGB8888, mhi, mlo);
+                }
             }
         }
     }
@@ -101,7 +124,7 @@ impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for State {
 
 impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &ZwpLinuxDmabufV1,
         request: zwp_linux_dmabuf_v1::Request,
@@ -114,14 +137,102 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
                 let _ = init.init(params_id, ParamsData::default());
                 tracing::debug!("dmabuf.create_params");
             }
+            zwp_linux_dmabuf_v1::Request::GetDefaultFeedback { id } => {
+                let fb = init.init(id, ());
+                if let Err(e) = send_feedback(&fb, state.drm_device_path.as_deref()) {
+                    tracing::warn!(error = %e, "dmabuf get_default_feedback failed");
+                } else {
+                    tracing::info!("dmabuf.get_default_feedback -> sent");
+                }
+            }
+            zwp_linux_dmabuf_v1::Request::GetSurfaceFeedback { id, surface: _ } => {
+                let fb = init.init(id, ());
+                if let Err(e) = send_feedback(&fb, state.drm_device_path.as_deref()) {
+                    tracing::warn!(error = %e, "dmabuf get_surface_feedback failed");
+                } else {
+                    tracing::info!("dmabuf.get_surface_feedback -> sent");
+                }
+            }
             zwp_linux_dmabuf_v1::Request::Destroy => {}
-            // v4 feedback objects — we advertise v3 so clients shouldn't
-            // reach here. If they do, just log and drop.
             _ => {
                 tracing::warn!("unhandled zwp_linux_dmabuf_v1 request");
             }
         }
     }
+}
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for State {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &ZwpLinuxDmabufFeedbackV1,
+        request: zwp_linux_dmabuf_feedback_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        _init: &mut DataInit<'_, Self>,
+    ) {
+        if let zwp_linux_dmabuf_feedback_v1::Request::Destroy = request {
+            // feedback is stateless for us — nothing to release.
+        }
+    }
+}
+
+/// Build + send a complete feedback event sequence:
+/// format_table → main_device → tranche_target_device → tranche_formats →
+/// tranche_flags → tranche_done → done. Mesa relies on main_device to
+/// pick the hardware GL path; without it, EGL-on-Wayland falls back to
+/// llvmpipe.
+fn send_feedback(
+    fb: &ZwpLinuxDmabufFeedbackV1,
+    drm_device_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let device_path = drm_device_path
+        .ok_or_else(|| anyhow::anyhow!("no DRM device path on State (headless mode?)"))?;
+
+    // 1. Format table in a memfd. Each entry is 16 bytes: u32 format, u32
+    //    padding, u64 modifier. Mesa mmaps this read-only and indexes by
+    //    u16 position sent later in tranche_formats.
+    let pairs = supported_format_pairs();
+    let mut table = Vec::with_capacity(pairs.len() * 16);
+    for (fmt, modifier) in pairs {
+        table.extend_from_slice(&fmt.to_ne_bytes());
+        table.extend_from_slice(&0u32.to_ne_bytes());
+        table.extend_from_slice(&modifier.to_ne_bytes());
+    }
+    let fd = memfd_create("voidptr-dmabuf-format-table", MemfdFlags::CLOEXEC)
+        .context("memfd_create")?;
+    ftruncate(&fd, table.len() as u64).context("ftruncate format table")?;
+    {
+        let mut f = std::fs::File::from(fd);
+        f.write_all(&table).context("write format table")?;
+        fb.format_table(f.as_fd(), table.len() as u32);
+    } // f closes here; wayland-rs already dup'd the fd.
+
+    // 2. main_device: dev_t of the DRM device we drive. Mesa uses this to
+    //    open the matching render node via libdrm.
+    let stat = rustix::fs::stat(device_path).context("stat drm device")?;
+    let rdev: u64 = stat.st_rdev;
+    let dev_bytes = rdev.to_ne_bytes().to_vec();
+    fb.main_device(dev_bytes.clone());
+
+    // 3. One tranche, same device, with all our format/modifier indices.
+    fb.tranche_target_device(dev_bytes);
+    let mut indices = Vec::with_capacity(pairs.len() * 2);
+    for i in 0..pairs.len() as u16 {
+        indices.extend_from_slice(&i.to_ne_bytes());
+    }
+    fb.tranche_formats(indices);
+    fb.tranche_flags(zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty());
+    fb.tranche_done();
+    fb.done();
+
+    tracing::info!(
+        device = %device_path.display(),
+        rdev,
+        pairs = pairs.len(),
+        "dmabuf feedback sent"
+    );
+    Ok(())
 }
 
 impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
