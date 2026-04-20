@@ -2,13 +2,13 @@
 //!
 //! Pools are mmapped read-only from the server's side; clients retain their
 //! own writable mapping via the fd they passed in, so buffer updates propagate
-//! through the shared memory region without server-side copies.
-//!
-//! Resize is not yet supported (B2 clients either pick a size up-front or
-//! allocate a larger pool). Attempting to resize just logs a warning.
+//! through the shared memory region without server-side copies. Resize is
+//! supported (grow only, per spec); existing wl_buffers keep their original
+//! mapping via their private `Arc<Mmap>` ref, while subsequently-created
+//! buffers allocate against the new, larger mapping.
 
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use memmap2::{Mmap, MmapOptions};
 use wayland_server::{
@@ -23,10 +23,16 @@ use wayland_server::{
 use crate::State;
 use voidptr_core::PixelFormat;
 
-/// User data attached to a wl_shm_pool. Holds the mmap so buffers can read
-/// pixels even after the client destroys the pool resource (spec: pool is
-/// just a name for the mapping, buffers keep the mapping alive).
+/// User data attached to a wl_shm_pool. The mmap lives behind a mutex so the
+/// Resize request (which sees only `&PoolData` via the Dispatch signature)
+/// can swap it for a bigger mapping.
 pub struct PoolData {
+    pub inner: Mutex<PoolInner>,
+    /// Kept alive so Resize can re-mmap at a larger size.
+    pub fd: OwnedFd,
+}
+
+pub struct PoolInner {
     pub mmap: Arc<Mmap>,
     pub size: usize,
 }
@@ -111,8 +117,11 @@ fn mmap_pool(fd: OwnedFd, size: i32) -> anyhow::Result<PoolData> {
     }
     let mmap = unsafe { MmapOptions::new().len(size as usize).map(&fd)? };
     Ok(PoolData {
-        mmap: Arc::new(mmap),
-        size: size as usize,
+        inner: Mutex::new(PoolInner {
+            mmap: Arc::new(mmap),
+            size: size as usize,
+        }),
+        fd,
     })
 }
 
@@ -142,8 +151,12 @@ impl Dispatch<WlShmPool, PoolData> for State {
                         return;
                     }
                 };
+                let mmap = {
+                    let inner = data.inner.lock().unwrap();
+                    inner.mmap.clone()
+                };
                 let buf = BufferData {
-                    mmap: data.mmap.clone(),
+                    mmap,
                     offset,
                     width,
                     height,
@@ -153,8 +166,32 @@ impl Dispatch<WlShmPool, PoolData> for State {
                 let _ = init.init(id, buf);
                 tracing::trace!(width, height, stride, ?format, "wl_shm_pool.create_buffer");
             }
-            wl_shm_pool::Request::Resize { size: _ } => {
-                tracing::warn!("wl_shm_pool.resize ignored at B2");
+            wl_shm_pool::Request::Resize { size } => {
+                if size <= 0 {
+                    pool.post_error(
+                        wl_shm::Error::InvalidStride,
+                        "wl_shm_pool.resize: non-positive size",
+                    );
+                    return;
+                }
+                let new_size = size as usize;
+                let mut inner = data.inner.lock().unwrap();
+                if new_size <= inner.size {
+                    // Spec: resize can only grow. Silently ignore
+                    // shrink — clients sometimes send the same size
+                    // after a buffer destroy; not a protocol error.
+                    return;
+                }
+                match unsafe { MmapOptions::new().len(new_size).map(&data.fd) } {
+                    Ok(new_mmap) => {
+                        inner.mmap = Arc::new(new_mmap);
+                        inner.size = new_size;
+                        tracing::debug!(new_size, "wl_shm_pool.resize applied");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, new_size, "wl_shm_pool.resize: mmap failed");
+                    }
+                }
             }
             wl_shm_pool::Request::Destroy => {}
             _ => {}
@@ -164,16 +201,21 @@ impl Dispatch<WlShmPool, PoolData> for State {
 
 impl Dispatch<WlBuffer, BufferData> for State {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WlBuffer,
         request: wl_buffer::Request,
-        _data: &BufferData,
+        data: &BufferData,
         _dh: &DisplayHandle,
         _init: &mut DataInit<'_, Self>,
     ) {
         if let wl_buffer::Request::Destroy = request {
-            // No extra bookkeeping; user data drop releases the Arc<Mmap>.
+            // Queue the cache entry for eviction on the next render tick.
+            // Buffer_key is the BufferData pointer (same value used at
+            // texture upload time), so the DRM presenter can find and
+            // free the GL texture.
+            let key = (data as *const BufferData) as usize as u64;
+            state.pending_texture_evictions.push(key);
         }
     }
 }

@@ -146,16 +146,12 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
                 let fb = init.init(id, ());
                 if let Err(e) = send_feedback(&fb, state.drm_device_path.as_deref()) {
                     tracing::warn!(error = %e, "dmabuf get_default_feedback failed");
-                } else {
-                    tracing::info!("dmabuf.get_default_feedback -> sent");
                 }
             }
             zwp_linux_dmabuf_v1::Request::GetSurfaceFeedback { id, surface: _ } => {
                 let fb = init.init(id, ());
                 if let Err(e) = send_feedback(&fb, state.drm_device_path.as_deref()) {
                     tracing::warn!(error = %e, "dmabuf get_surface_feedback failed");
-                } else {
-                    tracing::info!("dmabuf.get_surface_feedback -> sent");
                 }
             }
             zwp_linux_dmabuf_v1::Request::Destroy => {}
@@ -231,7 +227,7 @@ fn send_feedback(
     fb.tranche_done();
     fb.done();
 
-    tracing::info!(
+    tracing::debug!(
         device = %device_path.display(),
         rdev,
         pairs = pairs.len(),
@@ -296,7 +292,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
                     inner.consumed = true;
                     std::mem::take(&mut inner.planes)
                 };
-                tracing::info!(
+                tracing::debug!(
                     width,
                     height,
                     format = format_as_str(format),
@@ -348,7 +344,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
                 ) {
                     Ok(buffer) => {
                         resource.created(&buffer);
-                        tracing::info!(
+                        tracing::debug!(
                             width,
                             height,
                             format = format_as_str(format),
@@ -369,16 +365,21 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
 
 impl Dispatch<WlBuffer, DmabufBuffer> for State {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WlBuffer,
         request: wl_buffer::Request,
-        _data: &DmabufBuffer,
+        data: &DmabufBuffer,
         _dh: &DisplayHandle,
         _init: &mut DataInit<'_, Self>,
     ) {
         if let wl_buffer::Request::Destroy = request {
-            tracing::debug!("dmabuf wl_buffer destroyed");
+            // Queue for eviction: alacritty creates a new dmabuf on every
+            // tile resize, so without this the EGLImage + GL texture for
+            // each old buffer leak until voidptr exits.
+            let key = (data as *const DmabufBuffer) as usize as u64;
+            state.pending_texture_evictions.push(key);
+            tracing::debug!(key, "dmabuf wl_buffer destroyed; queued for eviction");
         }
     }
 }

@@ -23,6 +23,7 @@ use drm::control::{
     framebuffer,
 };
 use gbm::{AsRaw, BufferObjectFlags, Format as GbmFormat};
+use glow::HasContext;
 use khronos_egl as egl;
 use rustix::event::{PollFd, PollFlags, poll};
 
@@ -333,6 +334,25 @@ impl GlStack {
                 "glEGLImageTargetTexture2DOES not found; dmabuf clients will not render"
             );
         }
+
+        // Verify the GLES2 extensions we actually depend on are present.
+        // Mesa almost always has these on DRM-backed EGL; if they're
+        // missing (e.g. exotic vendor driver), dmabuf clients would
+        // silently render black — surface it loudly at startup instead.
+        let exts: String = gl.supported_extensions().iter().cloned().collect::<Vec<_>>().join(" ");
+        let want = [
+            "GL_OES_EGL_image",
+            "GL_OES_EGL_image_external",
+        ];
+        for ext in want {
+            if !gl.supported_extensions().contains(ext) {
+                tracing::warn!(
+                    ext,
+                    "GLES2 extension not advertised; dmabuf rendering will fail"
+                );
+            }
+        }
+        tracing::debug!(%exts, "GLES2 supported extensions");
 
         Ok(Self {
             egl,

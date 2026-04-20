@@ -116,6 +116,11 @@ pub struct State {
     /// evdev keycodes; Alt is scancode 56 (left) or 100 (right).
     pub left_alt_down: bool,
     pub right_alt_down: bool,
+    /// Keys of texture cache entries the DRM presenter should evict on
+    /// the next render tick. Filled by `Dispatch<WlBuffer, _>::Destroy`
+    /// handlers when a client tears down a buffer; drained (and acted
+    /// on) inside `render_tick` which has `&mut` access to the backend.
+    pub pending_texture_evictions: Vec<u64>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -374,7 +379,7 @@ fn send_pending_configures(state: &mut State) {
         tl.configure(w, h, state_bytes.clone());
         xs.configure(serial);
         state.mapped_toplevels[i].pending_size = Some((w, h));
-        tracing::info!(
+        tracing::debug!(
             tile_index = i,
             width = w,
             height = h,
@@ -477,6 +482,18 @@ fn scene_from_buffers<'a>(
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
+    // Free GPU-side resources for buffers clients destroyed since the
+    // last tick. Dmabuf-backed entries hold EGLImages that don't get
+    // freed via Drop; they'd otherwise accumulate per client-resize.
+    if let BackendState::Drm(presenter) = &mut comp.backend {
+        for key in std::mem::take(&mut comp.state.pending_texture_evictions) {
+            presenter.evict_texture(key);
+        }
+    } else {
+        // Headless has no per-buffer GPU state; just discard the list.
+        comp.state.pending_texture_evictions.clear();
+    }
+
     // Prune dead weak refs, recompute tile rects, then push fresh configures
     // to any client whose tile size has changed since the last we told them.
     comp.state
@@ -673,6 +690,7 @@ fn setup_event_loop(
         socket_name: socket_name.clone(),
         left_alt_down: false,
         right_alt_down: false,
+        pending_texture_evictions: Vec::new(),
     };
     let mut compositor = Compositor {
         state,

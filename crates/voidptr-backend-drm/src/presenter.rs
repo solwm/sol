@@ -123,6 +123,28 @@ impl DrmPresenter {
         (self.width, self.height)
     }
 
+    /// Drop the cached texture + EGLImage for a given buffer_key.
+    /// Callers should do this when a client destroys the backing
+    /// wl_buffer; otherwise dmabuf EGLImages accumulate across every
+    /// resize and leak GPU memory until the compositor exits.
+    pub fn evict_texture(&mut self, key: u64) {
+        let Some(entry) = self.textures.remove(&key) else {
+            return;
+        };
+        unsafe {
+            self.gl_stack.gl.delete_texture(entry.tex);
+        }
+        if let Some(img) = entry.egl_image {
+            if let Err(e) = self
+                .gl_stack
+                .egl
+                .destroy_image(self.gl_stack.display, img)
+            {
+                tracing::warn!(error = ?e, "destroy_image on eviction failed");
+            }
+        }
+    }
+
     fn initial_modeset(&mut self) -> Result<()> {
         // Render a dark frame so the first thing on screen isn't undefined
         // GBM memory (some drivers show garbage).
@@ -552,7 +574,7 @@ fn import_dmabuf_texture(
         tex
     };
 
-    tracing::info!(
+    tracing::debug!(
         width = elem.width,
         height = elem.height,
         modifier,

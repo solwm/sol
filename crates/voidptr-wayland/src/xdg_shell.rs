@@ -133,14 +133,14 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                 toplevel.configure(sw, sh, tile_state_bytes());
                 let serial = state.next_serial();
                 xs.configure(serial);
-                tracing::info!(width = sw, height = sh, "initial xdg_toplevel.configure");
+                tracing::debug!(width = sw, height = sh, "initial xdg_toplevel.configure");
             }
             xdg_surface::Request::GetPopup { id, .. } => {
                 let _ = init.init(id, ());
                 tracing::warn!("xdg popup not implemented at B2");
             }
             xdg_surface::Request::AckConfigure { serial } => {
-                tracing::info!(serial, "client ack_configure");
+                tracing::debug!(serial, "client ack_configure");
             }
             xdg_surface::Request::SetWindowGeometry { .. } => {}
             xdg_surface::Request::Destroy => {}
