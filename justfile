@@ -1,6 +1,10 @@
 set shell := ["bash", "-cu"]
 
-runtime := "/tmp/voidptr-run"
+# Prefer the user's real XDG_RUNTIME_DIR (systemd-logind creates
+# `/run/user/$UID` on login, owned by the user, mode 700 — already
+# dconf/fontconfig-friendly). Fall back to a pinned path only if the
+# env var isn't set (e.g. running from an unusual context).
+runtime := env_var_or_default("XDG_RUNTIME_DIR", "/tmp/voidptr-run")
 socket  := "wayland-1"
 png     := "/tmp/voidptr-headless.png"
 # AMD card on this box has the monitor attached; card1 is the NVIDIA GPU with
