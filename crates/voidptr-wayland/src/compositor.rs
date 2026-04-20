@@ -150,9 +150,34 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
             }
             wl_surface::Request::Commit => {
                 let mut sd = data.lock().unwrap();
-                // Promote pending -> current.
+                // Promote pending -> current, but hold onto the previous
+                // buffer so we can release it once the new one has
+                // definitively replaced it (see "release old buffer"
+                // block below — GDK's cairo surfaces fault otherwise).
+                let old_buffer = sd.current.buffer.take();
                 sd.current.buffer = sd.pending.buffer.take();
                 sd.current.damage = std::mem::take(&mut sd.pending.damage);
+
+                // Release the replaced buffer so the client can reuse it,
+                // per the wl_buffer.release "no longer used" contract.
+                // Only when old != new (same-buffer re-attach keeps the
+                // current reference live) and only after we've released
+                // the SurfaceData lock so any handlers don't re-enter us.
+                let new_buffer_id = sd
+                    .current
+                    .buffer
+                    .as_ref()
+                    .and_then(|w| w.upgrade().ok())
+                    .map(|b| b.id());
+                drop(sd);
+                if let Some(old_weak) = old_buffer {
+                    if let Ok(old_buf) = old_weak.upgrade() {
+                        if Some(old_buf.id()) != new_buffer_id {
+                            old_buf.release();
+                        }
+                    }
+                }
+                let sd = data.lock().unwrap();
 
                 // If this surface has a layer-shell role, double-buffer
                 // its per-role state (anchor, size, margin, etc.) the

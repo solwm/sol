@@ -620,10 +620,12 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
         }
     }
 
-    // Scene is done; drop buffers to release them back to clients.
-    for (buf, _) in placed {
-        buf.release();
-    }
+    // Don't release buffers here — release fires once, when a client
+    // attaches a new buffer that replaces this one (handled in the
+    // commit dispatch). Releasing per-frame was producing spurious
+    // events for buffers still in use, which tripped GDK's
+    // buffer_release_callback assertion and crashed Firefox.
+    drop(placed);
 
     // Present is done — fire every frame callback the clients requested
     // against the buffers we just displayed. On DRM this fires right after
