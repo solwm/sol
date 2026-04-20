@@ -64,6 +64,43 @@ pub struct OutputSelection {
     pub mode: drm::control::Mode,
 }
 
+/// Mode selection preference: width x height at the given integer refresh.
+/// Exposed as `VOIDPTR_MODE=WxH@Hz`; when absent, voidptr defaults to
+/// 3840x2160@240 and silently falls back to the connector's PREFERRED
+/// mode if that isn't advertised.
+#[derive(Debug, Clone, Copy)]
+pub struct ModePreference {
+    pub width: u16,
+    pub height: u16,
+    pub refresh_hz: u32,
+}
+
+impl ModePreference {
+    fn matches(&self, m: &drm::control::Mode) -> bool {
+        let (w, h) = m.size();
+        w == self.width && h == self.height && m.vrefresh() == self.refresh_hz
+    }
+}
+
+/// Parse `WxH@Hz` (e.g., `3840x2160@240`). Returns None on any parse error.
+fn parse_mode_pref(s: &str) -> Option<ModePreference> {
+    let (wh, hz) = s.split_once('@')?;
+    let (w, h) = wh.split_once('x')?;
+    Some(ModePreference {
+        width: w.trim().parse().ok()?,
+        height: h.trim().parse().ok()?,
+        refresh_hz: hz.trim().parse().ok()?,
+    })
+}
+
+fn default_mode_pref() -> ModePreference {
+    ModePreference {
+        width: 3840,
+        height: 2160,
+        refresh_hz: 240,
+    }
+}
+
 /// Describe what's connected without touching master. Safe to run while
 /// another compositor (Hyprland, whatever) holds DRM master on the same VT.
 pub fn describe_device(device: &Path) -> Result<()> {
@@ -91,7 +128,7 @@ pub fn describe_device(device: &Path) -> Result<()> {
             conn.modes().len()
         );
         if conn.state() == connector::State::Connected {
-            for (i, m) in conn.modes().iter().enumerate().take(3) {
+            for (i, m) in conn.modes().iter().enumerate() {
                 let (w, h) = m.size();
                 println!(
                     "    mode[{i}]: {w}x{h}@{hz} {flags}",
@@ -103,15 +140,25 @@ pub fn describe_device(device: &Path) -> Result<()> {
                     }
                 );
             }
-            if conn.modes().len() > 3 {
-                println!("    ... {} more mode(s)", conn.modes().len() - 3);
-            }
         }
     }
     Ok(())
 }
 
 pub fn pick_output(card: &Card) -> Result<OutputSelection> {
+    // Parse VOIDPTR_MODE if set. An unparseable value is rejected up front —
+    // better to fail loud than silently ignore a typo like `3840X2160@240`.
+    let env_raw = std::env::var("VOIDPTR_MODE").ok();
+    let env_pref = match env_raw.as_deref() {
+        Some(s) => Some(parse_mode_pref(s).ok_or_else(|| {
+            anyhow!(
+                "VOIDPTR_MODE={s:?} is not of the form WxH@Hz (e.g., 3840x2160@240)"
+            )
+        })?),
+        None => None,
+    };
+    let default_pref = default_mode_pref();
+
     let res = card.resource_handles().context("resource_handles")?;
 
     for &connector_h in res.connectors() {
@@ -124,13 +171,33 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
         if conn.modes().is_empty() {
             continue;
         }
-        // Preferred mode > first mode.
-        let mode = conn
+        // Explicit VOIDPTR_MODE overrides everything; missing match is a hard
+        // error so the user sees why. Without an override, we prefer 4K@240,
+        // then the connector's PREFERRED flag, then the first mode.
+        let (mode, source) = if let Some(p) = env_pref {
+            match conn.modes().iter().find(|m| p.matches(m)).copied() {
+                Some(m) => (m, "env"),
+                None => bail!(
+                    "VOIDPTR_MODE {}x{}@{} not advertised by connector {:?}; \
+                     run `just drm-info` to see what's available",
+                    p.width,
+                    p.height,
+                    p.refresh_hz,
+                    conn.interface(),
+                ),
+            }
+        } else if let Some(m) = conn.modes().iter().find(|m| default_pref.matches(m)).copied() {
+            (m, "default-4k240")
+        } else if let Some(m) = conn
             .modes()
             .iter()
             .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
             .copied()
-            .unwrap_or_else(|| conn.modes()[0]);
+        {
+            (m, "preferred")
+        } else {
+            (conn.modes()[0], "first")
+        };
 
         // Find a CRTC that works with this connector's encoder.
         let encoders = conn.encoders().to_vec();
@@ -146,6 +213,7 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
                     width = mode.size().0,
                     height = mode.size().1,
                     vrefresh = mode.vrefresh(),
+                    source,
                     "selected output"
                 );
                 return Ok(OutputSelection {
@@ -170,6 +238,12 @@ pub struct GlStack {
     pub gl: glow::Context,
     pub gbm: gbm::Device<Card>,
     pub gbm_surface: gbm::Surface<()>,
+    /// Function pointer for `glEGLImageTargetTexture2DOES`, looked up once at
+    /// init via eglGetProcAddress. `None` if the GLES implementation doesn't
+    /// advertise GL_OES_EGL_image — in which case dmabuf clients can't be
+    /// rendered and we log a warning on first use.
+    pub gl_egl_image_target_texture_2d_oes:
+        Option<unsafe extern "C" fn(target: u32, image: *mut std::ffi::c_void)>,
 }
 
 impl GlStack {
@@ -244,6 +318,22 @@ impl GlStack {
             })
         };
 
+        // Resolve the GL_OES_EGL_image entry point now so later dmabuf
+        // imports don't need to stash the EGL instance in every call site.
+        let gl_egl_image_target_texture_2d_oes = egl
+            .get_proc_address("glEGLImageTargetTexture2DOES")
+            .map(|p| unsafe {
+                std::mem::transmute::<
+                    _,
+                    unsafe extern "C" fn(u32, *mut std::ffi::c_void),
+                >(p)
+            });
+        if gl_egl_image_target_texture_2d_oes.is_none() {
+            tracing::warn!(
+                "glEGLImageTargetTexture2DOES not found; dmabuf clients will not render"
+            );
+        }
+
         Ok(Self {
             egl,
             display,
@@ -252,8 +342,24 @@ impl GlStack {
             gl,
             gbm,
             gbm_surface,
+            gl_egl_image_target_texture_2d_oes,
         })
     }
+}
+
+/// EGL extension tokens for dmabuf import (EGL_EXT_image_dma_buf_import +
+/// EGL_EXT_image_dma_buf_import_modifiers). Not exposed by khronos_egl so
+/// we spell them out here.
+pub mod dmabuf_egl {
+    pub const EGL_LINUX_DMA_BUF_EXT: khronos_egl::Enum = 0x3270;
+    pub const EGL_LINUX_DRM_FOURCC_EXT: khronos_egl::Attrib = 0x3271;
+    pub const EGL_DMA_BUF_PLANE0_FD_EXT: khronos_egl::Attrib = 0x3272;
+    pub const EGL_DMA_BUF_PLANE0_OFFSET_EXT: khronos_egl::Attrib = 0x3273;
+    pub const EGL_DMA_BUF_PLANE0_PITCH_EXT: khronos_egl::Attrib = 0x3274;
+    pub const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: khronos_egl::Attrib = 0x3443;
+    pub const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: khronos_egl::Attrib = 0x3444;
+    /// Sentinel meaning "no explicit modifier; driver picks."
+    pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 }
 
 /// Run the smoke test. Blocks until the duration elapses or the `should_quit`

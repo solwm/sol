@@ -210,6 +210,174 @@ demo-b6-1 card=drm_card seconds="8": _prep clean-socket
     sleep {{seconds}}
     sudo kill "$alacritty_pid" 2>/dev/null || true
 
+# B10.1 verify: show the modes the card advertises, then briefly bring up
+# voidptr on DRM and grep the log for which mode it actually picked. Default
+# preference is 3840x2160@240; override with VOIDPTR_MODE=WxH@Hz. Must run
+# from a free TTY.
+demo-b10-1 card=drm_card: _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    echo "=== modes advertised by {{card}} ==="
+    cargo run --release --quiet --bin voidptr-drm-smoke -- info {{card}}
+    echo
+    echo "=== building voidptr ==="
+    cargo build --release --bin voidptr
+    echo
+    echo "=== starting voidptr for 3s (mode override: ${VOIDPTR_MODE:-<none, default 3840x2160@240>}) ==="
+    sudo -E VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        RUST_LOG="voidptr_backend_drm=info,info" \
+        ./target/release/voidptr --backend=drm \
+        > {{runtime}}/voidptr.log 2>&1 &
+    server_pid=$!
+    cleanup() {
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    sleep 3
+    echo
+    echo "=== 'selected output' line from the log (should show 3840x2160@240 source=env|default-4k240) ==="
+    grep -F "selected output" {{runtime}}/voidptr.log || echo "<line not found; full log below>"
+    echo
+    echo "=== full voidptr.log tail ==="
+    tail -20 {{runtime}}/voidptr.log
+
+# B10 demo: full dmabuf path at 4K@240. Launches voidptr + one alacritty
+# running cmatrix, so you can eyeball whether the terminal redraws
+# smoothly now that we're doing zero-copy dmabuf import instead of the
+# llvmpipe -> SHM -> GPU upload path. Must run from a free TTY.
+demo-b10 card=drm_card seconds="60": _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    if ! command -v alacritty >/dev/null; then
+        echo "alacritty not found in PATH" >&2
+        exit 1
+    fi
+    if ! command -v cmatrix >/dev/null; then
+        echo "cmatrix not found in PATH; falling back to interactive shell" >&2
+        CMD="alacritty"
+    else
+        CMD="alacritty -e cmatrix"
+    fi
+    echo "=== building ==="
+    cargo build --release --bin voidptr
+    echo
+    echo "=== launching voidptr (sudo for /dev/input/event*) ==="
+    sudo -E VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        RUST_LOG="voidptr_wayland::linux_dmabuf=info,voidptr_backend_drm=info,voidptr_wayland=info" \
+        ./target/release/voidptr --backend=drm \
+        > {{runtime}}/voidptr.log 2>&1 &
+    server_pid=$!
+    cleanup() {
+        rc=$?
+        sudo kill "$alacritty_pid" 2>/dev/null || true
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+        echo
+        echo "=== dmabuf-relevant log lines ==="
+        grep -E 'zwp_linux_dmabuf_v1|dmabuf\.|dmabuf_params\.|imported dmabuf|xdg_decoration|selected output|restoring prior CRTC|restored prior CRTC' \
+            {{runtime}}/voidptr.log || echo "<no dmabuf log lines>"
+        echo
+        echo "=== full voidptr.log tail ==="
+        tail -60 {{runtime}}/voidptr.log
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    for _ in $(seq 1 100); do
+        [[ -S {{runtime}}/{{socket}} ]] && break
+        if ! sudo kill -0 "$server_pid" 2>/dev/null; then
+            echo "server exited before creating socket"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
+    echo "=== launching: $CMD ==="
+    sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+        $CMD > {{runtime}}/alacritty.log 2>&1 &
+    alacritty_pid=$!
+    echo "running for {{seconds}}s. watch cmatrix rain — should be smooth now."
+    echo "ctrl+c to end early."
+    sleep {{seconds}}
+
+# B10.2 verify: confirm alacritty picks the dmabuf path once voidptr
+# advertises zwp_linux_dmabuf_v1. The screen stays mostly empty because
+# B10.2 doesn't render dmabuf buffers yet — verification is log-only.
+# Look for "bind zwp_linux_dmabuf_v1", "dmabuf.create_params",
+# "dmabuf_params.add", and "dmabuf.create_immed -> wl_buffer" in the
+# voidptr log below. Must run from a free TTY.
+demo-b10-2 card=drm_card seconds="6": _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    if ! command -v alacritty >/dev/null; then
+        echo "alacritty not found in PATH" >&2
+        exit 1
+    fi
+    echo "=== building ==="
+    cargo build --release --bin voidptr
+    echo
+    echo "=== launching voidptr (sudo for /dev/input/event*) ==="
+    sudo -E VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        RUST_LOG="voidptr_wayland::linux_dmabuf=debug,voidptr_wayland=info,voidptr_backend_drm=info,info" \
+        ./target/release/voidptr --backend=drm \
+        > {{runtime}}/voidptr.log 2>&1 &
+    server_pid=$!
+    cleanup() {
+        rc=$?
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+        echo
+        echo "=== dmabuf-relevant log lines ==="
+        grep -E 'zwp_linux_dmabuf_v1|dmabuf\.|dmabuf_params\.' {{runtime}}/voidptr.log \
+            || echo "<no dmabuf log lines — client probably did not pick the dmabuf path>"
+        echo
+        echo "=== full voidptr.log (last 80 lines) ==="
+        tail -80 {{runtime}}/voidptr.log
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    for _ in $(seq 1 100); do
+        [[ -S {{runtime}}/{{socket}} ]] && break
+        if ! sudo kill -0 "$server_pid" 2>/dev/null; then
+            echo "server exited before creating socket"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
+    echo "=== launching alacritty ==="
+    sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+        alacritty > {{runtime}}/alacritty.log 2>&1 &
+    alacritty_pid=$!
+    echo "screen will stay mostly empty — B10.2 doesn't render dmabuf buffers yet."
+    echo "letting it run for {{seconds}}s."
+    sleep {{seconds}}
+    sudo kill "$alacritty_pid" 2>/dev/null || true
+
 # B6 demo: master-stack tiling. Start voidptr on DRM, then launch 4 alacritty
 # instances ~2s apart so the layout visibly transitions:
 #   1 window  = fullscreen

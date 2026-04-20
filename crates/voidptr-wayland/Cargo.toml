@@ -19,3 +19,4 @@ voidptr-backend-drm.workspace = true
 input.workspace = true
 libc.workspace = true
 xkbcommon.workspace = true
+ctrlc.workspace = true

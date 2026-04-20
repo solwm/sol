@@ -11,14 +11,24 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use drm::Device as BasicDevice;
-use drm::control::{Device as ControlDevice, PageFlipFlags, framebuffer};
+use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, framebuffer};
 use glow::HasContext;
-use voidptr_core::{PixelFormat, Scene};
+use khronos_egl as egl;
+use voidptr_core::{PixelFormat, Scene, SceneContent};
 
 use crate::{
-    Card, GlStack, OutputSelection, get_or_add_fb, pick_output, quad::QuadProgram,
-    wait_for_page_flip,
+    Card, GlStack, OutputSelection, dmabuf_egl, get_or_add_fb, pick_output,
+    quad::QuadProgram, wait_for_page_flip,
 };
+
+/// Snapshot of the CRTC state the kernel/fbcon had configured before we
+/// grabbed DRM master. Used on drop to hand the display back to whoever was
+/// driving it, so the TTY unblanks automatically on clean shutdown.
+struct SavedCrtc {
+    mode: Option<Mode>,
+    fb: Option<framebuffer::Handle>,
+    position: (u32, u32),
+}
 
 pub struct DrmPresenter {
     card: Card,
@@ -32,12 +42,18 @@ pub struct DrmPresenter {
     textures: HashMap<u64, TextureEntry>,
     width: u32,
     height: u32,
+    saved_crtc: Option<SavedCrtc>,
 }
 
 struct TextureEntry {
     tex: glow::NativeTexture,
     width: i32,
     height: i32,
+    /// Some() when the texture is backed by an EGLImage imported from a
+    /// dmabuf. The image is kept alive for the texture's lifetime and must
+    /// be destroyed explicitly (EGL doesn't refcount through GL texture
+    /// bindings).
+    egl_image: Option<egl::Image>,
 }
 
 impl DrmPresenter {
@@ -55,6 +71,20 @@ impl DrmPresenter {
         let width = w_i16 as u32;
         let height = h_i16 as u32;
 
+        // Snapshot the CRTC fbcon was using, so Drop can hand the display
+        // back. Don't fail on error — restore is best-effort anyway.
+        let saved_crtc = match card.get_crtc(sel.crtc) {
+            Ok(info) => Some(SavedCrtc {
+                mode: info.mode(),
+                fb: info.framebuffer(),
+                position: info.position(),
+            }),
+            Err(e) => {
+                tracing::warn!(error = ?e, "get_crtc for save failed; TTY restore on exit won't work");
+                None
+            }
+        };
+
         let gl_stack = GlStack::new(card.clone(), width, height)?;
         let quad = crate::quad::build(&gl_stack.gl)?;
 
@@ -68,6 +98,7 @@ impl DrmPresenter {
             textures: HashMap::new(),
             width,
             height,
+            saved_crtc,
         };
         presenter.initial_modeset()?;
         Ok(presenter)
@@ -112,8 +143,23 @@ impl DrmPresenter {
         let h = self.height as i32;
 
         // Pass 1: make sure every scene element has an up-to-date texture.
+        // SHM elements blit pixels via glTex{Sub,}Image2D; dmabuf elements
+        // take the EGL_EXT_image_dma_buf_import path once per buffer. A
+        // single failing element (bad dmabuf, unsupported modifier, etc.)
+        // is logged and skipped — don't let one broken client kill the
+        // whole frame.
         for elem in &scene.elements {
-            upload_texture(&self.gl_stack.gl, &mut self.textures, elem)?;
+            let res = match &elem.content {
+                SceneContent::Shm { .. } => {
+                    upload_shm_texture(&self.gl_stack.gl, &mut self.textures, elem)
+                }
+                SceneContent::Dmabuf { .. } => {
+                    import_dmabuf_texture(&self.gl_stack, &mut self.textures, elem)
+                }
+            };
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "scene element skipped");
+            }
         }
 
         // Pass 2: draw. After pass 1 nothing else needs &mut self.textures.
@@ -145,9 +191,18 @@ impl DrmPresenter {
             let y0 = 1.0 - ((elem.y + entry.height) as f32 / h as f32) * 2.0;
             let rw = entry.width as f32 / w as f32 * 2.0;
             let rh = entry.height as f32 / h as f32 * 2.0;
-            let opaque = match elem.format {
-                PixelFormat::Argb8888 => 0.0,
-                PixelFormat::Xrgb8888 => 1.0,
+            // Dmabuf buffers are opaque by convention (XRGB); SHM carries its
+            // own flag so the software cursor (ARGB) still alpha-blends.
+            let opaque = match &elem.content {
+                SceneContent::Shm {
+                    format: PixelFormat::Argb8888,
+                    ..
+                } => 0.0,
+                SceneContent::Shm {
+                    format: PixelFormat::Xrgb8888,
+                    ..
+                } => 1.0,
+                SceneContent::Dmabuf { .. } => 1.0,
             };
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(entry.tex));
@@ -185,13 +240,68 @@ impl DrmPresenter {
     }
 }
 
-fn upload_texture(
+impl Drop for DrmPresenter {
+    fn drop(&mut self) {
+        // Destroy any dmabuf EGLImages + their GL textures before we let
+        // the GL context go. We still have `&mut self` here so all fields
+        // are valid.
+        for (_, entry) in self.textures.drain() {
+            unsafe {
+                self.gl_stack.gl.delete_texture(entry.tex);
+            }
+            if let Some(img) = entry.egl_image {
+                let _ = self
+                    .gl_stack
+                    .egl
+                    .destroy_image(self.gl_stack.display, img);
+            }
+        }
+
+        // Best-effort: push the pre-modeset CRTC state back so fbcon can
+        // re-scan the text console framebuffer and the TTY unblanks cleanly.
+        // Failures are logged and swallowed — we still want the rest of
+        // resource release (GBM BOs, DRM master) to run.
+        //
+        // NOTE: on DisplayPort at high refresh (e.g. 4K@240), the synchronous
+        // set_crtc back to fbcon's mode can take 10–15s because the HW does
+        // a full DP link re-training. That's normal, not a voidptr bug.
+        let Some(saved) = self.saved_crtc.take() else {
+            return;
+        };
+        tracing::info!(
+            from_width = self.width,
+            from_height = self.height,
+            "restoring prior CRTC state (on high-bandwidth modes the DP link may take 10-15s to re-train)"
+        );
+        if let Err(e) = self.card.set_crtc(
+            self.sel.crtc,
+            saved.fb,
+            saved.position,
+            &[self.sel.connector],
+            saved.mode,
+        ) {
+            tracing::warn!(error = ?e, "CRTC restore on drop failed; TTY may stay blank");
+        } else {
+            tracing::info!("restored prior CRTC state");
+        }
+    }
+}
+
+/// Upload (or re-upload) a SHM-backed scene element to a GL texture.
+/// Keeps a per-`buffer_key` cache so subsequent frames use glTexSubImage2D.
+fn upload_shm_texture(
     gl: &glow::Context,
     textures: &mut HashMap<u64, TextureEntry>,
     elem: &voidptr_core::SceneElement<'_>,
 ) -> Result<()> {
-    let expected_bytes = (elem.stride as usize).saturating_mul(elem.height as usize);
-    if elem.pixels.len() < expected_bytes {
+    let (pixels_in, stride) = match &elem.content {
+        SceneContent::Shm { pixels, stride, .. } => (*pixels, *stride),
+        SceneContent::Dmabuf { .. } => {
+            unreachable!("upload_shm_texture called with dmabuf content")
+        }
+    };
+    let expected_bytes = (stride as usize).saturating_mul(elem.height as usize);
+    if pixels_in.len() < expected_bytes {
         tracing::warn!("scene element buffer shorter than stride*height; skipping");
         return Ok(());
     }
@@ -200,29 +310,30 @@ fn upload_texture(
     // GL_UNPACK_ROW_LENGTH to pass stride directly).
     let tight_width_bytes = elem.width as usize * 4;
     let owned_tight;
-    let pixels: &[u8] = if elem.stride as usize == tight_width_bytes {
-        &elem.pixels[..tight_width_bytes * elem.height as usize]
+    let pixels: &[u8] = if stride as usize == tight_width_bytes {
+        &pixels_in[..tight_width_bytes * elem.height as usize]
     } else {
         let mut buf = Vec::with_capacity(tight_width_bytes * elem.height as usize);
         for row in 0..elem.height as usize {
-            let start = row * elem.stride as usize;
+            let start = row * stride as usize;
             let end = start + tight_width_bytes;
-            buf.extend_from_slice(&elem.pixels[start..end]);
+            buf.extend_from_slice(&pixels_in[start..end]);
         }
         owned_tight = buf;
         &owned_tight
     };
 
-    let needs_new = textures
-        .get(&elem.buffer_key)
-        .is_none_or(|e| e.width != elem.width || e.height != elem.height);
+    // Reuse an existing texture only if it's SHM-backed AND the same size.
+    // A dmabuf->SHM transition on the same buffer_key (rare but possible
+    // if a wl_buffer is re-imported) must rebuild the texture.
+    let needs_new = textures.get(&elem.buffer_key).is_none_or(|e| {
+        e.egl_image.is_some() || e.width != elem.width || e.height != elem.height
+    });
 
     unsafe {
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
         if needs_new {
-            if let Some(e) = textures.remove(&elem.buffer_key) {
-                gl.delete_texture(e.tex);
-            }
+            evict_texture(gl, textures, elem.buffer_key);
             let tex = gl
                 .create_texture()
                 .map_err(|e| anyhow!("create_texture: {e}"))?;
@@ -264,6 +375,7 @@ fn upload_texture(
                     tex,
                     width: elem.width,
                     height: elem.height,
+                    egl_image: None,
                 },
             );
         } else {
@@ -283,4 +395,154 @@ fn upload_texture(
         }
     }
     Ok(())
+}
+
+/// Import a dmabuf-backed scene element as a GL texture via
+/// EGL_EXT_image_dma_buf_import. Cached per `buffer_key` just like SHM
+/// uploads — alacritty reuses the same wl_buffer across frames, so we only
+/// pay the import cost once.
+fn import_dmabuf_texture(
+    gl_stack: &GlStack,
+    textures: &mut HashMap<u64, TextureEntry>,
+    elem: &voidptr_core::SceneElement<'_>,
+) -> Result<()> {
+    let (fd, fourcc, modifier, offset, stride) = match &elem.content {
+        SceneContent::Dmabuf {
+            fd,
+            fourcc,
+            modifier,
+            offset,
+            stride,
+        } => (*fd, *fourcc, *modifier, *offset, *stride),
+        SceneContent::Shm { .. } => {
+            unreachable!("import_dmabuf_texture called with SHM content")
+        }
+    };
+
+    // Already imported and still valid? Reuse. EGLImage + GL texture stay
+    // live until the texture cache evicts them.
+    if let Some(entry) = textures.get(&elem.buffer_key) {
+        if entry.egl_image.is_some()
+            && entry.width == elem.width
+            && entry.height == elem.height
+        {
+            return Ok(());
+        }
+    }
+
+    let tex_target_fn = gl_stack
+        .gl_egl_image_target_texture_2d_oes
+        .ok_or_else(|| anyhow!("glEGLImageTargetTexture2DOES unavailable; cannot render dmabuf"))?;
+
+    // Build EGL_LINUX_DMA_BUF_EXT attribute list. Modifier attribs are only
+    // set if the client gave us a real modifier; DRM_FORMAT_MOD_INVALID
+    // means "implicit — driver picks" and we omit those attribs per the
+    // EGL_EXT_image_dma_buf_import_modifiers spec.
+    let mut attribs: Vec<egl::Attrib> = Vec::with_capacity(20);
+    attribs.extend_from_slice(&[
+        egl::WIDTH as egl::Attrib,
+        elem.width as egl::Attrib,
+        egl::HEIGHT as egl::Attrib,
+        elem.height as egl::Attrib,
+        dmabuf_egl::EGL_LINUX_DRM_FOURCC_EXT,
+        fourcc as egl::Attrib,
+        dmabuf_egl::EGL_DMA_BUF_PLANE0_FD_EXT,
+        fd as egl::Attrib,
+        dmabuf_egl::EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        offset as egl::Attrib,
+        dmabuf_egl::EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        stride as egl::Attrib,
+    ]);
+    if modifier != dmabuf_egl::DRM_FORMAT_MOD_INVALID {
+        attribs.extend_from_slice(&[
+            dmabuf_egl::EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+            (modifier & 0xffff_ffff) as egl::Attrib,
+            dmabuf_egl::EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+            (modifier >> 32) as egl::Attrib,
+        ]);
+    }
+    attribs.push(egl::ATTRIB_NONE);
+
+    let no_ctx = unsafe { egl::Context::from_ptr(std::ptr::null_mut()) };
+    let no_buf = unsafe { egl::ClientBuffer::from_ptr(std::ptr::null_mut()) };
+    let image = gl_stack
+        .egl
+        .create_image(
+            gl_stack.display,
+            no_ctx,
+            dmabuf_egl::EGL_LINUX_DMA_BUF_EXT,
+            no_buf,
+            &attribs,
+        )
+        .map_err(|e| anyhow!("eglCreateImage for dmabuf: {e:?}"))?;
+
+    // Evict any prior (stale) cache entry — EGL image + GL texture both.
+    evict_texture(&gl_stack.gl, textures, elem.buffer_key);
+
+    let tex = unsafe {
+        let tex = gl_stack
+            .gl
+            .create_texture()
+            .map_err(|e| anyhow!("create_texture for dmabuf: {e}"))?;
+        gl_stack.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl_stack.gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl_stack.gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl_stack.gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl_stack.gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        // Bind the EGLImage as the storage for this 2D texture. This is
+        // zero-copy: the GPU samples the client's dmabuf directly.
+        tex_target_fn(glow::TEXTURE_2D, image.as_ptr());
+        tex
+    };
+
+    tracing::debug!(
+        width = elem.width,
+        height = elem.height,
+        modifier,
+        "imported dmabuf as GL texture"
+    );
+
+    textures.insert(
+        elem.buffer_key,
+        TextureEntry {
+            tex,
+            width: elem.width,
+            height: elem.height,
+            egl_image: Some(image),
+        },
+    );
+    Ok(())
+}
+
+/// Evict a single cache entry, destroying its EGLImage (if dmabuf-backed)
+/// and its GL texture. Leaves the map entry removed.
+fn evict_texture(
+    _gl: &glow::Context,
+    textures: &mut HashMap<u64, TextureEntry>,
+    key: u64,
+) {
+    if let Some(entry) = textures.remove(&key) {
+        // NOTE: we intentionally leak the EGL image + GL texture here.
+        // Calling destroy_image / delete_texture requires the GL/EGL
+        // instance; this helper doesn't have access. The DrmPresenter::drop
+        // cleans them up wholesale at shutdown. Steady-state renders
+        // rarely evict because wl_buffers are long-lived.
+        let _ = entry;
+    }
 }

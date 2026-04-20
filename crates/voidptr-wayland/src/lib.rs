@@ -11,7 +11,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use voidptr_backend_drm::DrmPresenter;
-use voidptr_core::{Scene, SceneElement};
+use std::os::fd::AsRawFd;
+use voidptr_core::{Scene, SceneContent, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
@@ -25,16 +26,20 @@ use wayland_server::{
 mod compositor;
 mod cursor;
 mod input;
+mod linux_dmabuf;
 mod output;
 mod render;
 mod seat;
 mod shm;
+mod xdg_decoration;
 mod xdg_shell;
 mod xkb;
 
 use compositor::{SurfaceData, SurfaceRole};
 use input::{InputEvent, InputState};
 use render::Canvas;
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_server::protocol::{
     wl_keyboard::{self, WlKeyboard},
     wl_pointer::{self, WlPointer},
@@ -131,6 +136,8 @@ pub struct Globals {
     pub output: GlobalId,
     pub seat: GlobalId,
     pub xdg_wm_base: GlobalId,
+    pub linux_dmabuf: GlobalId,
+    pub xdg_decoration: GlobalId,
 }
 
 impl State {
@@ -377,32 +384,56 @@ fn scene_from_buffers<'a>(
 ) -> Scene<'a> {
     let mut scene = Scene::new();
     for (buf, rect) in placed {
-        let Some(bd) = buf.data::<shm::BufferData>() else { continue };
-        let Some(bytes) = bd.bytes() else { continue };
-        let Some(format) = bd.pixel_format() else { continue };
-        let key = (bd as *const shm::BufferData) as usize as u64;
-        scene.elements.push(SceneElement {
-            buffer_key: key,
-            pixels: bytes,
-            format,
-            width: bd.width,
-            height: bd.height,
-            stride: bd.stride,
-            x: rect.x,
-            y: rect.y,
-        });
+        if let Some(bd) = buf.data::<shm::BufferData>() {
+            let Some(bytes) = bd.bytes() else { continue };
+            let Some(format) = bd.pixel_format() else { continue };
+            let key = (bd as *const shm::BufferData) as usize as u64;
+            scene.elements.push(SceneElement {
+                buffer_key: key,
+                width: bd.width,
+                height: bd.height,
+                x: rect.x,
+                y: rect.y,
+                content: SceneContent::Shm {
+                    pixels: bytes,
+                    stride: bd.stride,
+                    format,
+                },
+            });
+        } else if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
+            // B10.3: single-plane dmabuf only. Multi-plane (YUV etc.) lands
+            // when we care about video, not for alacritty/terminals.
+            let Some(p0) = db.planes.first() else { continue };
+            let key = (db as *const linux_dmabuf::DmabufBuffer) as usize as u64;
+            scene.elements.push(SceneElement {
+                buffer_key: key,
+                width: db.width,
+                height: db.height,
+                x: rect.x,
+                y: rect.y,
+                content: SceneContent::Dmabuf {
+                    fd: p0.fd.as_raw_fd(),
+                    fourcc: db.format,
+                    modifier: p0.modifier,
+                    offset: p0.offset,
+                    stride: p0.stride,
+                },
+            });
+        }
     }
     // Cursor last so it always draws on top.
     if cursor.visible {
         scene.elements.push(SceneElement {
             buffer_key: CURSOR_SCENE_KEY,
-            pixels: &cursor.pixels,
-            format: voidptr_core::PixelFormat::Argb8888,
             width: cursor.width,
             height: cursor.height,
-            stride: cursor.width * 4,
             x: cursor.pos_x as i32 - cursor.hot_x,
             y: cursor.pos_y as i32 - cursor.hot_y,
+            content: SceneContent::Shm {
+                pixels: &cursor.pixels,
+                stride: cursor.width * 4,
+                format: voidptr_core::PixelFormat::Argb8888,
+            },
         });
     }
     scene
@@ -431,15 +462,22 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
         BackendState::Headless { canvas, png_path } => {
             canvas.clear();
             for e in &scene.elements {
-                canvas.blit_argb(
-                    e.x,
-                    e.y,
-                    e.pixels,
-                    e.width,
-                    e.height,
-                    e.stride,
-                    e.format,
-                );
+                match &e.content {
+                    SceneContent::Shm {
+                        pixels,
+                        stride,
+                        format,
+                    } => {
+                        canvas.blit_argb(
+                            e.x, e.y, pixels, e.width, e.height, *stride, *format,
+                        );
+                    }
+                    SceneContent::Dmabuf { .. } => {
+                        // Headless backend has no EGL context, can't sample
+                        // the dmabuf. Skip — dmabuf clients are a DRM-backend
+                        // feature.
+                    }
+                }
             }
             canvas
                 .write_png(png_path)
@@ -476,6 +514,14 @@ fn setup_event_loop(
         output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
         seat: dh.create_global::<State, WlSeat, ()>(SEAT_VERSION, ()),
         xdg_wm_base: dh.create_global::<State, XdgWmBase, ()>(XDG_WM_BASE_VERSION, ()),
+        linux_dmabuf: dh.create_global::<State, ZwpLinuxDmabufV1, ()>(
+            linux_dmabuf::DMABUF_VERSION,
+            (),
+        ),
+        xdg_decoration: dh.create_global::<State, ZxdgDecorationManagerV1, ()>(
+            xdg_decoration::DECORATION_VERSION,
+            (),
+        ),
     };
     tracing::info!(?globals, "advertised globals");
 
@@ -591,6 +637,19 @@ fn setup_event_loop(
         "ready: export WAYLAND_DISPLAY={} and run a client",
         socket_name
     );
+
+    // Wire SIGINT/SIGTERM to stop the calloop run cleanly. Stopping here
+    // causes `run()` to return, which drops Compositor -> BackendState ->
+    // DrmPresenter, whose Drop restores the saved CRTC so the TTY unblanks.
+    // ctrlc::set_handler panics if called twice in the same process; that's
+    // fine, voidptr only sets up one event loop per invocation.
+    let loop_signal = event_loop.get_signal();
+    if let Err(e) = ctrlc::set_handler(move || {
+        tracing::info!("shutdown signal received; stopping event loop");
+        loop_signal.stop();
+    }) {
+        tracing::warn!(error = %e, "ctrlc handler install failed; Ctrl+C may not cleanly restore the TTY");
+    }
 
     event_loop
         .run(None, &mut compositor, |comp| {
