@@ -157,12 +157,13 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     state.on_toplevel_mapped(surface);
                 }
 
-                // Fire frame callbacks immediately (headless, no real vblank).
+                // Defer frame callbacks until the next successful render:
+                // firing them here would let clients commit the next buffer
+                // before we've presented the current one, so they'd just
+                // over-render at full CPU speed. Delaying to post-present
+                // paces them to our vblank cadence.
                 let callbacks = std::mem::take(&mut data.lock().unwrap().frame_callbacks);
-                let ts = state.elapsed_ms();
-                for cb in callbacks {
-                    cb.done(ts);
-                }
+                state.pending_frame_callbacks.extend(callbacks);
 
                 state.needs_render = true;
             }

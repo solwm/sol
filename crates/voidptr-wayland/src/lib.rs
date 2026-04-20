@@ -98,6 +98,12 @@ pub struct State {
     pub pointer_focus: Option<WlSurface>,
     /// Surface currently receiving keyboard events.
     pub keyboard_focus: Option<WlSurface>,
+    /// wl_callback objects clients requested via wl_surface.frame and are
+    /// waiting on. We stash them here during commit and fire them from the
+    /// render_tick once the backend has actually presented the frame; that
+    /// implicit throttle keeps clients in lock-step with our vblank cadence
+    /// instead of over-rendering at max CPU speed.
+    pub pending_frame_callbacks: Vec<wayland_server::protocol::wl_callback::WlCallback>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -508,6 +514,17 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     for (buf, _) in placed {
         buf.release();
     }
+
+    // Present is done — fire every frame callback the clients requested
+    // against the buffers we just displayed. On DRM this fires right after
+    // page-flip-complete, which throttles clients to the display's vblank
+    // cadence. On headless it fires after PNG write; still prevents the
+    // "fire instantly, client over-renders" pattern.
+    let ts = comp.state.elapsed_ms();
+    let callbacks = std::mem::take(&mut comp.state.pending_frame_callbacks);
+    for cb in callbacks {
+        cb.done(ts);
+    }
     Ok(())
 }
 
@@ -638,6 +655,7 @@ fn setup_event_loop(
         keyboards: Vec::new(),
         pointer_focus: None,
         keyboard_focus: None,
+        pending_frame_callbacks: Vec::new(),
     };
     let mut compositor = Compositor {
         state,
