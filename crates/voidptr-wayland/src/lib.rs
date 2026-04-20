@@ -108,6 +108,14 @@ pub struct State {
     /// feedback can stat it and hand Mesa the `main_device` dev_t. None
     /// in headless mode; dmabuf clients won't get useful feedback.
     pub drm_device_path: Option<PathBuf>,
+    /// Wayland socket name (e.g. `wayland-1`). Stashed so built-in
+    /// keybinds that spawn clients (Alt+Enter → alacritty) can set
+    /// `WAYLAND_DISPLAY` on the child process.
+    pub socket_name: String,
+    /// Modifier-key tracking for built-in keybinds. libinput hands us raw
+    /// evdev keycodes; Alt is scancode 56 (left) or 100 (right).
+    pub left_alt_down: bool,
+    pub right_alt_down: bool,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -662,6 +670,9 @@ fn setup_event_loop(
         keyboard_focus: None,
         pending_frame_callbacks: Vec::new(),
         drm_device_path,
+        socket_name: socket_name.clone(),
+        left_alt_down: false,
+        right_alt_down: false,
     };
     let mut compositor = Compositor {
         state,
@@ -731,8 +742,53 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             send_pointer_button(state, button, pressed);
         }
         InputEvent::Key { keycode, pressed } => {
+            // Track Alt before anything else so modifier-based keybinds
+            // see the current state.
+            match keycode {
+                KEY_LEFTALT => state.left_alt_down = pressed,
+                KEY_RIGHTALT => state.right_alt_down = pressed,
+                _ => {}
+            }
+            // Built-in keybind: Alt+Enter spawns an alacritty client
+            // against our own socket. Intercepted before forwarding so
+            // focused apps don't also see it as Ctrl+M / newline.
+            if pressed
+                && keycode == KEY_ENTER
+                && (state.left_alt_down || state.right_alt_down)
+            {
+                spawn_alacritty(state);
+                return;
+            }
             send_keyboard_key(state, keycode, pressed);
         }
+    }
+}
+
+/// evdev scancodes, matching what libinput hands us via `key.key()`.
+const KEY_ENTER: u32 = 28;
+const KEY_LEFTALT: u32 = 56;
+const KEY_RIGHTALT: u32 = 100;
+
+/// Spawn an alacritty client connected to our Wayland socket. Inherits
+/// XDG_RUNTIME_DIR from our environment; sets WAYLAND_DISPLAY explicitly
+/// in case we started via a harness that didn't pass it through. The
+/// Child handle is intentionally dropped — we don't want to reap or wait,
+/// the kernel handles cleanup when voidptr exits.
+fn spawn_alacritty(state: &State) {
+    let socket = state.socket_name.clone();
+    match std::process::Command::new("alacritty")
+        .env("WAYLAND_DISPLAY", &socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => tracing::info!(
+            pid = child.id(),
+            socket = %socket,
+            "Alt+Enter: spawned alacritty"
+        ),
+        Err(e) => tracing::warn!(error = %e, "Alt+Enter: spawn alacritty failed"),
     }
 }
 

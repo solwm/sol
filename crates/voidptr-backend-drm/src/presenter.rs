@@ -511,10 +511,11 @@ fn import_dmabuf_texture(
         tex
     };
 
-    tracing::debug!(
+    tracing::info!(
         width = elem.width,
         height = elem.height,
         modifier,
+        fourcc = format!("{:#x}", fourcc),
         "imported dmabuf as GL texture"
     );
 
