@@ -25,6 +25,7 @@ use wayland_server::{
 
 mod compositor;
 mod cursor;
+mod data_device;
 mod input;
 mod layer_shell;
 mod linux_dmabuf;
@@ -44,6 +45,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLi
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
 use wayland_server::protocol::{
+    wl_data_device_manager::WlDataDeviceManager,
     wl_keyboard::{self, WlKeyboard},
     wl_pointer::{self, WlPointer},
     wl_subcompositor::WlSubcompositor,
@@ -171,6 +173,7 @@ pub struct Globals {
     pub xdg_decoration: GlobalId,
     pub layer_shell: GlobalId,
     pub subcompositor: GlobalId,
+    pub data_device_manager: GlobalId,
 }
 
 impl State {
@@ -664,6 +667,10 @@ fn setup_event_loop(
         ),
         subcompositor: dh.create_global::<State, WlSubcompositor, ()>(
             subcompositor::SUBCOMPOSITOR_VERSION,
+            (),
+        ),
+        data_device_manager: dh.create_global::<State, WlDataDeviceManager, ()>(
+            data_device::DATA_DEVICE_MANAGER_VERSION,
             (),
         ),
     };
