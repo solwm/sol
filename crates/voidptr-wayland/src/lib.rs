@@ -320,19 +320,12 @@ fn apply_layout(state: &mut State) {
 /// xdg_surface.configure. Cached via `Window.pending_size` so steady-state
 /// render ticks don't re-send configures.
 ///
-/// We send `Maximized` + `Activated` in the states list. `Maximized` tells
-/// the client it MUST obey the geometry (per xdg-shell spec, otherwise
-/// clients treat the size as a hint and fall back to their preferred
-/// default — alacritty defaults to ~80x24 cells, which is why cmatrix was
-/// tiny). `Activated` marks the focused window for styling hints; harmless
-/// on unfocused ones for now.
+/// States list comes from `xdg_shell::tile_state_bytes` (MAXIMIZED +
+/// TILED_* all edges + ACTIVATED). MAXIMIZED is what forces clients to
+/// obey the configured size; TILED_* is what tiling-aware clients use to
+/// avoid drawing resize chrome.
 fn send_pending_configures(state: &mut State) {
-    // xdg_toplevel::State values from xdg-shell.xml.
-    const STATE_MAXIMIZED: u32 = 1;
-    const STATE_ACTIVATED: u32 = 4;
-    let mut state_bytes: Vec<u8> = Vec::with_capacity(8);
-    state_bytes.extend_from_slice(&STATE_MAXIMIZED.to_ne_bytes());
-    state_bytes.extend_from_slice(&STATE_ACTIVATED.to_ne_bytes());
+    let state_bytes = xdg_shell::tile_state_bytes();
 
     let mut todo: Vec<(usize, i32, i32)> = Vec::new();
     for (i, win) in state.mapped_toplevels.iter().enumerate() {
@@ -363,6 +356,13 @@ fn send_pending_configures(state: &mut State) {
         tl.configure(w, h, state_bytes.clone());
         xs.configure(serial);
         state.mapped_toplevels[i].pending_size = Some((w, h));
+        tracing::info!(
+            tile_index = i,
+            width = w,
+            height = h,
+            serial,
+            "sent xdg_toplevel.configure (tiled+maximized)"
+        );
     }
 }
 

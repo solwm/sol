@@ -18,6 +18,36 @@ use wayland_server::{
 
 use crate::{State, compositor::SurfaceData};
 
+/// Canonical `states` payload for every configure voidptr sends. Includes
+/// MAXIMIZED (tells the client "obey this size, per the xdg-shell spec")
+/// plus TILED_* on all four edges (tells tiling-aware clients that they
+/// border other tiles/the screen so they shouldn't draw external shadows
+/// or allow resize by dragging edges) plus ACTIVATED (styling hint).
+///
+/// Every u32 value is written in native byte order; the wire protocol
+/// length prefix is added by wayland-server.
+pub(crate) fn tile_state_bytes() -> Vec<u8> {
+    const STATE_MAXIMIZED: u32 = 1;
+    const STATE_ACTIVATED: u32 = 4;
+    const STATE_TILED_LEFT: u32 = 5;
+    const STATE_TILED_RIGHT: u32 = 6;
+    const STATE_TILED_TOP: u32 = 7;
+    const STATE_TILED_BOTTOM: u32 = 8;
+    let vals = [
+        STATE_MAXIMIZED,
+        STATE_ACTIVATED,
+        STATE_TILED_LEFT,
+        STATE_TILED_RIGHT,
+        STATE_TILED_TOP,
+        STATE_TILED_BOTTOM,
+    ];
+    let mut buf = Vec::with_capacity(vals.len() * 4);
+    for v in vals {
+        buf.extend_from_slice(&v.to_ne_bytes());
+    }
+    buf
+}
+
 /// Tracks the surface a given xdg_surface wraps, so toplevel requests can
 /// reach through to modify the underlying compositor state.
 pub struct XdgSurfaceData {
@@ -93,18 +123,25 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                     sd.xdg_toplevel = Some(toplevel.downgrade());
                     sd.xdg_surface = Some(xs.downgrade());
                 }
-                // Initial configure with 0x0 lets the client draw at its
-                // preferred first-frame size. Once it maps, apply_layout
-                // re-configures it to the tile size assigned by master-stack.
-                toplevel.configure(0, 0, Vec::new());
+                // Give the client a real initial tile size with MAXIMIZED +
+                // ACTIVATED set, so it commits its first buffer at this
+                // size rather than whatever its hard-coded default is.
+                // Once the window actually maps, apply_layout re-sends a
+                // configure with the precise tile rect.
+                let sw = state.screen_width as i32;
+                let sh = state.screen_height as i32;
+                toplevel.configure(sw, sh, tile_state_bytes());
                 let serial = state.next_serial();
                 xs.configure(serial);
+                tracing::info!(width = sw, height = sh, "initial xdg_toplevel.configure");
             }
             xdg_surface::Request::GetPopup { id, .. } => {
                 let _ = init.init(id, ());
                 tracing::warn!("xdg popup not implemented at B2");
             }
-            xdg_surface::Request::AckConfigure { serial: _ } => {}
+            xdg_surface::Request::AckConfigure { serial } => {
+                tracing::info!(serial, "client ack_configure");
+            }
             xdg_surface::Request::SetWindowGeometry { .. } => {}
             xdg_surface::Request::Destroy => {}
             _ => {}
