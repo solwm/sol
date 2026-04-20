@@ -1,6 +1,14 @@
-//! Textured-quad GLES2 program: a unit [0,1]x[0,1] quad drawn at a given
-//! NDC rect, sampling an ARGB (BGRA-in-memory) Wayland buffer. The fragment
-//! shader swizzles R<->B so the uploaded RGBA bytes show up as real RGB.
+//! Textured-quad GLES2 programs.
+//!
+//! Two variants share a vertex shader but differ in texture binding:
+//! - `build()` — `sampler2D` on `GL_TEXTURE_2D`, used for SHM uploads.
+//!   Swizzles R<->B because clients write ARGB8888 in memory and our
+//!   glTex{Sub,}Image2D path interprets the bytes as GL_RGBA.
+//! - `build_external()` — `samplerExternalOES` on `GL_TEXTURE_EXTERNAL_OES`,
+//!   used for dmabuf-imported textures. Mesa's driver handles the format
+//!   swizzle internally, so no BGR flip here. Required because Mesa returns
+//!   external-only images for many dmabuf imports — binding those to
+//!   `GL_TEXTURE_2D` silently yields black samples.
 
 use anyhow::{Result, anyhow};
 use glow::{HasContext, NativeBuffer, NativeProgram, NativeUniformLocation};
@@ -30,6 +38,21 @@ void main() {
 }
 "#;
 
+const FS_EXTERNAL: &str = r#"#version 100
+#extension GL_OES_EGL_image_external : require
+precision mediump float;
+uniform samplerExternalOES u_tex;
+uniform float u_opaque;
+varying vec2 v_uv;
+void main() {
+    vec4 t = texture2D(u_tex, v_uv);
+    float a = mix(t.a, 1.0, u_opaque);
+    // Driver returns (R, G, B, A) in fourcc order for external images,
+    // so no channel swizzle needed here (unlike the SHM path).
+    gl_FragColor = vec4(t.rgb, a);
+}
+"#;
+
 pub struct QuadProgram {
     pub program: NativeProgram,
     pub vbo: NativeBuffer,
@@ -39,9 +62,19 @@ pub struct QuadProgram {
 }
 
 pub fn build(gl: &glow::Context) -> Result<QuadProgram> {
+    build_with_fs(gl, FS)
+}
+
+/// Companion to [`build`] that uses the `samplerExternalOES` fragment
+/// shader for dmabuf-imported textures bound to `GL_TEXTURE_EXTERNAL_OES`.
+pub fn build_external(gl: &glow::Context) -> Result<QuadProgram> {
+    build_with_fs(gl, FS_EXTERNAL)
+}
+
+fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
     unsafe {
         let vs = compile(gl, glow::VERTEX_SHADER, VS)?;
-        let fs = compile(gl, glow::FRAGMENT_SHADER, FS)?;
+        let fs = compile(gl, glow::FRAGMENT_SHADER, fs_src)?;
         let program = gl
             .create_program()
             .map_err(|e| anyhow!("create_program: {e}"))?;

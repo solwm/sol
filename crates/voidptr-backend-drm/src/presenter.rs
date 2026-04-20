@@ -30,13 +30,23 @@ struct SavedCrtc {
     position: (u32, u32),
 }
 
+/// GL extension constant for the external-image texture target. Used for
+/// dmabuf-imported textures via GL_OES_EGL_image_external.
+const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+
 pub struct DrmPresenter {
     card: Card,
     gl_stack: GlStack,
     sel: OutputSelection,
     fb_cache: HashMap<usize, framebuffer::Handle>,
     scanned_out: Option<gbm::BufferObject<()>>,
+    /// Shader program for SHM textures: `sampler2D` on `GL_TEXTURE_2D`.
     quad: QuadProgram,
+    /// Shader program for dmabuf textures: `samplerExternalOES` on
+    /// `GL_TEXTURE_EXTERNAL_OES`. Required because Mesa often returns
+    /// external-only EGLImages for dmabuf imports — binding those to
+    /// GL_TEXTURE_2D silently yields all-zero samples.
+    quad_external: QuadProgram,
     /// GPU textures keyed by Scene::buffer_key. Kept across frames so
     /// uploads are glTexSubImage2D after the first sight.
     textures: HashMap<u64, TextureEntry>,
@@ -54,6 +64,9 @@ struct TextureEntry {
     /// be destroyed explicitly (EGL doesn't refcount through GL texture
     /// bindings).
     egl_image: Option<egl::Image>,
+    /// GL texture target this entry is bound to. SHM uploads use
+    /// GL_TEXTURE_2D; dmabuf imports use GL_TEXTURE_EXTERNAL_OES.
+    target: u32,
 }
 
 impl DrmPresenter {
@@ -87,6 +100,7 @@ impl DrmPresenter {
 
         let gl_stack = GlStack::new(card.clone(), width, height)?;
         let quad = crate::quad::build(&gl_stack.gl)?;
+        let quad_external = crate::quad::build_external(&gl_stack.gl)?;
 
         let mut presenter = Self {
             card,
@@ -95,6 +109,7 @@ impl DrmPresenter {
             fb_cache: HashMap::new(),
             scanned_out: None,
             quad,
+            quad_external,
             textures: HashMap::new(),
             width,
             height,
@@ -162,37 +177,46 @@ impl DrmPresenter {
             }
         }
 
-        // Pass 2: draw. After pass 1 nothing else needs &mut self.textures.
+        // Pass 2: draw. SHM and dmabuf elements use different shader
+        // programs + texture targets; switch between them per element.
         let gl = &self.gl_stack.gl;
         unsafe {
             gl.viewport(0, 0, w, h);
             gl.clear_color(0.02, 0.02, 0.04, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
 
-            // Alpha blending for ARGB surfaces (notably the software cursor).
-            // XRGB surfaces set u_opaque=1.0 so alpha ends up 1.0 and the
-            // blend is a no-op for them.
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-
-            gl.use_program(Some(self.quad.program));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.quad.vbo));
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
-            gl.uniform_1_i32(Some(&self.quad.u_tex), 0);
             gl.active_texture(glow::TEXTURE0);
         }
 
+        let mut active_program: Option<u32> = None;
         for elem in &scene.elements {
             let Some(entry) = self.textures.get(&elem.buffer_key) else {
                 continue;
             };
+            // Pick the shader + VBO set matching this element's target.
+            let prog = if entry.target == GL_TEXTURE_EXTERNAL_OES {
+                &self.quad_external
+            } else {
+                &self.quad
+            };
+            let prog_id = prog.program.0.get();
+            if active_program != Some(prog_id) {
+                unsafe {
+                    gl.use_program(Some(prog.program));
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(prog.vbo));
+                    gl.enable_vertex_attrib_array(0);
+                    gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+                    gl.uniform_1_i32(Some(&prog.u_tex), 0);
+                }
+                active_program = Some(prog_id);
+            }
+
             let x0 = (elem.x as f32 / w as f32) * 2.0 - 1.0;
             let y0 = 1.0 - ((elem.y + entry.height) as f32 / h as f32) * 2.0;
             let rw = entry.width as f32 / w as f32 * 2.0;
             let rh = entry.height as f32 / h as f32 * 2.0;
-            // Dmabuf buffers are opaque by convention (XRGB); SHM carries its
-            // own flag so the software cursor (ARGB) still alpha-blends.
             let opaque = match &elem.content {
                 SceneContent::Shm {
                     format: PixelFormat::Argb8888,
@@ -205,15 +229,15 @@ impl DrmPresenter {
                 SceneContent::Dmabuf { .. } => 1.0,
             };
             unsafe {
-                gl.bind_texture(glow::TEXTURE_2D, Some(entry.tex));
-                gl.uniform_4_f32(Some(&self.quad.u_rect), x0, y0, rw, rh);
-                gl.uniform_1_f32(Some(&self.quad.u_opaque), opaque);
+                gl.bind_texture(entry.target, Some(entry.tex));
+                gl.uniform_4_f32(Some(&prog.u_rect), x0, y0, rw, rh);
+                gl.uniform_1_f32(Some(&prog.u_opaque), opaque);
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.bind_texture(entry.target, None);
             }
         }
 
         unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, None);
             gl.disable_vertex_attrib_array(0);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
@@ -376,6 +400,7 @@ fn upload_shm_texture(
                     width: elem.width,
                     height: elem.height,
                     egl_image: None,
+                    target: glow::TEXTURE_2D,
                 },
             );
         } else {
@@ -480,34 +505,50 @@ fn import_dmabuf_texture(
     evict_texture(&gl_stack.gl, textures, elem.buffer_key);
 
     let tex = unsafe {
+        // Clear any stale error before the sequence so we only report
+        // failures caused by our own calls.
+        while gl_stack.gl.get_error() != glow::NO_ERROR {}
+
         let tex = gl_stack
             .gl
             .create_texture()
             .map_err(|e| anyhow!("create_texture for dmabuf: {e}"))?;
-        gl_stack.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        // Bind to GL_TEXTURE_EXTERNAL_OES: Mesa returns external-only
+        // EGLImages for most dmabuf imports (even LINEAR ARGB8888).
+        // Binding those to plain GL_TEXTURE_2D succeeds silently but
+        // sampling yields all-zeros — exactly what we were seeing as
+        // black alacritty windows with the old path.
+        gl_stack
+            .gl
+            .bind_texture(GL_TEXTURE_EXTERNAL_OES, Some(tex));
         gl_stack.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
+            GL_TEXTURE_EXTERNAL_OES,
             glow::TEXTURE_MIN_FILTER,
             glow::LINEAR as i32,
         );
         gl_stack.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
+            GL_TEXTURE_EXTERNAL_OES,
             glow::TEXTURE_MAG_FILTER,
             glow::LINEAR as i32,
         );
         gl_stack.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
+            GL_TEXTURE_EXTERNAL_OES,
             glow::TEXTURE_WRAP_S,
             glow::CLAMP_TO_EDGE as i32,
         );
         gl_stack.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
+            GL_TEXTURE_EXTERNAL_OES,
             glow::TEXTURE_WRAP_T,
             glow::CLAMP_TO_EDGE as i32,
         );
-        // Bind the EGLImage as the storage for this 2D texture. This is
-        // zero-copy: the GPU samples the client's dmabuf directly.
-        tex_target_fn(glow::TEXTURE_2D, image.as_ptr());
+        tex_target_fn(GL_TEXTURE_EXTERNAL_OES, image.as_ptr());
+        let err = gl_stack.gl.get_error();
+        if err != glow::NO_ERROR {
+            tracing::warn!(
+                err = format!("0x{:04x}", err),
+                "glEGLImageTargetTexture2DOES(EXTERNAL_OES) failed"
+            );
+        }
         tex
     };
 
@@ -516,7 +557,7 @@ fn import_dmabuf_texture(
         height = elem.height,
         modifier,
         fourcc = format!("{:#x}", fourcc),
-        "imported dmabuf as GL texture"
+        "imported dmabuf as GL_TEXTURE_EXTERNAL_OES"
     );
 
     textures.insert(
@@ -526,6 +567,7 @@ fn import_dmabuf_texture(
             width: elem.width,
             height: elem.height,
             egl_image: Some(image),
+            target: GL_TEXTURE_EXTERNAL_OES,
         },
     );
     Ok(())
