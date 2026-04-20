@@ -39,6 +39,7 @@ ctrlc = { version = "3", features = ["termination"] }
 input = { version = "0.9", features = ["libinput_1_19"] }
 libc = "0.2"
 xkbcommon = "0.8"
+libseat = "0.2"
 
 voidptr-backend-drm = { path = "crates/voidptr-backend-drm" }
 

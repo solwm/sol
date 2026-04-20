@@ -7,7 +7,6 @@
 //! a drmModePageFlip, and blocks on the DRM fd for the flip-complete event.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use drm::Device as BasicDevice;
@@ -70,12 +69,18 @@ struct TextureEntry {
 }
 
 impl DrmPresenter {
-    pub fn new(device: &Path) -> Result<Self> {
-        let card = Card::open(device)?;
+    /// Construct from a `Card` already wrapping a DRM fd. voidptr's main
+    /// binary uses this path — libseat hands us the fd; we wrap it via
+    /// `Card::from_fd` before calling here. `acquire_master_lock` is
+    /// still needed on the first call to establish master, but because
+    /// libseat coordinates the session's VT ownership the ioctl succeeds
+    /// without the "another compositor owns this VT" error we used to
+    /// have to work around.
+    pub fn from_card(card: Card) -> Result<Self> {
         card.acquire_master_lock().map_err(|e| {
             anyhow!(
-                "could not become DRM master on {}: {e:?}\n\nHyprland (or another compositor) likely owns this VT. Switch to a free TTY first.",
-                device.display()
+                "could not become DRM master: {e:?} — libseat should have \
+                 given us a session-owned fd, but acquire_master was refused."
             )
         })?;
 
@@ -121,6 +126,43 @@ impl DrmPresenter {
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Drop DRM master while our session is inactive (libseat Disable).
+    /// The fd remains open but DRM ioctls requiring master will fail.
+    /// Called from the session's Disable handler.
+    pub fn drop_master(&self) {
+        if let Err(e) = self.card.release_master_lock() {
+            tracing::warn!(error = ?e, "DRM drop_master");
+        } else {
+            tracing::info!("DRM master dropped (session disabled)");
+        }
+    }
+
+    /// Reacquire DRM master when our session becomes active again
+    /// (libseat Enable). Also re-applies our modeset so the screen
+    /// reflects our scene rather than whatever drove the display
+    /// during the disabled window.
+    pub fn reacquire_master(&mut self) -> Result<()> {
+        self.card
+            .acquire_master_lock()
+            .map_err(|e| anyhow!("DRM acquire_master on Enable: {e:?}"))?;
+        // Re-arm the CRTC with our most recent scanned-out buffer so
+        // fbcon's takeover during the disabled window is overwritten.
+        if let Some(bo) = self.scanned_out.as_ref() {
+            let fb = crate::get_or_add_fb(&self.card, bo, &mut self.fb_cache)?;
+            self.card
+                .set_crtc(
+                    self.sel.crtc,
+                    Some(fb),
+                    (0, 0),
+                    &[self.sel.connector],
+                    Some(self.sel.mode),
+                )
+                .context("re-apply modeset on Enable")?;
+        }
+        tracing::info!("DRM master reacquired (session enabled)");
+        Ok(())
     }
 
     /// Drop the cached texture + EGLImage for a given buffer_key.

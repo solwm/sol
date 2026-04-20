@@ -21,3 +21,4 @@ input.workspace = true
 libc.workspace = true
 xkbcommon.workspace = true
 ctrlc.workspace = true
+libseat.workspace = true

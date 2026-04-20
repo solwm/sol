@@ -41,6 +41,11 @@ const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
 pub struct Card(Arc<File>);
 
 impl Card {
+    /// Open the DRM device directly. Requires the caller to have access
+    /// to `/dev/dri/cardN`; on a regular user that means `video` group
+    /// membership, or sudo. Retained as a convenience for the
+    /// `voidptr-drm-smoke` harness where session management isn't set
+    /// up — the main `voidptr` binary takes the libseat path instead.
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -48,6 +53,14 @@ impl Card {
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
         Ok(Card(Arc::new(file)))
+    }
+
+    /// Wrap an already-opened DRM fd (typically obtained via
+    /// `libseat::open_device`, which runs as the daemon's user and
+    /// hands us the fd via the seat protocol). Lets voidptr run as an
+    /// unprivileged user without any group membership.
+    pub fn from_fd(fd: std::os::fd::OwnedFd) -> Self {
+        Card(Arc::new(File::from(fd)))
     }
 }
 impl AsFd for Card {

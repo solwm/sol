@@ -32,6 +32,7 @@ mod linux_dmabuf;
 mod output;
 mod render;
 mod seat;
+mod session;
 mod shm;
 mod subcompositor;
 mod xdg_decoration;
@@ -121,9 +122,12 @@ pub struct State {
     /// `WAYLAND_DISPLAY` on the child process.
     pub socket_name: String,
     /// Modifier-key tracking for built-in keybinds. libinput hands us raw
-    /// evdev keycodes; Alt is scancode 56 (left) or 100 (right).
+    /// evdev keycodes; Alt is scancode 56 (left) or 100 (right), Ctrl
+    /// is 29 (left) / 97 (right).
     pub left_alt_down: bool,
     pub right_alt_down: bool,
+    pub left_ctrl_down: bool,
+    pub right_ctrl_down: bool,
     /// Keys of texture cache entries the DRM presenter should evict on
     /// the next render tick. Filled by `Dispatch<WlBuffer, _>::Destroy`
     /// handlers when a client tears down a buffer; drained (and acted
@@ -133,6 +137,9 @@ pub struct State {
     /// role. Dead weaks are pruned on render tick; the role's mapped
     /// flag on `SurfaceData` determines whether we currently draw it.
     pub pending_layer_surfaces: Vec<Weak<WlSurface>>,
+    /// libseat session handle. Used by VT-switch keybinds and by the
+    /// backend's Enable/Disable transition logic. None in headless.
+    pub session: Option<session::SharedSession>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -646,6 +653,7 @@ fn setup_event_loop(
     screen_height: u32,
     input: Option<(InputState, std::os::fd::OwnedFd)>,
     drm_device_path: Option<PathBuf>,
+    session: Option<session::SharedSession>,
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, Compositor> =
         EventLoop::try_new().context("create calloop event loop")?;
@@ -753,6 +761,35 @@ fn setup_event_loop(
             .map_err(|e| anyhow::anyhow!("insert input source: {e}"))?;
     }
 
+    // libseat session: dispatch Enable/Disable events, handle DRM
+    // master transitions. Without this source, VT switches would
+    // leave us in a half-disabled state and libseat would block.
+    if let Some(sess) = session.clone() {
+        let poll_fd = {
+            let mut s = sess.borrow_mut();
+            s.poll_fd()?.try_clone_to_owned()?
+        };
+        event_loop
+            .handle()
+            .insert_source(
+                Generic::new(poll_fd, Interest::READ, Mode::Level),
+                move |_ready, _fd, comp| {
+                    let events = match comp.state.session.as_ref() {
+                        Some(s) => s
+                            .borrow_mut()
+                            .dispatch_events()
+                            .unwrap_or_default(),
+                        None => return Ok(PostAction::Continue),
+                    };
+                    for ev in events {
+                        handle_session_event(comp, ev);
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("insert session source: {e}"))?;
+    }
+
     let cursor = Cursor::new(screen_width as f64 / 2.0, screen_height as f64 / 2.0);
     // Only build the keymap when we have libinput. Headless has no keys to
     // translate and no clients to hand the fd to in any useful way.
@@ -789,8 +826,11 @@ fn setup_event_loop(
         socket_name: socket_name.clone(),
         left_alt_down: false,
         right_alt_down: false,
+        left_ctrl_down: false,
+        right_ctrl_down: false,
         pending_texture_evictions: Vec::new(),
         pending_layer_surfaces: Vec::new(),
+        session: session.clone(),
     };
     let mut compositor = Compositor {
         state,
@@ -839,6 +879,39 @@ fn setup_event_loop(
     Ok(())
 }
 
+/// Handle a single libseat event. Keeps the backend's DRM master state
+/// in sync with our session ownership and then acks the Disable so the
+/// daemon can proceed with the VT switch.
+fn handle_session_event(comp: &mut Compositor, ev: libseat::SeatEvent) {
+    match ev {
+        libseat::SeatEvent::Disable => {
+            tracing::info!("libseat: Disable — releasing DRM master");
+            if let BackendState::Drm(presenter) = &mut comp.backend {
+                presenter.drop_master();
+            }
+            if let Some(s) = comp.state.session.as_ref() {
+                let mut s = s.borrow_mut();
+                s.active = false;
+                if let Err(e) = s.ack_disable() {
+                    tracing::warn!(error = %e, "libseat: ack_disable");
+                }
+            }
+        }
+        libseat::SeatEvent::Enable => {
+            tracing::info!("libseat: Enable — reacquiring DRM master");
+            if let Some(s) = comp.state.session.as_ref() {
+                s.borrow_mut().active = true;
+            }
+            if let BackendState::Drm(presenter) = &mut comp.backend {
+                if let Err(e) = presenter.reacquire_master() {
+                    tracing::warn!(error = %e, "DRM reacquire on Enable");
+                }
+            }
+            comp.state.needs_render = true;
+        }
+    }
+}
+
 /// Apply one translated libinput event to the state. Updates the cursor,
 /// sets `needs_render`, and forwards pointer/key events to the right
 /// Wayland client based on current focus.
@@ -866,20 +939,37 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             send_pointer_button(state, button, pressed);
         }
         InputEvent::Key { keycode, pressed } => {
-            // Track Alt before anything else so modifier-based keybinds
-            // see the current state.
+            // Track modifiers before anything else so keybinds see
+            // accurate state. Released modifiers stop participating.
             match keycode {
                 KEY_LEFTALT => state.left_alt_down = pressed,
                 KEY_RIGHTALT => state.right_alt_down = pressed,
+                KEY_LEFTCTRL => state.left_ctrl_down = pressed,
+                KEY_RIGHTCTRL => state.right_ctrl_down = pressed,
                 _ => {}
             }
+            let alt = state.left_alt_down || state.right_alt_down;
+            let ctrl = state.left_ctrl_down || state.right_ctrl_down;
+
+            // Ctrl+Alt+F1..F12 → libseat VT switch. Intercept FIRST so
+            // clients don't see the Fn press. Matches sway/Hyprland.
+            if pressed && ctrl && alt {
+                if let Some(vt) = vt_number_for_f_key(keycode) {
+                    if let Some(s) = state.session.as_ref() {
+                        if let Err(e) = s.borrow_mut().switch_session(vt) {
+                            tracing::warn!(%e, vt, "libseat switch_session");
+                        } else {
+                            tracing::info!(vt, "Ctrl+Alt+F{vt}: switching VT");
+                        }
+                    }
+                    return;
+                }
+            }
+
             // Built-in keybinds:
             //   Alt+Enter → alacritty (terminal)
             //   Alt+D     → rofi (application launcher, layer-shell client)
-            // Intercepted before forwarding so focused apps don't also
-            // see them.
-            let alt = state.left_alt_down || state.right_alt_down;
-            if pressed && alt {
+            if pressed && alt && !ctrl {
                 match keycode {
                     KEY_ENTER => {
                         spawn_client(state, "alacritty", &[], "Alt+Enter");
@@ -902,11 +992,24 @@ fn apply_input(state: &mut State, ev: InputEvent) {
     }
 }
 
+/// Map an evdev F1..F12 keycode to the 1-based VT number libseat expects.
+/// F1..F10 are contiguous (59..68), F11 and F12 jump to 87 and 88.
+fn vt_number_for_f_key(keycode: u32) -> Option<i32> {
+    match keycode {
+        59..=68 => Some((keycode - 58) as i32), // F1 → VT 1 ... F10 → VT 10
+        87 => Some(11),
+        88 => Some(12),
+        _ => None,
+    }
+}
+
 /// evdev scancodes, matching what libinput hands us via `key.key()`.
 const KEY_ENTER: u32 = 28;
 const KEY_D: u32 = 32;
 const KEY_LEFTALT: u32 = 56;
 const KEY_RIGHTALT: u32 = 100;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_RIGHTCTRL: u32 = 97;
 
 /// Fork/exec a Wayland client connected to our own socket. Inherits env
 /// (XDG_RUNTIME_DIR, HOME, etc.) from the compositor; overrides
@@ -1124,18 +1227,74 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
         canvas: Canvas::new(width, height),
         png_path,
     };
-    setup_event_loop(backend, width, height, None, None)
+    setup_event_loop(backend, width, height, None, None, None)
 }
 
-/// DRM backend: takes master on `device`, renders via GLES to the screen.
-/// Must be called from a VT that doesn't already have a compositor.
+/// DRM backend, managed via libseat.
+///
+/// Startup sequence:
+///   1. Open a libseat session. On systemd hosts this talks to
+///      systemd-logind; otherwise seatd. The daemon owns device files.
+///   2. Pump the session once to consume the initial Enable event so
+///      we know the daemon has handed us the seat.
+///   3. Ask libseat for the DRM device fd and wrap it into a Card.
+///      Build the DrmPresenter off that.
+///   4. Initialise libinput with a LibinputInterface that routes every
+///      open_restricted through libseat.
+///   5. Hand the session + Wayland bits to setup_event_loop; it wires
+///      the session poll fd into calloop and handles enable/disable.
 pub fn run_drm(device: &Path) -> Result<()> {
-    let presenter = DrmPresenter::new(device).context("initialise DrmPresenter")?;
+    let session = session::Session::open().context("libseat: open session")?;
+
+    // Drain the initial event burst so the Enable arrives before we
+    // start opening devices; libseat's open_device fails while the
+    // session is still in the "pending" state.
+    {
+        let mut s = session.borrow_mut();
+        let _initial = s
+            .dispatch_events()
+            .context("libseat: initial dispatch")?;
+        // The first Enable may take another round-trip; block up to
+        // ~100 ms by polling. Keep it bounded so we don't hang if
+        // something's genuinely wrong with the session.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !s.active && std::time::Instant::now() < deadline {
+            let evs = s
+                .dispatch_events()
+                .context("libseat: waiting for Enable")?;
+            for ev in evs {
+                if matches!(ev, libseat::SeatEvent::Enable) {
+                    s.active = true;
+                }
+            }
+            if !s.active {
+                // libseat's dispatch is non-blocking at timeout=0; give
+                // the daemon a moment to produce the next event.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if !s.active {
+            anyhow::bail!(
+                "libseat: no Enable event within 500ms — the daemon hasn't \
+                 handed us the seat. Are you logged in on this TTY?"
+            );
+        }
+    }
+
+    // Open the DRM device through libseat, wrap into a Card, build the
+    // presenter off it.
+    let drm_fd = session
+        .borrow_mut()
+        .open_device_keep_fd(device)
+        .context("libseat: open DRM device")?;
+    let card = voidptr_backend_drm::Card::from_fd(drm_fd);
+    let presenter =
+        DrmPresenter::from_card(card).context("initialise DrmPresenter")?;
     let (w, h) = presenter.size();
     tracing::info!(width = w, height = h, "drm backend");
 
     // libinput is DRM-only: a headless PNG dump has nowhere to point a cursor.
-    let input = match InputState::init("seat0") {
+    let input = match InputState::init("seat0", session.clone()) {
         Ok(pair) => Some(pair),
         Err(e) => {
             tracing::warn!(error = %e, "libinput init failed; running without input");
@@ -1148,6 +1307,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
         h,
         input,
         Some(device.to_path_buf()),
+        Some(session),
     )
 }
 
