@@ -47,6 +47,25 @@ const OUTPUT_VERSION: u32 = 4;
 const SEAT_VERSION: u32 = 7;
 const XDG_WM_BASE_VERSION: u32 = 5;
 
+/// Screen-space rectangle assigned to a mapped window by the layout.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// A mapped xdg_toplevel together with the screen-space rect the layout
+/// assigned to it. `pending_size` is the (w, h) most recently sent to the
+/// client via xdg_toplevel.configure; layout sends a fresh configure only
+/// when the target rect differs, so we don't spam configures every frame.
+pub struct Window {
+    pub surface: Weak<WlSurface>,
+    pub rect: Rect,
+    pub pending_size: Option<(i32, i32)>,
+}
+
 /// Compositor state shared across Dispatch impls. Backend-specific resources
 /// (canvas, presenter) live on `Compositor` alongside this, not here.
 pub struct State {
@@ -55,7 +74,7 @@ pub struct State {
     pub clients_seen: u64,
     /// Mapped xdg_toplevels in stacking order (bottom to top). Held as weak
     /// refs so dead surfaces drop out on the next render.
-    pub mapped_toplevels: Vec<Weak<WlSurface>>,
+    pub mapped_toplevels: Vec<Window>,
     /// Logical screen size. Drives toplevel placement and (eventually) the
     /// wl_output mode advertised to clients.
     pub screen_width: u32,
@@ -218,13 +237,123 @@ pub struct Compositor {
     pub backend: BackendState,
 }
 
-/// Collects scene elements from mapped xdg_toplevels and the WlBuffers that
-/// back them. Returns the buffers alongside the scene so callers keep them
-/// alive for the duration of rendering.
-fn collect_scene(state: &State) -> Vec<wayland_server::protocol::wl_buffer::WlBuffer> {
-    let mut buffers = Vec::new();
-    for weak in state.mapped_toplevels.iter() {
-        let Ok(surface) = weak.upgrade() else { continue };
+/// If keyboard focus is missing or points at a dead surface (e.g. the
+/// focused window was just closed), move focus to the topmost surviving
+/// mapped toplevel. Keeps typing working without requiring the user to
+/// click a new window to reclaim focus.
+fn rebalance_keyboard_focus(state: &mut State) {
+    let focus_alive = state
+        .keyboard_focus
+        .as_ref()
+        .map(|s| s.is_alive())
+        .unwrap_or(false);
+    if focus_alive {
+        return;
+    }
+    let next = state
+        .mapped_toplevels
+        .iter()
+        .rev()
+        .find_map(|w| w.surface.upgrade().ok());
+    state.set_keyboard_focus(next);
+}
+
+/// Master-stack layout. First window takes the left half (or full screen if
+/// it's the only one); remaining windows split the right half evenly, top to
+/// bottom in mapping order — so the most recently mapped toplevel is the
+/// bottom of the stack. Pure function over window count + screen rect.
+fn master_stack_layout(n: usize, screen: Rect) -> Vec<Rect> {
+    match n {
+        0 => Vec::new(),
+        1 => vec![screen],
+        _ => {
+            let mid = screen.w / 2;
+            let master = Rect {
+                x: screen.x,
+                y: screen.y,
+                w: mid,
+                h: screen.h,
+            };
+            let stack_w = screen.w - mid;
+            let stack_x = screen.x + mid;
+            let stack_n = (n - 1) as i32;
+            let mut out = Vec::with_capacity(n);
+            out.push(master);
+            for i in 0..(n - 1) as i32 {
+                let y0 = screen.y + (screen.h * i) / stack_n;
+                let y1 = screen.y + (screen.h * (i + 1)) / stack_n;
+                out.push(Rect {
+                    x: stack_x,
+                    y: y0,
+                    w: stack_w,
+                    h: y1 - y0,
+                });
+            }
+            out
+        }
+    }
+}
+
+/// Assign a screen-space rect to each mapped toplevel using master-stack.
+fn apply_layout(state: &mut State) {
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        w: state.screen_width as i32,
+        h: state.screen_height as i32,
+    };
+    let rects = master_stack_layout(state.mapped_toplevels.len(), screen);
+    for (win, rect) in state.mapped_toplevels.iter_mut().zip(rects.into_iter()) {
+        win.rect = rect;
+    }
+}
+
+/// For each window whose assigned rect differs from the size we most
+/// recently told the client, send a fresh xdg_toplevel.configure +
+/// xdg_surface.configure. Cached via `Window.pending_size` so steady-state
+/// render ticks don't re-send configures.
+fn send_pending_configures(state: &mut State) {
+    let mut todo: Vec<(usize, i32, i32)> = Vec::new();
+    for (i, win) in state.mapped_toplevels.iter().enumerate() {
+        let target = (win.rect.w, win.rect.h);
+        if win.pending_size != Some(target) {
+            todo.push((i, target.0, target.1));
+        }
+    }
+    for (i, w, h) in todo {
+        let (tl, xs) = {
+            let win = &state.mapped_toplevels[i];
+            let Ok(surface) = win.surface.upgrade() else { continue };
+            let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
+                continue;
+            };
+            let sd = sd_arc.lock().unwrap();
+            let (Some(tl_weak), Some(xs_weak)) =
+                (sd.xdg_toplevel.as_ref(), sd.xdg_surface.as_ref())
+            else {
+                continue;
+            };
+            let (Ok(tl), Ok(xs)) = (tl_weak.upgrade(), xs_weak.upgrade()) else {
+                continue;
+            };
+            (tl, xs)
+        };
+        let serial = state.next_serial();
+        tl.configure(w, h, Vec::new());
+        xs.configure(serial);
+        state.mapped_toplevels[i].pending_size = Some((w, h));
+    }
+}
+
+/// Collects scene elements from mapped xdg_toplevels. Returns each toplevel's
+/// backing `WlBuffer` paired with the `Rect` the layout assigned to it, so
+/// callers keep the buffers alive for the duration of rendering.
+fn collect_scene(
+    state: &State,
+) -> Vec<(wayland_server::protocol::wl_buffer::WlBuffer, Rect)> {
+    let mut out = Vec::new();
+    for win in state.mapped_toplevels.iter() {
+        let Ok(surface) = win.surface.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
@@ -236,26 +365,21 @@ fn collect_scene(state: &State) -> Vec<wayland_server::protocol::wl_buffer::WlBu
             continue;
         };
         if let Ok(buf) = buf_weak.upgrade() {
-            buffers.push(buf);
+            out.push((buf, win.rect));
         }
     }
-    buffers
+    out
 }
 
 fn scene_from_buffers<'a>(
-    buffers: &'a [wayland_server::protocol::wl_buffer::WlBuffer],
+    placed: &'a [(wayland_server::protocol::wl_buffer::WlBuffer, Rect)],
     cursor: &'a Cursor,
-    screen_width: u32,
-    screen_height: u32,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
-    for buf in buffers {
+    for (buf, rect) in placed {
         let Some(bd) = buf.data::<shm::BufferData>() else { continue };
         let Some(bytes) = bd.bytes() else { continue };
         let Some(format) = bd.pixel_format() else { continue };
-        // Centre the toplevel. Replace with a real layout in B6.
-        let x = (screen_width as i32 - bd.width) / 2;
-        let y = (screen_height as i32 - bd.height) / 2;
         let key = (bd as *const shm::BufferData) as usize as u64;
         scene.elements.push(SceneElement {
             buffer_key: key,
@@ -264,8 +388,8 @@ fn scene_from_buffers<'a>(
             width: bd.width,
             height: bd.height,
             stride: bd.stride,
-            x,
-            y,
+            x: rect.x,
+            y: rect.y,
         });
     }
     // Cursor last so it always draws on top.
@@ -290,16 +414,17 @@ fn scene_from_buffers<'a>(
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
-    // Prune dead weak refs each frame.
-    comp.state.mapped_toplevels.retain(|w| w.upgrade().is_ok());
+    // Prune dead weak refs, recompute tile rects, then push fresh configures
+    // to any client whose tile size has changed since the last we told them.
+    comp.state
+        .mapped_toplevels
+        .retain(|w| w.surface.upgrade().is_ok());
+    rebalance_keyboard_focus(&mut comp.state);
+    apply_layout(&mut comp.state);
+    send_pending_configures(&mut comp.state);
 
-    let buffers = collect_scene(&comp.state);
-    let scene = scene_from_buffers(
-        &buffers,
-        &comp.state.cursor,
-        comp.state.screen_width,
-        comp.state.screen_height,
-    );
+    let placed = collect_scene(&comp.state);
+    let scene = scene_from_buffers(&placed, &comp.state.cursor);
     let drawn = scene.elements.len();
 
     match &mut comp.backend {
@@ -328,7 +453,7 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     }
 
     // Scene is done; drop buffers to release them back to clients.
-    for buf in buffers {
+    for (buf, _) in placed {
         buf.release();
     }
     Ok(())
@@ -514,45 +639,26 @@ fn apply_input(state: &mut State, ev: InputEvent) {
     }
 }
 
-/// Hit-test the cursor against mapped toplevels (top of stack first) and
-/// return the surface plus cursor position in surface-local coords.
+/// Hit-test the cursor against mapped toplevels (top of stack first) using
+/// each window's layout-assigned `Rect`. Returns the surface plus cursor
+/// position in surface-local coords.
 fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
-    for weak in state.mapped_toplevels.iter().rev() {
-        let Ok(surface) = weak.upgrade() else { continue };
-        let hit = {
-            let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
-                continue;
-            };
-            let sd = sd_arc.lock().unwrap();
-            if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
-                None
-            } else if let Some(buf_weak) = sd.current.buffer.as_ref() {
-                if let Ok(buf) = buf_weak.upgrade() {
-                    if let Some(bd) = buf.data::<shm::BufferData>() {
-                        let x0 = (state.screen_width as i32 - bd.width) / 2;
-                        let y0 = (state.screen_height as i32 - bd.height) / 2;
-                        let lx = state.cursor.pos_x - x0 as f64;
-                        let ly = state.cursor.pos_y - y0 as f64;
-                        if lx >= 0.0
-                            && lx < bd.width as f64
-                            && ly >= 0.0
-                            && ly < bd.height as f64
-                        {
-                            Some((lx, ly))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+    for win in state.mapped_toplevels.iter().rev() {
+        let Ok(surface) = win.surface.upgrade() else { continue };
+        let sd_arc = match surface.data::<Arc<Mutex<SurfaceData>>>() {
+            Some(s) => s,
+            None => continue,
         };
-        if let Some((lx, ly)) = hit {
+        if !matches!(
+            sd_arc.lock().unwrap().role,
+            SurfaceRole::XdgToplevel { mapped: true }
+        ) {
+            continue;
+        }
+        let r = win.rect;
+        let lx = state.cursor.pos_x - r.x as f64;
+        let ly = state.cursor.pos_y - r.y as f64;
+        if lx >= 0.0 && lx < r.w as f64 && ly >= 0.0 && ly < r.h as f64 {
             return Some((surface, lx, ly));
         }
     }
@@ -608,6 +714,12 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
     let Some(focus) = state.pointer_focus.clone() else { return };
     if !focus.is_alive() {
         return;
+    }
+    // Click-to-focus: on press, move keyboard focus to the window under the
+    // cursor. No-op if that window already has focus (set_keyboard_focus
+    // compares first).
+    if pressed {
+        state.set_keyboard_focus(Some(focus.clone()));
     }
     let serial = state.next_serial();
     let time = state.elapsed_ms();

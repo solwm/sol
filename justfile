@@ -143,6 +143,140 @@ demo-b5 card=drm_card seconds="20": _prep clean-socket
     sleep {{seconds}}
     sudo kill "$paint_pid" 2>/dev/null || true
 
+# B6.1 diagnostic: start voidptr, point alacritty at it, capture both sides
+# of the wire. WAYLAND_DEBUG=1 on the client dumps every request/event from
+# alacritty; RUST_LOG=debug on the server dumps what voidptr saw. The point
+# is NOT to make alacritty draw — it's to read the logs and learn which
+# globals and requests are missing. Must run from a free TTY.
+demo-b6-1 card=drm_card seconds="8": _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    if ! command -v alacritty >/dev/null; then
+        echo "alacritty not found in PATH" >&2
+        exit 1
+    fi
+    echo "=== building ==="
+    cargo build --release --bin voidptr
+    echo
+    echo "=== launching voidptr (sudo for /dev/input/event*) ==="
+    sudo -E VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        RUST_LOG="voidptr=debug,voidptr_wayland=debug,voidptr_backend_drm=debug,info" \
+        WAYLAND_DEBUG=server \
+        ./target/release/voidptr --backend=drm \
+        > {{runtime}}/voidptr.log 2>&1 &
+    server_pid=$!
+    cleanup() {
+        rc=$?
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+        echo
+        echo "=== voidptr.log (rc=$rc, last 300 lines) ==="
+        tail -300 {{runtime}}/voidptr.log 2>/dev/null || echo "<no log>"
+        if [[ -f {{runtime}}/alacritty.log ]]; then
+            echo
+            echo "=== alacritty.log (last 300 lines) ==="
+            tail -300 {{runtime}}/alacritty.log
+        fi
+        echo
+        echo "=== full logs kept at: ==="
+        echo "  {{runtime}}/voidptr.log"
+        echo "  {{runtime}}/alacritty.log"
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    for _ in $(seq 1 100); do
+        [[ -S {{runtime}}/{{socket}} ]] && break
+        if ! sudo kill -0 "$server_pid" 2>/dev/null; then
+            echo "server exited before creating socket"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
+    echo "=== launching alacritty (WAYLAND_DEBUG=1) ==="
+    sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+        WAYLAND_DEBUG=1 \
+        alacritty > {{runtime}}/alacritty.log 2>&1 &
+    alacritty_pid=$!
+    echo "letting it run for {{seconds}}s. ctrl+c to end early."
+    sleep {{seconds}}
+    sudo kill "$alacritty_pid" 2>/dev/null || true
+
+# B6 demo: master-stack tiling. Start voidptr on DRM, then launch 4 alacritty
+# instances ~2s apart so the layout visibly transitions:
+#   1 window  = fullscreen
+#   2 windows = master left half, second on right half
+#   3 windows = master left, right split into two stacked rows
+#   4 windows = master left, right split into three stacked rows
+# The master is always the FIRST alacritty; new instances push the bottom of
+# the right stack. Close one with ctrl+d / exit — the remaining tiles snap
+# to the new layout. Must run from a free TTY.
+demo-b6 card=drm_card seconds="60": _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    if ! command -v alacritty >/dev/null; then
+        echo "alacritty not found in PATH" >&2
+        exit 1
+    fi
+    echo "=== building ==="
+    cargo build --release --bin voidptr
+    echo
+    echo "=== launching voidptr (sudo for /dev/input/event*) ==="
+    sudo -E VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        RUST_LOG="voidptr=info,voidptr_wayland=info,voidptr_backend_drm=info" \
+        ./target/release/voidptr --backend=drm \
+        > {{runtime}}/voidptr.log 2>&1 &
+    server_pid=$!
+    declare -a client_pids=()
+    cleanup() {
+        rc=$?
+        for pid in "${client_pids[@]}"; do
+            sudo kill "$pid" 2>/dev/null || true
+        done
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+        echo
+        echo "=== voidptr.log (rc=$rc, last 200 lines) ==="
+        tail -200 {{runtime}}/voidptr.log 2>/dev/null || echo "<no log>"
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    for _ in $(seq 1 100); do
+        [[ -S {{runtime}}/{{socket}} ]] && break
+        if ! sudo kill -0 "$server_pid" 2>/dev/null; then
+            echo "server exited before creating socket"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
+    for n in 1 2 3 4; do
+        echo "=== launching alacritty #$n (you should see layout reflow) ==="
+        sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+            alacritty -T "voidptr-$n" > {{runtime}}/alacritty-$n.log 2>&1 &
+        client_pids+=($!)
+        sleep 2
+    done
+    echo "running for {{seconds}}s. click between windows to change focus."
+    echo "close any window (ctrl+d) to see the tiles rebalance."
+    sleep {{seconds}}
+
 # B4 demo: run voidptr as a real compositor on the DRM backend, connect
 # voidptr-paint, show its stripes on the physical panel. MUST be run from a
 # free TTY (Ctrl+Alt+F2..F6). Server runs in background, client paints, then
@@ -217,7 +351,11 @@ demo-b3 card=drm_card seconds="8": build
     fi
     cargo run --release --bin voidptr-drm-smoke -- run {{card}} {{seconds}}
 
-# B2 verification: run demo-b2, then sample four pixels against expected colors
+# B2 verification: run demo-b2, then sample four pixels against expected colors.
+# Post-B6 the layout is master-stack, so with one paint window (256x256 at the
+# top-left tile of a 1920x1080 screen) each stripe band is ~85 rows tall and
+# the rest of the canvas is background. Positions chosen to hit each stripe
+# plus the outside-window background.
 verify-b2: demo-b2
     #!/usr/bin/env bash
     set -euo pipefail
@@ -226,10 +364,10 @@ verify-b2: demo-b2
         exit 1
     fi
     declare -A want=(
-        [100,100]="32,32,40"
-        [900,440]="255,48,48"
-        [900,520]="48,255,48"
-        [900,630]="48,48,255"
+        [100,40]="255,48,48"
+        [100,120]="48,255,48"
+        [100,200]="48,48,255"
+        [900,500]="32,32,40"
     )
     rc=0
     for pos in "${!want[@]}"; do

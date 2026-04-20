@@ -6,6 +6,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use wayland_protocols::xdg::shell::server::{
+    xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel,
+};
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, Weak,
     protocol::{
@@ -42,6 +45,11 @@ pub struct SurfaceData {
     pub pending: SurfaceState,
     pub current: SurfaceState,
     pub frame_callbacks: Vec<WlCallback>,
+    /// Populated by xdg_surface.get_toplevel so the compositor can send
+    /// directive configure events during layout without threading the
+    /// XdgToplevel handle through every code path.
+    pub xdg_toplevel: Option<Weak<XdgToplevel>>,
+    pub xdg_surface: Option<Weak<XdgSurface>>,
 }
 
 impl GlobalDispatch<WlCompositor, ()> for State {
@@ -131,9 +139,11 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                             *mapped = true;
                             just_mapped = true;
                             tracing::info!(id = ?surface.id(), "toplevel mapped");
-                            state
-                                .mapped_toplevels
-                                .push(surface.downgrade());
+                            state.mapped_toplevels.push(crate::Window {
+                                surface: surface.downgrade(),
+                                rect: crate::Rect::default(),
+                                pending_size: None,
+                            });
                         }
                     } else {
                         *mapped = false;

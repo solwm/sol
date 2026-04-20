@@ -1,5 +1,6 @@
-//! wl_output global. At B2 we advertise a single virtual 1920x1080 output
-//! matching the headless canvas size.
+//! wl_output global. Advertises the compositor's active screen size to
+//! clients. Dimensions are read live from `State.screen_{width,height}` so
+//! headless and DRM backends with different resolutions both work.
 
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
@@ -8,12 +9,9 @@ use wayland_server::{
 
 use crate::State;
 
-pub const OUTPUT_WIDTH: i32 = 1920;
-pub const OUTPUT_HEIGHT: i32 = 1080;
-
 impl GlobalDispatch<WlOutput, ()> for State {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<WlOutput>,
@@ -21,28 +19,30 @@ impl GlobalDispatch<WlOutput, ()> for State {
         init: &mut DataInit<'_, Self>,
     ) {
         let o = init.init(resource, ());
+        let w = state.screen_width as i32;
+        let h = state.screen_height as i32;
         o.geometry(
             0,
             0,
             300,
             200,
             Subpixel::Unknown,
-            "hyperland-rs".into(),
-            "headless-0".into(),
+            "voidptr".into(),
+            "voidptr-0".into(),
             Transform::Normal,
         );
-        o.mode(Mode::Current | Mode::Preferred, OUTPUT_WIDTH, OUTPUT_HEIGHT, 60_000);
+        o.mode(Mode::Current | Mode::Preferred, w, h, 60_000);
         if o.version() >= 2 {
             o.scale(1);
         }
         if o.version() >= 4 {
-            o.name("HEADLESS-0".into());
-            o.description("hyperland-rs headless virtual output".into());
+            o.name("VOIDPTR-0".into());
+            o.description("voidptr primary output".into());
         }
         if o.version() >= 2 {
             o.done();
         }
-        tracing::info!(id = ?o.id(), "bind wl_output");
+        tracing::info!(id = ?o.id(), width = w, height = h, "bind wl_output");
     }
 }
 

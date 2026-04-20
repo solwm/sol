@@ -90,8 +90,12 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                 {
                     let mut sd = data.surface_data.lock().unwrap();
                     sd.role = crate::compositor::SurfaceRole::XdgToplevel { mapped: false };
+                    sd.xdg_toplevel = Some(toplevel.downgrade());
+                    sd.xdg_surface = Some(xs.downgrade());
                 }
-                // Send initial configure: empty states, size 0x0 means "client picks".
+                // Initial configure with 0x0 lets the client draw at its
+                // preferred first-frame size. Once it maps, apply_layout
+                // re-configures it to the tile size assigned by master-stack.
                 toplevel.configure(0, 0, Vec::new());
                 let serial = state.next_serial();
                 xs.configure(serial);
@@ -128,7 +132,7 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
             xdg_toplevel::Request::Destroy => {
                 state
                     .mapped_toplevels
-                    .retain(|w| w.upgrade().ok().as_ref() != Some(surface));
+                    .retain(|w| w.surface.upgrade().ok().as_ref() != Some(surface));
                 state.needs_render = true;
             }
             _ => {}
