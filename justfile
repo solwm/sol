@@ -268,11 +268,27 @@ demo-b9 card=drm_card seconds="120": _prep clean-socket
     EOF
         exit 1
     fi
+    # Run voidptr as the invoking user so Alt+Enter / Alt+D clients
+    # inherit the user's identity (config dirs, $HOME, DBus session,
+    # etc.). Requires that user to be in the `video` + `input` groups
+    # so DRM and libinput are accessible without sudo.
+    missing=""
+    for g in video input; do
+        id -nG | tr ' ' '\n' | grep -qx "$g" || missing+=" $g"
+    done
+    if [[ -n "$missing" ]]; then
+        echo "voidptr needs access to /dev/dri and /dev/input without sudo so" >&2
+        echo "clients spawned via Alt+Enter/Alt+D run as you, not root. Your user" >&2
+        echo "isn't in these groups:${missing}" >&2
+        echo "Fix: sudo usermod -aG video,input $(whoami)" >&2
+        echo "then log out of this TTY and log back in (groups only apply on fresh login)." >&2
+        exit 1
+    fi
     echo "=== building ==="
     cargo build --release --bin voidptr
     echo
-    echo "=== launching voidptr (sudo for /dev/input/event*) ==="
-    sudo -E VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+    echo "=== launching voidptr as $(whoami) ==="
+    VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
         RUST_LOG="voidptr_wayland::layer_shell=info,voidptr_wayland=info,voidptr_backend_drm=info" \
         ./target/release/voidptr --backend=drm \
         > {{runtime}}/voidptr.log 2>&1 &
@@ -281,9 +297,9 @@ demo-b9 card=drm_card seconds="120": _prep clean-socket
     cleanup() {
         rc=$?
         for pid in "${client_pids[@]}"; do
-            sudo kill "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
         done
-        sudo kill "$server_pid" 2>/dev/null || true
+        kill "$server_pid" 2>/dev/null || true
         wait 2>/dev/null || true
         echo
         echo "=== layer-shell log lines ==="
@@ -297,7 +313,7 @@ demo-b9 card=drm_card seconds="120": _prep clean-socket
     trap cleanup EXIT
     for _ in $(seq 1 100); do
         [[ -S {{runtime}}/{{socket}} ]] && break
-        if ! sudo kill -0 "$server_pid" 2>/dev/null; then
+        if ! kill -0 "$server_pid" 2>/dev/null; then
             echo "server exited before creating socket"
             exit 1
         fi
@@ -306,7 +322,7 @@ demo-b9 card=drm_card seconds="120": _prep clean-socket
     [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
     if command -v waybar >/dev/null; then
         echo "=== launching waybar ==="
-        sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+        XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
             waybar > {{runtime}}/waybar.log 2>&1 &
         client_pids+=($!)
     else
