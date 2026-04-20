@@ -26,6 +26,7 @@ calloop = "0.14"
 wayland-server = "0.31"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 memmap2 = "0.9"
 png = "0.17"
 rustix = { version = "0.38", features = ["fs", "mm", "event"] }

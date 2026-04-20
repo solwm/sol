@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use wayland_protocols::xdg::shell::server::{
     xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel,
 };
+use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, Weak,
     protocol::{
@@ -22,13 +23,25 @@ use wayland_server::{
 
 use crate::State;
 
-/// Roles a surface can take on. Only xdg_toplevel at B2.
+/// Roles a surface can take on.
 #[derive(Clone, Debug, Default)]
 pub enum SurfaceRole {
     #[default]
     None,
     XdgToplevel {
         mapped: bool,
+    },
+    /// `zwlr_layer_surface_v1` role. Layer surfaces live outside the
+    /// tile layout — they're anchored to output edges and stack in a
+    /// separate z-order (background/bottom under toplevels, top/overlay
+    /// over them).
+    LayerSurface {
+        mapped: bool,
+        /// Set to true once we've sent the first `configure` event but
+        /// haven't yet seen the corresponding `ack_configure` + buffered
+        /// commit. The client is allowed to commit without a buffer in
+        /// this state to request reconfiguration.
+        initial_configure_sent: bool,
     },
 }
 
@@ -50,6 +63,10 @@ pub struct SurfaceData {
     /// XdgToplevel handle through every code path.
     pub xdg_toplevel: Option<Weak<XdgToplevel>>,
     pub xdg_surface: Option<Weak<XdgSurface>>,
+    /// Populated by zwlr_layer_shell_v1.get_layer_surface — same purpose
+    /// as the xdg handles above, but for layer surfaces so apply_layout
+    /// can configure the bar/launcher/wallpaper.
+    pub zwlr_layer_surface: Option<Weak<ZwlrLayerSurfaceV1>>,
 }
 
 impl GlobalDispatch<WlCompositor, ()> for State {
@@ -130,26 +147,66 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 sd.current.buffer = sd.pending.buffer.take();
                 sd.current.damage = std::mem::take(&mut sd.pending.damage);
 
+                // If this surface has a layer-shell role, double-buffer
+                // its per-role state (anchor, size, margin, etc.) the
+                // same way we did with the buffer above.
+                let is_layer_role =
+                    matches!(sd.role, SurfaceRole::LayerSurface { .. });
+                drop(sd);
+                if is_layer_role {
+                    crate::layer_shell::promote_layer_state(surface);
+                }
+                let mut sd = data.lock().unwrap();
+
                 // Mark as mapped once we have a buffer + role.
                 let has_buffer = sd.current.buffer.is_some();
                 let mut just_mapped = false;
-                if let SurfaceRole::XdgToplevel { mapped } = &mut sd.role {
-                    if has_buffer {
-                        if !*mapped {
+                let mut layer_needs_configure = false;
+                match &mut sd.role {
+                    SurfaceRole::XdgToplevel { mapped } => {
+                        if has_buffer {
+                            if !*mapped {
+                                *mapped = true;
+                                just_mapped = true;
+                                tracing::info!(id = ?surface.id(), "toplevel mapped");
+                                state.mapped_toplevels.push(crate::Window {
+                                    surface: surface.downgrade(),
+                                    rect: crate::Rect::default(),
+                                    pending_size: None,
+                                });
+                            }
+                        } else {
+                            *mapped = false;
+                        }
+                    }
+                    SurfaceRole::LayerSurface {
+                        mapped,
+                        initial_configure_sent,
+                    } => {
+                        // Protocol flow:
+                        // 1. Client creates layer_surface, sets state,
+                        //    commits with NO buffer.
+                        // 2. Server sends configure(serial, w, h).
+                        // 3. Client acks + commits WITH a buffer → mapped.
+                        if !*initial_configure_sent && !has_buffer {
+                            layer_needs_configure = true;
+                            *initial_configure_sent = true;
+                        } else if has_buffer && !*mapped && *initial_configure_sent {
                             *mapped = true;
                             just_mapped = true;
-                            tracing::info!(id = ?surface.id(), "toplevel mapped");
-                            state.mapped_toplevels.push(crate::Window {
-                                surface: surface.downgrade(),
-                                rect: crate::Rect::default(),
-                                pending_size: None,
-                            });
+                            tracing::info!(id = ?surface.id(), "layer surface mapped");
+                        } else if !has_buffer && *mapped {
+                            // Null buffer unmaps per spec.
+                            *mapped = false;
                         }
-                    } else {
-                        *mapped = false;
                     }
+                    SurfaceRole::None => {}
                 }
                 drop(sd);
+
+                if layer_needs_configure {
+                    crate::layer_shell::send_initial_configure(state, surface);
+                }
 
                 if just_mapped {
                     // Give this toplevel keyboard focus if no one else has

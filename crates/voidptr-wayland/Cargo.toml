@@ -11,6 +11,7 @@ tracing.workspace = true
 calloop.workspace = true
 wayland-server.workspace = true
 wayland-protocols = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
 memmap2.workspace = true
 png.workspace = true
 rustix.workspace = true

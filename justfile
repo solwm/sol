@@ -250,6 +250,76 @@ demo-b10-1 card=drm_card: _prep clean-socket
     echo "=== full voidptr.log tail ==="
     tail -20 {{runtime}}/voidptr.log
 
+# B9 demo: layer-shell + built-in keybinds. Launches voidptr plus
+# (optionally) waybar if it's installed. Once it's up:
+#   Alt+Enter  → spawn alacritty
+#   Alt+D      → spawn rofi (layer-shell launcher; takes exclusive kb)
+# This exercises every layer slot: waybar (Top/exclusive_zone) reserves
+# bar space, rofi (Top/exclusive keyboard) grabs focus and renders over
+# tiled toplevels. Must run from a free TTY.
+demo-b9 card=drm_card seconds="120": _prep clean-socket
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${SKIP_TTY_CHECK:-}" && "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        cat >&2 <<'EOF'
+    Refusing to run: XDG_SESSION_TYPE=wayland suggests you're still inside
+    a graphical session. Switch to a free TTY (Ctrl+Alt+F2..F6), log in,
+    and run the same recipe there. Set SKIP_TTY_CHECK=1 to override.
+    EOF
+        exit 1
+    fi
+    echo "=== building ==="
+    cargo build --release --bin voidptr
+    echo
+    echo "=== launching voidptr (sudo for /dev/input/event*) ==="
+    sudo -E VOIDPTR_DRM_DEVICE={{card}} XDG_RUNTIME_DIR={{runtime}} \
+        RUST_LOG="voidptr_wayland::layer_shell=info,voidptr_wayland=info,voidptr_backend_drm=info" \
+        ./target/release/voidptr --backend=drm \
+        > {{runtime}}/voidptr.log 2>&1 &
+    server_pid=$!
+    declare -a client_pids=()
+    cleanup() {
+        rc=$?
+        for pid in "${client_pids[@]}"; do
+            sudo kill "$pid" 2>/dev/null || true
+        done
+        sudo kill "$server_pid" 2>/dev/null || true
+        wait 2>/dev/null || true
+        echo
+        echo "=== layer-shell log lines ==="
+        grep -E 'layer|zwlr_layer|Alt\+' {{runtime}}/voidptr.log \
+            || echo "<no layer-shell activity recorded>"
+        echo
+        echo "=== voidptr.log tail ==="
+        tail -60 {{runtime}}/voidptr.log
+        exit "$rc"
+    }
+    trap cleanup EXIT
+    for _ in $(seq 1 100); do
+        [[ -S {{runtime}}/{{socket}} ]] && break
+        if ! sudo kill -0 "$server_pid" 2>/dev/null; then
+            echo "server exited before creating socket"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    [[ -S {{runtime}}/{{socket}} ]] || { echo "no socket after 10s"; exit 1; }
+    if command -v waybar >/dev/null; then
+        echo "=== launching waybar ==="
+        sudo -E XDG_RUNTIME_DIR={{runtime}} WAYLAND_DISPLAY={{socket}} \
+            waybar > {{runtime}}/waybar.log 2>&1 &
+        client_pids+=($!)
+    else
+        echo "(waybar not installed; skipping)"
+    fi
+    echo
+    echo "Keybinds:"
+    echo "  Alt+Enter -> new alacritty tile"
+    echo "  Alt+D     -> rofi launcher (takes exclusive keyboard focus)"
+    echo "  Ctrl+C    -> end session"
+    echo
+    sleep {{seconds}}
+
 # B10 demo: full dmabuf path at 4K@240. Launches voidptr + one alacritty
 # running cmatrix, so you can eyeball whether the terminal redraws
 # smoothly now that we're doing zero-copy dmabuf import instead of the

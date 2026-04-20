@@ -26,6 +26,7 @@ use wayland_server::{
 mod compositor;
 mod cursor;
 mod input;
+mod layer_shell;
 mod linux_dmabuf;
 mod output;
 mod render;
@@ -40,6 +41,7 @@ use input::{InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
 use wayland_server::protocol::{
     wl_keyboard::{self, WlKeyboard},
     wl_pointer::{self, WlPointer},
@@ -121,6 +123,10 @@ pub struct State {
     /// handlers when a client tears down a buffer; drained (and acted
     /// on) inside `render_tick` which has `&mut` access to the backend.
     pub pending_texture_evictions: Vec<u64>,
+    /// Weak refs to every `wl_surface` with a `zwlr_layer_surface_v1`
+    /// role. Dead weaks are pruned on render tick; the role's mapped
+    /// flag on `SurfaceData` determines whether we currently draw it.
+    pub pending_layer_surfaces: Vec<Weak<WlSurface>>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -161,6 +167,7 @@ pub struct Globals {
     pub xdg_wm_base: GlobalId,
     pub linux_dmabuf: GlobalId,
     pub xdg_decoration: GlobalId,
+    pub layer_shell: GlobalId,
 }
 
 impl State {
@@ -271,7 +278,38 @@ pub struct Compositor {
 /// focused window was just closed), move focus to the topmost surviving
 /// mapped toplevel. Keeps typing working without requiring the user to
 /// click a new window to reclaim focus.
+///
+/// Also: if any mapped Top/Overlay layer surface sets
+/// `keyboard_interactivity = exclusive` (e.g. rofi while it's visible),
+/// hand focus to *that* instead, regardless of what was previously
+/// focused. This matches sway/wlroots behavior and is what makes
+/// launchers and lockscreens capture input reliably.
 fn rebalance_keyboard_focus(state: &mut State) {
+    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
+    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::KeyboardInteractivity;
+
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        w: state.screen_width as i32,
+        h: state.screen_height as i32,
+    };
+    // Check if a Top/Overlay layer surface is currently demanding
+    // exclusive keyboard focus.
+    let layers = layer_shell::mapped_layers(state, screen);
+    let exclusive_layer = layers.iter().rev().find(|m| {
+        matches!(m.layer, Layer::Top | Layer::Overlay)
+            && m.keyboard_interactivity == KeyboardInteractivity::Exclusive as u32
+    });
+    if let Some(ml) = exclusive_layer {
+        // Steal focus unconditionally; exclusive means exclusive.
+        let target = Some(ml.surface.clone());
+        if !surface_eq(state.keyboard_focus.as_ref(), target.as_ref()) {
+            state.set_keyboard_focus(target);
+        }
+        return;
+    }
+
     let focus_alive = state
         .keyboard_focus
         .as_ref()
@@ -324,7 +362,10 @@ fn master_stack_layout(n: usize, screen: Rect) -> Vec<Rect> {
     }
 }
 
-/// Assign a screen-space rect to each mapped toplevel using master-stack.
+/// Assign a screen-space rect to each mapped toplevel using master-stack,
+/// but compute the layout against the usable area — the screen minus any
+/// edge-reserved exclusive zones from layer surfaces (a top-anchored bar
+/// with exclusive_zone=30 shrinks tiled toplevels by 30 px off the top).
 fn apply_layout(state: &mut State) {
     let screen = Rect {
         x: 0,
@@ -332,7 +373,9 @@ fn apply_layout(state: &mut State) {
         w: state.screen_width as i32,
         h: state.screen_height as i32,
     };
-    let rects = master_stack_layout(state.mapped_toplevels.len(), screen);
+    let layers = layer_shell::mapped_layers(state, screen);
+    let usable = layer_shell::usable_area(&layers, screen);
+    let rects = master_stack_layout(state.mapped_toplevels.len(), usable);
     for (win, rect) in state.mapped_toplevels.iter_mut().zip(rects.into_iter()) {
         win.rect = rect;
     }
@@ -389,13 +432,34 @@ fn send_pending_configures(state: &mut State) {
     }
 }
 
-/// Collects scene elements from mapped xdg_toplevels. Returns each toplevel's
-/// backing `WlBuffer` paired with the `Rect` the layout assigned to it, so
-/// callers keep the buffers alive for the duration of rendering.
+/// Collects scene elements in back-to-front render order:
+/// background + bottom layer surfaces → tiled xdg toplevels →
+/// top + overlay layer surfaces. Cursor is added separately by
+/// `scene_from_buffers`. Each entry pairs a `WlBuffer` with the rect
+/// it should be drawn at; callers keep the buffers alive for the
+/// duration of rendering.
 fn collect_scene(
     state: &State,
 ) -> Vec<(wayland_server::protocol::wl_buffer::WlBuffer, Rect)> {
     let mut out = Vec::new();
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        w: state.screen_width as i32,
+        h: state.screen_height as i32,
+    };
+
+    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
+    let layers = layer_shell::mapped_layers(state, screen);
+
+    // 1. Background + Bottom layer surfaces.
+    for ml in &layers {
+        if matches!(ml.layer, Layer::Background | Layer::Bottom) {
+            out.push((ml.buffer.clone(), ml.rect));
+        }
+    }
+
+    // 2. Tiled xdg_toplevels.
     for win in state.mapped_toplevels.iter() {
         let Ok(surface) = win.surface.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
@@ -412,6 +476,14 @@ fn collect_scene(
             out.push((buf, win.rect));
         }
     }
+
+    // 3. Top + Overlay layer surfaces.
+    for ml in &layers {
+        if matches!(ml.layer, Layer::Top | Layer::Overlay) {
+            out.push((ml.buffer.clone(), ml.rect));
+        }
+    }
+
     out
 }
 
@@ -583,6 +655,10 @@ fn setup_event_loop(
             xdg_decoration::DECORATION_VERSION,
             (),
         ),
+        layer_shell: dh.create_global::<State, ZwlrLayerShellV1, ()>(
+            layer_shell::LAYER_SHELL_VERSION,
+            (),
+        ),
     };
     tracing::info!(?globals, "advertised globals");
 
@@ -691,6 +767,7 @@ fn setup_event_loop(
         left_alt_down: false,
         right_alt_down: false,
         pending_texture_evictions: Vec::new(),
+        pending_layer_surfaces: Vec::new(),
     };
     let mut compositor = Compositor {
         state,
@@ -767,15 +844,29 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                 KEY_RIGHTALT => state.right_alt_down = pressed,
                 _ => {}
             }
-            // Built-in keybind: Alt+Enter spawns an alacritty client
-            // against our own socket. Intercepted before forwarding so
-            // focused apps don't also see it as Ctrl+M / newline.
-            if pressed
-                && keycode == KEY_ENTER
-                && (state.left_alt_down || state.right_alt_down)
-            {
-                spawn_alacritty(state);
-                return;
+            // Built-in keybinds:
+            //   Alt+Enter → alacritty (terminal)
+            //   Alt+D     → rofi (application launcher, layer-shell client)
+            // Intercepted before forwarding so focused apps don't also
+            // see them.
+            let alt = state.left_alt_down || state.right_alt_down;
+            if pressed && alt {
+                match keycode {
+                    KEY_ENTER => {
+                        spawn_client(state, "alacritty", &[], "Alt+Enter");
+                        return;
+                    }
+                    KEY_D => {
+                        spawn_client(
+                            state,
+                            "rofi",
+                            &["-show", "drun"],
+                            "Alt+D",
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
             }
             send_keyboard_key(state, keycode, pressed);
         }
@@ -784,17 +875,18 @@ fn apply_input(state: &mut State, ev: InputEvent) {
 
 /// evdev scancodes, matching what libinput hands us via `key.key()`.
 const KEY_ENTER: u32 = 28;
+const KEY_D: u32 = 32;
 const KEY_LEFTALT: u32 = 56;
 const KEY_RIGHTALT: u32 = 100;
 
-/// Spawn an alacritty client connected to our Wayland socket. Inherits
-/// XDG_RUNTIME_DIR from our environment; sets WAYLAND_DISPLAY explicitly
-/// in case we started via a harness that didn't pass it through. The
-/// Child handle is intentionally dropped — we don't want to reap or wait,
-/// the kernel handles cleanup when voidptr exits.
-fn spawn_alacritty(state: &State) {
+/// Fork/exec a Wayland client connected to our own socket. Inherits env
+/// (XDG_RUNTIME_DIR, HOME, etc.) from the compositor; overrides
+/// WAYLAND_DISPLAY to our socket name. Child handle is intentionally
+/// dropped — no reap, no wait; the kernel cleans up on voidptr exit.
+fn spawn_client(state: &State, program: &str, args: &[&str], label: &str) {
     let socket = state.socket_name.clone();
-    match std::process::Command::new("alacritty")
+    match std::process::Command::new(program)
+        .args(args)
         .env("WAYLAND_DISPLAY", &socket)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -804,16 +896,54 @@ fn spawn_alacritty(state: &State) {
         Ok(child) => tracing::info!(
             pid = child.id(),
             socket = %socket,
-            "Alt+Enter: spawned alacritty"
+            program,
+            "{label}: spawned"
         ),
-        Err(e) => tracing::warn!(error = %e, "Alt+Enter: spawn alacritty failed"),
+        Err(e) => {
+            tracing::warn!(error = %e, program, "{label}: spawn failed");
+        }
     }
 }
 
-/// Hit-test the cursor against mapped toplevels (top of stack first) using
-/// each window's layout-assigned `Rect`. Returns the surface plus cursor
-/// position in surface-local coords.
+/// Hit-test the cursor top-to-bottom through the full z-stack:
+/// Overlay → Top layer surfaces → tiled toplevels → Bottom → Background
+/// layer surfaces. Returns the surface plus cursor position in
+/// surface-local coords.
 fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
+    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        w: state.screen_width as i32,
+        h: state.screen_height as i32,
+    };
+    let cx = state.cursor.pos_x;
+    let cy = state.cursor.pos_y;
+
+    let hit_rect = |r: Rect| -> Option<(f64, f64)> {
+        let lx = cx - r.x as f64;
+        let ly = cy - r.y as f64;
+        if lx >= 0.0 && lx < r.w as f64 && ly >= 0.0 && ly < r.h as f64 {
+            Some((lx, ly))
+        } else {
+            None
+        }
+    };
+
+    let layers = layer_shell::mapped_layers(state, screen);
+
+    // Pass 1: Overlay > Top. Iterate overlay-first (descending priority).
+    for ml in layers
+        .iter()
+        .filter(|m| matches!(m.layer, Layer::Overlay))
+        .chain(layers.iter().filter(|m| matches!(m.layer, Layer::Top)))
+    {
+        if let Some((lx, ly)) = hit_rect(ml.rect) {
+            return Some((ml.surface.clone(), lx, ly));
+        }
+    }
+
+    // Pass 2: tiled toplevels (top of stack first).
     for win in state.mapped_toplevels.iter().rev() {
         let Ok(surface) = win.surface.upgrade() else { continue };
         let sd_arc = match surface.data::<Arc<Mutex<SurfaceData>>>() {
@@ -826,13 +956,22 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         ) {
             continue;
         }
-        let r = win.rect;
-        let lx = state.cursor.pos_x - r.x as f64;
-        let ly = state.cursor.pos_y - r.y as f64;
-        if lx >= 0.0 && lx < r.w as f64 && ly >= 0.0 && ly < r.h as f64 {
+        if let Some((lx, ly)) = hit_rect(win.rect) {
             return Some((surface, lx, ly));
         }
     }
+
+    // Pass 3: Bottom > Background.
+    for ml in layers
+        .iter()
+        .filter(|m| matches!(m.layer, Layer::Bottom))
+        .chain(layers.iter().filter(|m| matches!(m.layer, Layer::Background)))
+    {
+        if let Some((lx, ly)) = hit_rect(ml.rect) {
+            return Some((ml.surface.clone(), lx, ly));
+        }
+    }
+
     None
 }
 
