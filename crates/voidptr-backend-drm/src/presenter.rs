@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow};
-use drm::Device as BasicDevice;
 use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, framebuffer};
 use glow::HasContext;
 use khronos_egl as egl;
@@ -71,19 +70,19 @@ struct TextureEntry {
 impl DrmPresenter {
     /// Construct from a `Card` already wrapping a DRM fd. voidptr's main
     /// binary uses this path — libseat hands us the fd; we wrap it via
-    /// `Card::from_fd` before calling here. `acquire_master_lock` is
-    /// still needed on the first call to establish master, but because
-    /// libseat coordinates the session's VT ownership the ioctl succeeds
-    /// without the "another compositor owns this VT" error we used to
-    /// have to work around.
+    /// `Card::from_fd` before calling here.
+    ///
+    /// No explicit `acquire_master_lock` call here: the fd returned by
+    /// libseat's `TakeDevice` (logind) or seatd is already master,
+    /// because the daemon set master on it as part of granting the
+    /// active session's device. Calling DRM_IOCTL_SET_MASTER again
+    /// from our process-side fails with EACCES — the kernel only
+    /// allows the currently-active logind session to perform it, and
+    /// from a child process's perspective of the daemon-opened fd
+    /// that check doesn't match. Operations that actually need master
+    /// (set_crtc, page_flip) work fine because the fd itself is
+    /// master-flagged.
     pub fn from_card(card: Card) -> Result<Self> {
-        card.acquire_master_lock().map_err(|e| {
-            anyhow!(
-                "could not become DRM master: {e:?} — libseat should have \
-                 given us a session-owned fd, but acquire_master was refused."
-            )
-        })?;
-
         let sel = pick_output(&card)?;
         let (w_i16, h_i16) = sel.mode.size();
         let width = w_i16 as u32;
@@ -128,25 +127,23 @@ impl DrmPresenter {
         (self.width, self.height)
     }
 
-    /// Drop DRM master while our session is inactive (libseat Disable).
-    /// The fd remains open but DRM ioctls requiring master will fail.
-    /// Called from the session's Disable handler.
+    /// Called from the session's Disable handler. libseat/logind
+    /// revokes DRM master on our fd as part of the session-deactivate
+    /// path, so we don't call DROP_MASTER ourselves — the kernel has
+    /// already flipped the fd out of master mode and issuing another
+    /// DROP would return EINVAL. Kept as a stub for symmetry with
+    /// `reacquire_master` and so future backends (direct VT mgmt)
+    /// can hook in.
     pub fn drop_master(&self) {
-        if let Err(e) = self.card.release_master_lock() {
-            tracing::warn!(error = ?e, "DRM drop_master");
-        } else {
-            tracing::info!("DRM master dropped (session disabled)");
-        }
+        tracing::info!("session disabled — DRM master released by logind");
     }
 
-    /// Reacquire DRM master when our session becomes active again
-    /// (libseat Enable). Also re-applies our modeset so the screen
+    /// Called on libseat Enable: re-apply our modeset so the screen
     /// reflects our scene rather than whatever drove the display
-    /// during the disabled window.
+    /// during the disabled window (fbcon or another session). No
+    /// explicit acquire_master_lock — libseat/logind restores master
+    /// on our fd as part of making the session active.
     pub fn reacquire_master(&mut self) -> Result<()> {
-        self.card
-            .acquire_master_lock()
-            .map_err(|e| anyhow!("DRM acquire_master on Enable: {e:?}"))?;
         // Re-arm the CRTC with our most recent scanned-out buffer so
         // fbcon's takeover during the disabled window is overwritten.
         if let Some(bo) = self.scanned_out.as_ref() {
