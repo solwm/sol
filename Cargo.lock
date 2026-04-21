@@ -808,36 +808,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "voidptr-drm-smoke"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "ctrlc",
- "tracing",
- "tracing-subscriber",
- "voidptr-backend-drm",
-]
-
-[[package]]
-name = "voidptr-paint"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "memmap2",
- "rustix 0.38.44",
- "wayland-client",
- "wayland-protocols",
-]
-
-[[package]]
-name = "voidptr-probe"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "wayland-client",
-]
-
-[[package]]
 name = "voidptr-wayland"
 version = "0.0.1"
 dependencies = [

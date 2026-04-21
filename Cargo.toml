@@ -5,9 +5,6 @@ members = [
     "crates/voidptr-wayland",
     "crates/voidptr-backend-drm",
     "crates/voidptr",
-    "crates/voidptr-probe",
-    "crates/voidptr-paint",
-    "crates/voidptr-drm-smoke",
 ]
 
 [workspace.package]
