@@ -939,13 +939,23 @@ fn setup_event_loop(
     Ok(())
 }
 
-/// Handle a single libseat event. Keeps the backend's DRM master state
-/// in sync with our session ownership and then acks the Disable so the
-/// daemon can proceed with the VT switch.
+/// Handle a single libseat event. Keeps both the DRM backend's master
+/// state AND libinput's device fds in sync with our session ownership,
+/// then acks the Disable so the daemon can proceed with the VT switch.
+///
+/// libinput suspend/resume is mandatory here: logind revokes our
+/// /dev/input/event* fds on Disable, so libinput is left with stale
+/// fds that stop producing events even after we come back. Calling
+/// `suspend` before we ack Disable closes them via our
+/// close_restricted callback, and `resume` on Enable re-opens fresh
+/// ones via open_restricted (which routes through libseat).
 fn handle_session_event(comp: &mut Compositor, ev: libseat::SeatEvent) {
     match ev {
         libseat::SeatEvent::Disable => {
-            tracing::info!("libseat: Disable — releasing DRM master");
+            tracing::info!("libseat: Disable — suspending input + releasing DRM master");
+            if let Some(input) = comp.state.input.as_mut() {
+                input.li.suspend();
+            }
             if let BackendState::Drm(presenter) = &mut comp.backend {
                 presenter.drop_master();
             }
@@ -958,13 +968,18 @@ fn handle_session_event(comp: &mut Compositor, ev: libseat::SeatEvent) {
             }
         }
         libseat::SeatEvent::Enable => {
-            tracing::info!("libseat: Enable — reacquiring DRM master");
+            tracing::info!("libseat: Enable — reacquiring DRM master + resuming input");
             if let Some(s) = comp.state.session.as_ref() {
                 s.borrow_mut().active = true;
             }
             if let BackendState::Drm(presenter) = &mut comp.backend {
                 if let Err(e) = presenter.reacquire_master() {
                     tracing::warn!(error = %e, "DRM reacquire on Enable");
+                }
+            }
+            if let Some(input) = comp.state.input.as_mut() {
+                if input.li.resume().is_err() {
+                    tracing::warn!("libinput resume failed — input may be dead");
                 }
             }
             comp.state.needs_render = true;
