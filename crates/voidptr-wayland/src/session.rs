@@ -103,6 +103,20 @@ impl Session {
         Ok(std::mem::take(&mut *self.queue.borrow_mut()))
     }
 
+    /// Block up to `timeout_ms` waiting for events. Used at startup to
+    /// wait for the initial Enable: logind's D-Bus reply can take a
+    /// tens-of-ms round-trip, and with dispatch(0) we'd bail before
+    /// the message arrives. Returns the accumulated events.
+    pub fn dispatch_events_blocking(
+        &mut self,
+        timeout_ms: i32,
+    ) -> Result<Vec<SeatEvent>> {
+        self.seat
+            .dispatch(timeout_ms)
+            .map_err(|e| anyhow!("libseat: dispatch({timeout_ms}): {e}"))?;
+        Ok(std::mem::take(&mut *self.queue.borrow_mut()))
+    }
+
     /// Open a device via the seat daemon. Returns a `Device` owning the
     /// fd; callers must `close_device` when done so the daemon can
     /// revoke cleanly on session teardown.

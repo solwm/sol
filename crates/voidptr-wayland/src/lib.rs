@@ -1246,39 +1246,38 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
 pub fn run_drm(device: &Path) -> Result<()> {
     let session = session::Session::open().context("libseat: open session")?;
 
-    // Drain the initial event burst so the Enable arrives before we
-    // start opening devices; libseat's open_device fails while the
-    // session is still in the "pending" state.
+    // Wait for the initial Enable. Under logind the first event can
+    // be delayed by a D-Bus round-trip; a non-blocking dispatch(0)
+    // poll-and-sleep loop can miss the notify and bail. dispatch with
+    // a positive timeout lets libseat block on its own fd until the
+    // daemon sends something. Loop in case other events (e.g. an
+    // unrelated Disable from a prior session, though unusual) arrive
+    // first.
     {
         let mut s = session.borrow_mut();
-        let _initial = s
-            .dispatch_events()
-            .context("libseat: initial dispatch")?;
-        // The first Enable may take another round-trip; block up to
-        // ~100 ms by polling. Keep it bounded so we don't hang if
-        // something's genuinely wrong with the session.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while !s.active && std::time::Instant::now() < deadline {
-            let evs = s
-                .dispatch_events()
-                .context("libseat: waiting for Enable")?;
-            for ev in evs {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !s.active {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as i32;
+            if remaining <= 0 {
+                anyhow::bail!(
+                    "libseat: no Enable event within 5s — the daemon hasn't \
+                     handed us the seat. Make sure voidptr was launched from \
+                     an active logind session (check `loginctl show-session \
+                     $XDG_SESSION_ID` from the TTY where you're running it)."
+                );
+            }
+            for ev in s
+                .dispatch_events_blocking(remaining)
+                .context("libseat: waiting for Enable")?
+            {
                 if matches!(ev, libseat::SeatEvent::Enable) {
                     s.active = true;
                 }
             }
-            if !s.active {
-                // libseat's dispatch is non-blocking at timeout=0; give
-                // the daemon a moment to produce the next event.
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
         }
-        if !s.active {
-            anyhow::bail!(
-                "libseat: no Enable event within 500ms — the daemon hasn't \
-                 handed us the seat. Are you logged in on this TTY?"
-            );
-        }
+        tracing::info!(seat = %s.name(), "libseat session active");
     }
 
     // Open the DRM device through libseat, wrap into a Card, build the
