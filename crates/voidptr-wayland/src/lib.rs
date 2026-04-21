@@ -848,13 +848,28 @@ fn setup_event_loop(
     // External stop signals (SIGTERM, SIGHUP — the ones `killall voidptr`
     // and `kill <pid>` send) trigger a clean shutdown: calloop returns
     // from `run`, Compositor drops, DrmPresenter's Drop restores the
-    // saved CRTC so the TTY unblanks. ctrlc::set_handler with the
-    // termination feature registers for SIGINT+SIGTERM+SIGHUP; we
-    // immediately override SIGINT back to SIG_IGN below so Ctrl+C
-    // doesn't kill us — it should reach the focused client via
-    // libinput like any other keystroke.
+    // saved CRTC. If the first stop can't make progress (e.g. the
+    // event loop is wedged on a blocking DRM ioctl), a second signal
+    // within ~3s calls libc::_exit so the user can always kill us
+    // without resorting to SIGKILL. SIGINT is separately set to
+    // SIG_IGN so Ctrl+C doesn't stop the compositor at all — it gets
+    // forwarded to the focused client via libinput.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_STOP: AtomicU64 = AtomicU64::new(0);
     let loop_signal = event_loop.get_signal();
     if let Err(e) = ctrlc::set_handler(move || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev = LAST_STOP.swap(now, Ordering::SeqCst);
+        if prev != 0 && now.saturating_sub(prev) < 3000 {
+            // Second signal in 3s — event loop clearly can't unwedge.
+            // Bypass Drop and exit immediately; TTY may stay blank
+            // until logind takes over, but we're not killable-able.
+            tracing::error!("second stop signal in under 3s; forcing exit");
+            unsafe { libc::_exit(130) };
+        }
         tracing::info!("shutdown signal received; stopping event loop");
         loop_signal.stop();
     }) {
