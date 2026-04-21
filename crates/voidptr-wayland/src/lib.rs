@@ -1268,16 +1268,24 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
 }
 
 fn send_keyboard_key(state: &mut State, keycode: u32, pressed: bool) {
-    let Some(focus) = state.keyboard_focus.clone() else { return };
-    if !focus.is_alive() {
-        return;
-    }
-    // Update modifier state via xkb and emit wl_keyboard.modifiers if it
-    // changed (e.g. shift pressed/released).
+    // Always feed the key to xkb — even when focus is dead or missing —
+    // so the modifier state stays consistent with the physical
+    // keyboard. If we skipped the release of a modifier because the
+    // focused client had just died (e.g. user typed Ctrl+D, the shell
+    // exited, the Ctrl release event then arrived with no live focus),
+    // xkb would think that modifier is still held forever. The next
+    // focused client would then receive a `modifiers` event with
+    // stale depressed bits and misinterpret every subsequent keystroke
+    // as Ctrl+<whatever>.
     let mods = state
         .keymap
         .as_mut()
         .map(|km| km.feed_key(keycode, pressed));
+
+    let Some(focus) = state.keyboard_focus.clone() else { return };
+    if !focus.is_alive() {
+        return;
+    }
     let time = state.elapsed_ms();
     let key_state = if pressed {
         wl_keyboard::KeyState::Pressed
