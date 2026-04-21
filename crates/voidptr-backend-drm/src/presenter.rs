@@ -310,7 +310,15 @@ impl DrmPresenter {
                     format: PixelFormat::Xrgb8888,
                     ..
                 } => 1.0,
-                SceneContent::Dmabuf { .. } => 1.0,
+                // DRM fourcc is a 4-char little-endian ASCII code; the
+                // first byte encodes whether the alpha channel is
+                // meaningful. 'X' = ignore alpha (opaque), 'A' = use
+                // alpha. Chrome hands us ARGB dmabufs for popups where
+                // the shadow/border regions have alpha=0 and RGB≈0 —
+                // forcing opaque there rendered those as solid black.
+                SceneContent::Dmabuf { fourcc, .. } => {
+                    if (*fourcc & 0xFF) as u8 == b'X' { 1.0 } else { 0.0 }
+                }
             };
             unsafe {
                 gl.bind_texture(entry.target, Some(entry.tex));

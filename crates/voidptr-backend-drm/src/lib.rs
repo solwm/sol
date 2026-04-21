@@ -79,9 +79,11 @@ pub struct OutputSelection {
 }
 
 /// Mode selection preference: width x height at the given integer refresh.
-/// Exposed as `VOIDPTR_MODE=WxH@Hz`; when absent, voidptr defaults to
-/// 3840x2160@240 and silently falls back to the connector's PREFERRED
-/// mode if that isn't advertised.
+/// Exposed as `VOIDPTR_MODE=WxH@Hz`. When absent, voidptr picks the
+/// highest-refresh mode at the connector's PREFERRED resolution (so a
+/// 1440p@240 monitor gets 240 Hz automatically without hardcoding the
+/// size), falling back to PREFERRED at its native rate and then to the
+/// first advertised mode.
 #[derive(Debug, Clone, Copy)]
 pub struct ModePreference {
     pub width: u16,
@@ -105,14 +107,6 @@ fn parse_mode_pref(s: &str) -> Option<ModePreference> {
         height: h.trim().parse().ok()?,
         refresh_hz: hz.trim().parse().ok()?,
     })
-}
-
-fn default_mode_pref() -> ModePreference {
-    ModePreference {
-        width: 3840,
-        height: 2160,
-        refresh_hz: 240,
-    }
 }
 
 /// Describe what's connected without touching master. Safe to run while
@@ -171,7 +165,6 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
         })?),
         None => None,
     };
-    let default_pref = default_mode_pref();
 
     let res = card.resource_handles().context("resource_handles")?;
 
@@ -186,8 +179,17 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
             continue;
         }
         // Explicit VOIDPTR_MODE overrides everything; missing match is a hard
-        // error so the user sees why. Without an override, we prefer 4K@240,
-        // then the connector's PREFERRED flag, then the first mode.
+        // error so the user sees why. Without an override we look at the
+        // connector's PREFERRED mode (native resolution) and pick the
+        // highest-refresh advertised mode at that same resolution — so a
+        // 240 Hz monitor runs at 240 Hz regardless of whether its native
+        // size is 1080p, 1440p, or 4K. Falls back to plain PREFERRED and
+        // then to the first mode if anything is missing.
+        let preferred = conn
+            .modes()
+            .iter()
+            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .copied();
         let (mode, source) = if let Some(p) = env_pref {
             match conn.modes().iter().find(|m| p.matches(m)).copied() {
                 Some(m) => (m, "env"),
@@ -200,15 +202,20 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
                     conn.interface(),
                 ),
             }
-        } else if let Some(m) = conn.modes().iter().find(|m| default_pref.matches(m)).copied() {
-            (m, "default-4k240")
-        } else if let Some(m) = conn
-            .modes()
-            .iter()
-            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .copied()
-        {
-            (m, "preferred")
+        } else if let Some(pm) = preferred {
+            let (pw, ph) = pm.size();
+            let best = conn
+                .modes()
+                .iter()
+                .filter(|m| m.size() == (pw, ph))
+                .max_by_key(|m| m.vrefresh())
+                .copied()
+                .unwrap_or(pm);
+            if best.vrefresh() > pm.vrefresh() {
+                (best, "preferred-size-max-hz")
+            } else {
+                (best, "preferred")
+            }
         } else {
             (conn.modes()[0], "first")
         };

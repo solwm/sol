@@ -149,8 +149,9 @@ impl Dispatch<WlSubsurface, SubsurfaceData> for State {
             wl_subsurface::Request::Destroy => {
                 // Remove ourselves from the parent's children list so
                 // the scene walker doesn't try to upgrade a dead weak
-                // ref every frame. Best-effort: if the parent is
-                // already gone, nothing to clean up.
+                // ref every frame. Order matters: read the parent link
+                // before we clear it below, otherwise parent_of would
+                // return None.
                 if let Some(parent) = parent_of(&data.surface) {
                     if let Some(parent_sd) =
                         parent.data::<Arc<Mutex<SurfaceData>>>()
@@ -163,6 +164,22 @@ impl Dispatch<WlSubsurface, SubsurfaceData> for State {
                                 .unwrap_or(false)
                         });
                     }
+                }
+                // Reset the child's role back to None so the wl_surface
+                // can be reassigned later. Chrome's popup machinery
+                // (address bar dropdown, menus) recycles wl_surfaces
+                // through create→destroy→reuse-as-subsurface cycles;
+                // without this reset we'd fail the reuse with
+                // "wl_surface already has a role" and Chrome's
+                // fallback path draws with black edges / missing
+                // fragments. Per spec: `wl_subsurface.destroy` removes
+                // the role and unmaps the surface immediately.
+                if let Some(sd_arc) = data.surface.data::<Arc<Mutex<SurfaceData>>>() {
+                    let mut sd = sd_arc.lock().unwrap();
+                    sd.role = SurfaceRole::None;
+                    sd.subsurface_parent = None;
+                    sd.subsurface_offset = (0, 0);
+                    sd.subsurface_pending_offset = None;
                 }
             }
             // place_above / place_below / set_sync / set_desync all
