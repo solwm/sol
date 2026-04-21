@@ -40,6 +40,35 @@ fn main() -> Result<()> {
 
     tracing::info!(%backend, "voidptr starting");
 
+    // Normalise the environment before the backend (and therefore every
+    // spawned client) inherits it. Children pick up our env via
+    // std::process::Command's default inheritance, so fixing it once
+    // here is enough. `set_var` / `remove_var` are unsafe in modern
+    // Rust (thread-safety), but we're pre-threads here so it's fine.
+    unsafe {
+        // Tell clients we're a Wayland session — some (notably GTK,
+        // Firefox via MOZ_ENABLE_WAYLAND auto-detect, Chromium's
+        // Ozone) check this to decide their display backend.
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
+        std::env::set_var("XDG_CURRENT_DESKTOP", "voidptr");
+        // No X server here. Strip DISPLAY / XAUTHORITY so clients that
+        // auto-detect either-or don't try an X path that'll never
+        // work (and waste seconds failing at it — e.g. mplayer's
+        // VO probe).
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("XAUTHORITY");
+    }
+
+    // Log what we're passing through so config-not-found complaints
+    // are one line away from the cause.
+    for key in ["HOME", "USER", "SHELL", "PATH", "XDG_RUNTIME_DIR", "LANG"] {
+        tracing::info!(
+            key,
+            value = std::env::var(key).as_deref().unwrap_or("<unset>"),
+            "env inherited"
+        );
+    }
+
     match backend.as_str() {
         "headless" => {
             let png_path = std::env::var_os("VOIDPTR_PNG_PATH")

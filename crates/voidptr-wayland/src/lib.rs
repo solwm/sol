@@ -710,6 +710,12 @@ fn setup_event_loop(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "<anonymous>".into());
     tracing::info!(socket = %socket_name, "listening");
+    // Set WAYLAND_DISPLAY in our own process env so every future
+    // spawn_client inherits it via Command's default env inheritance.
+    // No more per-call .env("WAYLAND_DISPLAY", ...) overrides needed.
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    }
 
     event_loop
         .handle()
@@ -1086,15 +1092,16 @@ const KEY_RIGHTALT: u32 = 100;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_RIGHTCTRL: u32 = 97;
 
-/// Fork/exec a Wayland client connected to our own socket. Inherits env
-/// (XDG_RUNTIME_DIR, HOME, etc.) from the compositor; overrides
-/// WAYLAND_DISPLAY to our socket name. Child handle is intentionally
-/// dropped — no reap, no wait; the kernel cleans up on voidptr exit.
+/// Fork/exec a Wayland client connected to our own socket. Env is
+/// inherited wholesale from voidptr's process, which was normalised at
+/// startup (XDG_SESSION_TYPE=wayland, XDG_CURRENT_DESKTOP=voidptr,
+/// DISPLAY/XAUTHORITY unset, WAYLAND_DISPLAY set). Child handle is
+/// intentionally dropped — no reap, no wait; kernel cleans up on
+/// voidptr exit.
 fn spawn_client(state: &State, program: &str, args: &[&str], label: &str) {
     let socket = state.socket_name.clone();
     match std::process::Command::new(program)
         .args(args)
-        .env("WAYLAND_DISPLAY", &socket)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
