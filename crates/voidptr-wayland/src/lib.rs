@@ -472,6 +472,7 @@ fn collect_scene(
     for ml in &layers {
         if matches!(ml.layer, Layer::Background | Layer::Bottom) {
             out.push((ml.buffer.clone(), ml.rect));
+            emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
         }
     }
 
@@ -481,26 +482,81 @@ fn collect_scene(
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let sd = sd_arc.lock().unwrap();
-        if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
-            continue;
-        }
-        let Some(buf_weak) = sd.current.buffer.as_ref() else {
-            continue;
+        let buf_opt = {
+            let sd = sd_arc.lock().unwrap();
+            if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
+                continue;
+            }
+            sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok())
         };
-        if let Ok(buf) = buf_weak.upgrade() {
+        if let Some(buf) = buf_opt {
             out.push((buf, win.rect));
         }
+        emit_subsurface_tree(&mut out, &surface, win.rect.x, win.rect.y);
     }
 
     // 3. Top + Overlay layer surfaces.
     for ml in &layers {
         if matches!(ml.layer, Layer::Top | Layer::Overlay) {
             out.push((ml.buffer.clone(), ml.rect));
+            emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
         }
     }
 
     out
+}
+
+/// Walk a surface's subsurface_children recursively, pushing each mapped
+/// child's current buffer at `parent_origin + child.subsurface_offset`.
+/// Subsurfaces without a buffer attached yet are skipped but their own
+/// children still descended into — the buffer may land a frame later.
+/// Stacking follows registration order in `subsurface_children`;
+/// `place_above` / `place_below` aren't implemented.
+fn emit_subsurface_tree(
+    out: &mut Vec<(wayland_server::protocol::wl_buffer::WlBuffer, Rect)>,
+    parent: &WlSurface,
+    parent_x: i32,
+    parent_y: i32,
+) {
+    let Some(sd_arc) = parent.data::<Arc<Mutex<SurfaceData>>>() else {
+        return;
+    };
+    // Snapshot the child list so we don't hold the parent's lock while
+    // we recurse into child locks (avoids any risk of the same surface
+    // being double-locked if the topology is ever cyclic).
+    let children: Vec<WlSurface> = {
+        let sd = sd_arc.lock().unwrap();
+        sd.subsurface_children
+            .iter()
+            .filter_map(|w| w.upgrade().ok())
+            .collect()
+    };
+    for child in children {
+        let Some(child_sd_arc) = child.data::<Arc<Mutex<SurfaceData>>>() else {
+            continue;
+        };
+        let (buf_opt, child_x, child_y) = {
+            let sd = child_sd_arc.lock().unwrap();
+            let (ox, oy) = sd.subsurface_offset;
+            let buf = sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok());
+            (buf, parent_x + ox, parent_y + oy)
+        };
+        if let Some(buf) = buf_opt {
+            // rect.w/h aren't used when rendering — scene_from_buffers
+            // pulls the intrinsic size from the buffer's own metadata
+            // (SHM width/height, dmabuf width/height). Only x/y matters.
+            out.push((
+                buf,
+                Rect {
+                    x: child_x,
+                    y: child_y,
+                    w: 0,
+                    h: 0,
+                },
+            ));
+        }
+        emit_subsurface_tree(out, &child, child_x, child_y);
+    }
 }
 
 fn scene_from_buffers<'a>(

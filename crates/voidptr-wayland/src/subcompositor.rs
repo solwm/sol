@@ -2,14 +2,19 @@
 //!
 //! Required for GTK/Qt clients (Firefox, most desktop apps) to finish
 //! initializing — they create subsurfaces for tooltips, popups, and
-//! cursor images during startup and refuse to proceed if the global
-//! isn't advertised.
+//! cursor images during startup.
 //!
-//! B9+ polish scope: accept the protocol so clients can init. We
-//! assign `SurfaceRole::Subsurface` to the child surface so the main
-//! commit handler doesn't treat its buffers as a toplevel, but we
-//! don't actually render subsurfaces yet — tooltips/popups will be
-//! invisible. Main windows (xdg_toplevel) are unaffected.
+//! Now actually renders subsurfaces: `get_subsurface` links the child
+//! into the parent's `subsurface_children` list; `set_position` stores
+//! a pending offset applied on commit; the scene walker in
+//! voidptr-wayland/src/lib.rs recurses through the tree from any
+//! mapped xdg_toplevel or layer_surface root, emitting each subsurface
+//! at `parent_origin + offset`.
+//!
+//! Out of scope for now: explicit sync vs desync semantics (we treat
+//! every commit as immediate), `place_above` / `place_below` sibling
+//! ordering (we use registration order), and subsurface damage
+//! tracking.
 
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +34,17 @@ pub const SUBCOMPOSITOR_VERSION: u32 = 1;
 pub struct SubsurfaceData {
     pub surface: WlSurface,
     pub parent: WlSurface,
+}
+
+/// Walk upward from a surface toward its role-holding root (xdg_toplevel
+/// or layer_surface). Used at destroy time so we can clean up weak refs
+/// on the right parent's `subsurface_children`. Returns the immediate
+/// parent for surfaces with a Subsurface role; None otherwise.
+fn parent_of(surface: &WlSurface) -> Option<WlSurface> {
+    let sd_arc = surface.data::<Arc<Mutex<SurfaceData>>>()?;
+    let sd = sd_arc.lock().ok()?;
+    let parent_weak = sd.subsurface_parent.clone()?;
+    parent_weak.upgrade().ok()
 }
 
 impl GlobalDispatch<WlSubcompositor, ()> for State {
@@ -61,24 +77,40 @@ impl Dispatch<WlSubcompositor, ()> for State {
                 surface,
                 parent,
             } => {
-                let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
+                let Some(child_sd) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
                     resource.post_error(
                         wl_subcompositor::Error::BadSurface,
-                        "wl_surface missing SurfaceData",
+                        "child wl_surface missing SurfaceData",
+                    );
+                    return;
+                };
+                let Some(parent_sd) = parent.data::<Arc<Mutex<SurfaceData>>>() else {
+                    resource.post_error(
+                        wl_subcompositor::Error::BadSurface,
+                        "parent wl_surface missing SurfaceData",
                     );
                     return;
                 };
                 {
-                    let mut sd = sd_arc.lock().unwrap();
-                    if !matches!(sd.role, SurfaceRole::None) {
+                    let mut cs = child_sd.lock().unwrap();
+                    if !matches!(cs.role, SurfaceRole::None) {
                         resource.post_error(
                             wl_subcompositor::Error::BadSurface,
                             "wl_surface already has a role",
                         );
                         return;
                     }
-                    sd.role = SurfaceRole::Subsurface;
+                    cs.role = SurfaceRole::Subsurface;
+                    cs.subsurface_parent = Some(parent.downgrade());
                 }
+                // Register the child on the parent's children list so
+                // the scene walker finds it when it recurses down from
+                // the mapped root.
+                parent_sd
+                    .lock()
+                    .unwrap()
+                    .subsurface_children
+                    .push(surface.downgrade());
                 let _ = init.init(
                     id,
                     SubsurfaceData {
@@ -100,21 +132,42 @@ impl Dispatch<WlSubsurface, SubsurfaceData> for State {
         _client: &Client,
         _resource: &WlSubsurface,
         request: wl_subsurface::Request,
-        _data: &SubsurfaceData,
+        data: &SubsurfaceData,
         _dh: &DisplayHandle,
         _init: &mut DataInit<'_, Self>,
     ) {
-        // All set_position / place_above / place_below / set_sync / set_desync
-        // / destroy requests are accepted but not acted on. This is enough
-        // for clients to finish initialization — we'll wire real subsurface
-        // rendering in a follow-up milestone.
         match request {
-            wl_subsurface::Request::Destroy
-            | wl_subsurface::Request::SetPosition { .. }
-            | wl_subsurface::Request::PlaceAbove { .. }
-            | wl_subsurface::Request::PlaceBelow { .. }
-            | wl_subsurface::Request::SetSync
-            | wl_subsurface::Request::SetDesync => {}
+            wl_subsurface::Request::SetPosition { x, y } => {
+                // Double-buffer the offset. The main commit handler in
+                // compositor.rs promotes pending → current on the next
+                // wl_surface.commit. Matches the spec's double-buffered
+                // state model.
+                if let Some(sd_arc) = data.surface.data::<Arc<Mutex<SurfaceData>>>() {
+                    sd_arc.lock().unwrap().subsurface_pending_offset = Some((x, y));
+                }
+            }
+            wl_subsurface::Request::Destroy => {
+                // Remove ourselves from the parent's children list so
+                // the scene walker doesn't try to upgrade a dead weak
+                // ref every frame. Best-effort: if the parent is
+                // already gone, nothing to clean up.
+                if let Some(parent) = parent_of(&data.surface) {
+                    if let Some(parent_sd) =
+                        parent.data::<Arc<Mutex<SurfaceData>>>()
+                    {
+                        let child_id = data.surface.id();
+                        parent_sd.lock().unwrap().subsurface_children.retain(|w| {
+                            w.upgrade()
+                                .ok()
+                                .map(|s| s.id() != child_id)
+                                .unwrap_or(false)
+                        });
+                    }
+                }
+            }
+            // place_above / place_below / set_sync / set_desync all
+            // silently accepted — not implemented but also not fatal
+            // to clients that call them.
             _ => {}
         }
     }

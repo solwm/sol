@@ -45,10 +45,9 @@ pub enum SurfaceRole {
     },
     /// `wl_subsurface` role. Subsurfaces are children of another
     /// wl_surface, positioned at an offset, and drawn as part of the
-    /// parent's tree (popups, tooltips, cursor images). We accept the
-    /// role so GTK/Qt clients initialize cleanly; actual rendering of
-    /// subsurface trees is a later polish item — main-window content
-    /// via xdg_toplevel still works.
+    /// parent's tree (popups, tooltips, cursor images). The scene
+    /// walker recurses through SurfaceData.subsurface_children when
+    /// rendering any mapped root (xdg_toplevel or layer_surface).
     Subsurface,
 }
 
@@ -64,6 +63,15 @@ pub struct SurfaceData {
     pub role: SurfaceRole,
     pub pending: SurfaceState,
     pub current: SurfaceState,
+    /// True iff wl_surface.attach was called since the last commit.
+    /// Without this flag, a commit-without-attach would overwrite
+    /// current.buffer with an empty pending.buffer — unmapping the
+    /// surface for one frame, then remapping it on the next
+    /// attach+commit. Firefox's GDK commits subsurfaces this way for
+    /// frame-callback delivery, which showed up as rapid blinking
+    /// until we started honoring "no attach since last commit" as
+    /// "leave current.buffer alone."
+    pub pending_attach: bool,
     pub frame_callbacks: Vec<WlCallback>,
     /// Populated by xdg_surface.get_toplevel so the compositor can send
     /// directive configure events during layout without threading the
@@ -74,6 +82,22 @@ pub struct SurfaceData {
     /// as the xdg handles above, but for layer surfaces so apply_layout
     /// can configure the bar/launcher/wallpaper.
     pub zwlr_layer_surface: Option<Weak<ZwlrLayerSurfaceV1>>,
+    /// For surfaces with role=Subsurface: weak ref to the parent the
+    /// child hangs off of. The scene walker follows this in reverse
+    /// (parent → children) but carries the parent link so cleanup on
+    /// destroy can remove this child from its parent's list.
+    pub subsurface_parent: Option<Weak<WlSurface>>,
+    /// Current offset of this subsurface from its parent's origin, in
+    /// surface-local coords. Applied on commit; pending_subsurface_offset
+    /// holds the value set via wl_subsurface.set_position between commits.
+    pub subsurface_offset: (i32, i32),
+    pub subsurface_pending_offset: Option<(i32, i32)>,
+    /// Every wl_surface can have subsurface children attached via
+    /// wl_subcompositor.get_subsurface. Iteration order is the order
+    /// of registration; wl_subsurface.place_above/below isn't
+    /// implemented yet so the stacking matches the client's
+    /// attachment sequence.
+    pub subsurface_children: Vec<Weak<WlSurface>>,
 }
 
 impl GlobalDispatch<WlCompositor, ()> for State {
@@ -128,6 +152,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
             wl_surface::Request::Attach { buffer, x: _, y: _ } => {
                 let mut sd = data.lock().unwrap();
                 sd.pending.buffer = buffer.as_ref().map(|b| b.downgrade());
+                sd.pending_attach = true;
             }
             wl_surface::Request::Damage {
                 x,
@@ -150,13 +175,36 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
             }
             wl_surface::Request::Commit => {
                 let mut sd = data.lock().unwrap();
-                // Promote pending -> current, but hold onto the previous
-                // buffer so we can release it once the new one has
-                // definitively replaced it (see "release old buffer"
-                // block below — GDK's cairo surfaces fault otherwise).
-                let old_buffer = sd.current.buffer.take();
-                sd.current.buffer = sd.pending.buffer.take();
+                // Promote pending -> current, but only touch the buffer
+                // if the client actually called wl_surface.attach since
+                // the last commit. A commit without attach is a no-op
+                // on the content (used to deliver frame callbacks or
+                // ack state changes); treating it as "buffer = None"
+                // would unmap the surface for one frame, blinking it.
+                // Hold onto the previous buffer so we can release it
+                // only once it's been definitively replaced.
+                let old_buffer = if sd.pending_attach {
+                    let old = sd.current.buffer.take();
+                    sd.current.buffer = sd.pending.buffer.take();
+                    sd.pending_attach = false;
+                    Some(old)
+                } else {
+                    // Still drain pending.buffer so a stale pending
+                    // value doesn't leak into the next real attach.
+                    sd.pending.buffer = None;
+                    None
+                };
                 sd.current.damage = std::mem::take(&mut sd.pending.damage);
+
+                // Subsurface position is double-buffered too: commits
+                // promote the pending offset recorded by
+                // wl_subsurface.set_position. We treat every commit as
+                // desynced (see subcompositor.rs), so the offset goes
+                // live on the child's own commit rather than waiting
+                // for the parent to commit.
+                if let Some(off) = sd.subsurface_pending_offset.take() {
+                    sd.subsurface_offset = off;
+                }
 
                 // Release the replaced buffer so the client can reuse it,
                 // per the wl_buffer.release "no longer used" contract.
@@ -170,7 +218,12 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     .and_then(|w| w.upgrade().ok())
                     .map(|b| b.id());
                 drop(sd);
-                if let Some(old_weak) = old_buffer {
+                // old_buffer is Option<Option<Weak>>: outer None means
+                // no attach happened (nothing to release); outer Some
+                // with inner None means we promoted but had no prior
+                // buffer; outer Some(Some) is the actual replaced
+                // buffer.
+                if let Some(Some(old_weak)) = old_buffer {
                     if let Ok(old_buf) = old_weak.upgrade() {
                         if Some(old_buf.id()) != new_buffer_id {
                             old_buf.release();
