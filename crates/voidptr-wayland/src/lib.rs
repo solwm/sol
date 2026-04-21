@@ -570,6 +570,16 @@ fn scene_from_buffers<'a>(
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
+    // If a page flip is already in flight, skip this tick. The flip
+    // will complete asynchronously on the DRM fd; the calloop source
+    // there will fire frame callbacks and re-trigger a render if more
+    // work has piled up in the meantime.
+    if let BackendState::Drm(presenter) = &comp.backend {
+        if presenter.is_pending_flip() {
+            return Ok(());
+        }
+    }
+
     // Free GPU-side resources for buffers clients destroyed since the
     // last tick. Dmabuf-backed entries hold EGLImages that don't get
     // freed via Drop; they'd otherwise accumulate per client-resize.
@@ -634,15 +644,15 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     // buffer_release_callback assertion and crashed Firefox.
     drop(placed);
 
-    // Present is done — fire every frame callback the clients requested
-    // against the buffers we just displayed. On DRM this fires right after
-    // page-flip-complete, which throttles clients to the display's vblank
-    // cadence. On headless it fires after PNG write; still prevents the
-    // "fire instantly, client over-renders" pattern.
-    let ts = comp.state.elapsed_ms();
-    let callbacks = std::mem::take(&mut comp.state.pending_frame_callbacks);
-    for cb in callbacks {
-        cb.done(ts);
+    // Fire frame callbacks: for headless there's no page-flip concept so
+    // we do it right after the PNG write; for DRM the callbacks fire in
+    // the flip-complete handler (below, on the DRM fd source) so that
+    // client redraws pace to vblank instead of to our render timing.
+    if matches!(comp.backend, BackendState::Headless { .. }) {
+        let ts = comp.state.elapsed_ms();
+        for cb in std::mem::take(&mut comp.state.pending_frame_callbacks) {
+            cb.done(ts);
+        }
     }
     Ok(())
 }
@@ -759,6 +769,41 @@ fn setup_event_loop(
                 },
             )
             .map_err(|e| anyhow::anyhow!("insert input source: {e}"))?;
+    }
+
+    // DRM fd: kernel delivers page-flip-complete events here after a
+    // page_flip ioctl lands on vblank. Keeping the wait async (instead
+    // of the old blocking wait_for_page_flip at the end of every
+    // render) is what lets us stay responsive — if a client stalls
+    // inside render_scene, the compositor no longer gets wedged.
+    if let BackendState::Drm(presenter) = &backend {
+        let drm_fd = presenter.drm_fd().try_clone_to_owned()?;
+        event_loop
+            .handle()
+            .insert_source(
+                Generic::new(drm_fd, Interest::READ, Mode::Level),
+                |_ready, _fd, comp| {
+                    let saw_flip = if let BackendState::Drm(p) = &mut comp.backend {
+                        p.drain_events().unwrap_or(false)
+                    } else {
+                        return Ok(PostAction::Continue);
+                    };
+                    if saw_flip {
+                        let ts = comp.state.elapsed_ms();
+                        for cb in std::mem::take(
+                            &mut comp.state.pending_frame_callbacks,
+                        ) {
+                            cb.done(ts);
+                        }
+                        // Another commit may have piled up while we
+                        // were waiting; trigger a fresh render so the
+                        // pipeline stays full.
+                        comp.state.needs_render = true;
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("insert drm source: {e}"))?;
     }
 
     // libseat session: dispatch Enable/Disable events, handle DRM

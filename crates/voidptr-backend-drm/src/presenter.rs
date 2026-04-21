@@ -16,7 +16,7 @@ use voidptr_core::{PixelFormat, Scene, SceneContent};
 
 use crate::{
     Card, GlStack, OutputSelection, dmabuf_egl, get_or_add_fb, pick_output,
-    quad::QuadProgram, wait_for_page_flip,
+    quad::QuadProgram,
 };
 
 /// Snapshot of the CRTC state the kernel/fbcon had configured before we
@@ -38,6 +38,17 @@ pub struct DrmPresenter {
     sel: OutputSelection,
     fb_cache: HashMap<usize, framebuffer::Handle>,
     scanned_out: Option<gbm::BufferObject<()>>,
+    /// GBM BO submitted for the most recent page flip, held here until
+    /// the flip-complete event fires and the buffer becomes the active
+    /// scanout. Without this, GBM would release the BO back to its
+    /// pool while the display is still sampling from it.
+    pending_bo: Option<gbm::BufferObject<()>>,
+    /// True while a page flip is in flight. `render_scene` checks this
+    /// and skips rendering if set — the kernel rejects a second
+    /// page_flip on the same CRTC before the first completes, and
+    /// we'd rather just drop the extra frame than error out of the
+    /// render loop.
+    pending_flip: bool,
     /// Shader program for SHM textures: `sampler2D` on `GL_TEXTURE_2D`.
     quad: QuadProgram,
     /// Shader program for dmabuf textures: `samplerExternalOES` on
@@ -112,6 +123,8 @@ impl DrmPresenter {
             sel,
             fb_cache: HashMap::new(),
             scanned_out: None,
+            pending_bo: None,
+            pending_flip: false,
             quad,
             quad_external,
             textures: HashMap::new(),
@@ -213,8 +226,18 @@ impl DrmPresenter {
         Ok(())
     }
 
-    /// Redraw the given scene and present it, blocking on vsync.
+    /// Redraw the given scene and submit a page flip. Returns as soon
+    /// as the flip is submitted — the flip-complete event arrives
+    /// asynchronously on the DRM fd, driven by a calloop source in
+    /// the main loop; the source calls `flip_complete()` to settle
+    /// buffer state and fire frame callbacks. If a flip is still in
+    /// flight when this is called, we silently drop the frame rather
+    /// than error — the client will get a frame callback once the
+    /// current flip completes and can submit again then.
     pub fn render_scene(&mut self, scene: &Scene) -> Result<()> {
+        if self.pending_flip {
+            return Ok(());
+        }
         let w = self.width as i32;
         let h = self.height as i32;
 
@@ -305,10 +328,16 @@ impl DrmPresenter {
             gl.disable(glow::BLEND);
         }
 
-        self.present_and_flip()
+        self.submit_flip()
     }
 
-    fn present_and_flip(&mut self) -> Result<()> {
+    /// Swap EGL front/back, lock the resulting GBM buffer, register a
+    /// drm framebuffer for it, and ask DRM to page-flip to it on the
+    /// next vblank. Non-blocking: the caller (render_tick) returns to
+    /// the event loop as soon as the flip is submitted, and the
+    /// flip-complete event arrives on the DRM fd and is handled by
+    /// the calloop source in the main loop.
+    fn submit_flip(&mut self) -> Result<()> {
         self.gl_stack
             .egl
             .swap_buffers(self.gl_stack.display, self.gl_stack.surface)
@@ -319,9 +348,51 @@ impl DrmPresenter {
         self.card
             .page_flip(self.sel.crtc, next_fb, PageFlipFlags::EVENT, None)
             .context("page_flip")?;
-        wait_for_page_flip(&self.card).context("wait_for_page_flip")?;
-        self.scanned_out = Some(next_bo);
+        self.pending_bo = Some(next_bo);
+        self.pending_flip = true;
         Ok(())
+    }
+
+    pub fn is_pending_flip(&self) -> bool {
+        self.pending_flip
+    }
+
+    /// Drain outstanding DRM events from the card's fd and, for each
+    /// page-flip-complete event, settle buffer state by calling
+    /// `flip_complete`. Returns true if at least one PageFlip event
+    /// was processed, so the caller (the calloop source on the DRM
+    /// fd) knows it should fire the frame callbacks queued for this
+    /// frame. Kept as a single method so voidptr-wayland doesn't
+    /// need to depend on drm-rs directly.
+    pub fn drain_events(&mut self) -> Result<bool> {
+        let mut saw_flip = false;
+        for ev in self.card.receive_events()? {
+            if matches!(ev, drm::control::Event::PageFlip(_)) {
+                saw_flip = true;
+            }
+        }
+        if saw_flip {
+            self.flip_complete();
+        }
+        Ok(saw_flip)
+    }
+
+    /// Settle buffer state after a page-flip-complete. The BO we
+    /// submitted becomes the active scanout; the one that WAS the
+    /// active scanout is dropped, returning it to GBM's pool. Clears
+    /// the pending flag so the next render_scene submits a new flip.
+    pub fn flip_complete(&mut self) {
+        if let Some(bo) = self.pending_bo.take() {
+            self.scanned_out = Some(bo);
+        }
+        self.pending_flip = false;
+    }
+
+    /// DRM file descriptor for calloop registration. Borrowed for the
+    /// lifetime of the presenter; the card's File owns the fd.
+    pub fn drm_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.card.as_fd()
     }
 }
 
