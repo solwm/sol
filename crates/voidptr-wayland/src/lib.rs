@@ -749,6 +749,13 @@ fn setup_event_loop(
                 comp.display
                     .flush_clients()
                     .map_err(std::io::Error::other)?;
+                // Any client request/disconnect can dirty our layout
+                // or focus state — e.g. the client that just exited
+                // left its toplevel dead in mapped_toplevels and
+                // keyboard_focus pointing at an invalidated surface.
+                // Flagging a render triggers the prune + rebalance
+                // path on the next tick at negligible cost.
+                comp.state.needs_render = true;
                 Ok(PostAction::Continue)
             },
         )
