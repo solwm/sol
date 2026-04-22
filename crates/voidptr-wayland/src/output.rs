@@ -31,7 +31,17 @@ impl GlobalDispatch<WlOutput, ()> for State {
             "voidptr-0".into(),
             Transform::Normal,
         );
-        o.mode(Mode::Current | Mode::Preferred, w, h, 60_000);
+        // Advertise the real refresh rate. Chrome / Firefox / anything
+        // that uses the presentation-time protocol or wl_frame pacing
+        // reads this to decide their rendering cadence. Before this
+        // was dynamic, voidptr shipped a hardcoded 60_000 and Chrome
+        // dutifully capped at 60 Hz even on a 240 Hz panel.
+        o.mode(
+            Mode::Current | Mode::Preferred,
+            w,
+            h,
+            state.screen_refresh_mhz,
+        );
         if o.version() >= 2 {
             o.scale(1);
         }

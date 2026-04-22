@@ -178,6 +178,21 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
         if conn.modes().is_empty() {
             continue;
         }
+        // Dump every advertised mode for this connector at startup
+        // so a user wondering "why am I not at 240 Hz?" can grep the
+        // log and see exactly what the EDID said was available. The
+        // `*` marks the PREFERRED mode.
+        for m in conn.modes() {
+            let (mw, mh) = m.size();
+            tracing::info!(
+                connector = ?conn.interface(),
+                width = mw,
+                height = mh,
+                vrefresh = m.vrefresh(),
+                preferred = m.mode_type().contains(ModeTypeFlags::PREFERRED),
+                "available mode"
+            );
+        }
         // Explicit VOIDPTR_MODE overrides everything; missing match is a hard
         // error so the user sees why. Without an override we look at the
         // connector's PREFERRED mode (native resolution) and pick the
@@ -330,6 +345,19 @@ impl GlStack {
 
         egl.make_current(display, Some(surface), Some(surface), Some(context))
             .map_err(|e| anyhow!("make_current: {e:?}"))?;
+
+        // Disable EGL's own vsync wait: our DRM page_flip (submitted
+        // with PageFlipFlags::EVENT) is what throttles the render loop
+        // to the display's vblank. The default EGL swap interval of 1
+        // would add a *second* vblank wait inside eglSwapBuffers,
+        // halving the effective framerate from (say) 240 Hz to 120 Hz
+        // or worse. Safe to ignore failure — swap_interval is
+        // optional and a compliant driver just returns EGL_FALSE.
+        if let Err(e) = egl.swap_interval(display, 0) {
+            tracing::warn!(error = ?e, "eglSwapInterval(0) failed; swap_buffers may vsync-wait on top of page_flip");
+        } else {
+            tracing::info!("eglSwapInterval(0): page_flip drives frame pacing");
+        }
 
         let gl = unsafe {
             glow::Context::from_loader_function(|s| {

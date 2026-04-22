@@ -144,6 +144,13 @@ impl DrmPresenter {
         (self.width, self.height)
     }
 
+    /// Selected mode's vrefresh in Hz. Returned as u32 to match what
+    /// drm-rs exposes; the Wayland server multiplies by 1000 when
+    /// advertising `wl_output.mode` (which wants milli-Hz).
+    pub fn refresh_hz(&self) -> u32 {
+        self.sel.mode.vrefresh()
+    }
+
     /// Called from the session's Disable handler. libseat/logind
     /// revokes DRM master on our fd as part of the session-deactivate
     /// path, so we don't call DROP_MASTER ourselves — the kernel has

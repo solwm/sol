@@ -31,6 +31,7 @@ mod input;
 mod layer_shell;
 mod linux_dmabuf;
 mod output;
+mod presentation_time;
 mod render;
 mod seat;
 mod session;
@@ -46,6 +47,7 @@ use input::{InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
 use wayland_server::protocol::{
@@ -103,10 +105,16 @@ pub struct State {
     /// Mapped xdg_toplevels in stacking order (bottom to top). Held as weak
     /// refs so dead surfaces drop out on the next render.
     pub mapped_toplevels: Vec<Window>,
-    /// Logical screen size. Drives toplevel placement and (eventually) the
+    /// Logical screen size. Drives toplevel placement and the
     /// wl_output mode advertised to clients.
     pub screen_width: u32,
     pub screen_height: u32,
+    /// Refresh rate of the selected DRM mode, in milli-Hz (so 240 Hz
+    /// is 240_000). Advertised via `wl_output.mode`: browsers (Chrome,
+    /// Firefox) and other animation-aware clients use this to decide
+    /// how fast to commit buffers. Hardcoded to 60_000 in headless —
+    /// nothing actually paces off it there.
+    pub screen_refresh_mhz: i32,
     pub needs_render: bool,
     pub started: Instant,
     pub next_serial: u32,
@@ -169,6 +177,22 @@ pub struct State {
     /// libseat session handle. Used by VT-switch keybinds and by the
     /// backend's Enable/Disable transition logic. None in headless.
     pub session: Option<session::SharedSession>,
+    /// Rolling count of page-flip events since the last FPS log. Reset
+    /// every second in the DRM source handler; logged at INFO so
+    /// users can sanity-check their refresh rate without external
+    /// tools.
+    pub flip_counter: u32,
+    pub flip_counter_reset: Option<Instant>,
+    /// `wp_presentation.feedback` objects clients have handed us that
+    /// are waiting for their next `presented` event. Fired at the
+    /// next DRM page-flip-complete (at which point they're dropped).
+    /// Without this protocol, Chrome refuses to pace above 60 Hz.
+    pub pending_presentation: Vec<
+        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback,
+    >,
+    /// Monotonically incrementing counter used as the MSC field in
+    /// `presented`. Clients use it to detect missed vblanks.
+    pub presentation_seq: u64,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -213,6 +237,7 @@ pub struct Globals {
     pub subcompositor: GlobalId,
     pub data_device_manager: GlobalId,
     pub xdg_output_manager: GlobalId,
+    pub presentation: GlobalId,
 }
 
 impl State {
@@ -1055,6 +1080,7 @@ fn setup_event_loop(
     backend: BackendState,
     screen_width: u32,
     screen_height: u32,
+    screen_refresh_mhz: i32,
     input: Option<(InputState, std::os::fd::OwnedFd)>,
     drm_device_path: Option<PathBuf>,
     session: Option<session::SharedSession>,
@@ -1092,6 +1118,10 @@ fn setup_event_loop(
         ),
         xdg_output_manager: dh.create_global::<State, ZxdgOutputManagerV1, ()>(
             xdg_output::XDG_OUTPUT_MANAGER_VERSION,
+            (),
+        ),
+        presentation: dh.create_global::<State, WpPresentation, ()>(
+            presentation_time::PRESENTATION_VERSION,
             (),
         ),
     };
@@ -1202,10 +1232,46 @@ fn setup_event_loop(
                         ) {
                             cb.done(ts);
                         }
+                        // Fire wp_presentation.feedback on every
+                        // pending feedback object with a real-time
+                        // vblank timestamp. Chrome uses this for its
+                        // VSyncProvider; without it, its scheduler
+                        // caps at 60 fps regardless of what
+                        // wl_output.mode reports.
+                        let refresh_ns = (1_000_000_000u64
+                            / (comp.state.screen_refresh_mhz as u64 / 1000).max(1))
+                            as u32;
+                        presentation_time::fire_presented(
+                            &mut comp.state,
+                            Instant::now(),
+                            refresh_ns,
+                        );
                         // Another commit may have piled up while we
                         // were waiting; trigger a fresh render so the
                         // pipeline stays full.
                         comp.state.needs_render = true;
+
+                        // Rough FPS counter: tally page flips and log
+                        // once a second so the user can confirm the
+                        // display is actually running at the selected
+                        // refresh. Fires at INFO so it lands in the
+                        // default log filter.
+                        comp.state.flip_counter += 1;
+                        let now = Instant::now();
+                        match comp.state.flip_counter_reset {
+                            Some(t) if now.duration_since(t).as_secs() >= 1 => {
+                                let secs = now.duration_since(t).as_secs_f64();
+                                let fps = comp.state.flip_counter as f64 / secs;
+                                tracing::info!(
+                                    fps = format!("{:.1}", fps),
+                                    "display refresh"
+                                );
+                                comp.state.flip_counter = 0;
+                                comp.state.flip_counter_reset = Some(now);
+                            }
+                            None => comp.state.flip_counter_reset = Some(now),
+                            _ => {}
+                        }
                     }
                     Ok(PostAction::Continue)
                 },
@@ -1263,6 +1329,7 @@ fn setup_event_loop(
         mapped_toplevels: Vec::new(),
         screen_width,
         screen_height,
+        screen_refresh_mhz,
         needs_render: false,
         started: Instant::now(),
         next_serial: 0,
@@ -1286,6 +1353,10 @@ fn setup_event_loop(
         right_super_down: false,
         config: config::load(),
         zoomed: None,
+        flip_counter: 0,
+        flip_counter_reset: None,
+        pending_presentation: presentation_time::empty(),
+        presentation_seq: 0,
         pending_texture_evictions: Vec::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
@@ -1860,7 +1931,9 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
         canvas: Canvas::new(width, height),
         png_path,
     };
-    setup_event_loop(backend, width, height, None, None, None)
+    // 60 mHz is a stand-in; headless has no real output and nothing
+    // paces off wl_output.mode here.
+    setup_event_loop(backend, width, height, 60_000, None, None, None)
 }
 
 /// DRM backend, managed via libseat.
@@ -1923,7 +1996,8 @@ pub fn run_drm(device: &Path) -> Result<()> {
     let presenter =
         DrmPresenter::from_card(card).context("initialise DrmPresenter")?;
     let (w, h) = presenter.size();
-    tracing::info!(width = w, height = h, "drm backend");
+    let refresh_mhz = presenter.refresh_hz() as i32 * 1000;
+    tracing::info!(width = w, height = h, refresh_mhz, "drm backend");
 
     // libinput is DRM-only: a headless PNG dump has nowhere to point a cursor.
     let input = match InputState::init("seat0", session.clone()) {
@@ -1937,6 +2011,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
         BackendState::Drm(presenter),
         w,
         h,
+        refresh_mhz,
         input,
         Some(device.to_path_buf()),
         Some(session),
