@@ -260,10 +260,12 @@ pub fn default_config() -> Config {
                 key: key_from_name("Tab").unwrap(),
                 action: Action::ToggleZoom,
             },
-            // Ctrl+Q closes the focused window (polite request via
-            // xdg_toplevel.close; the client has final say).
+            // Alt+Q closes the focused window (polite request via
+            // xdg_toplevel.close; the client has final say). Alt
+            // rather than Ctrl so we don't steal Ctrl+Q from apps
+            // that bind it internally (vim, etc.).
             Binding {
-                mods: MOD_CTRL,
+                mods: MOD_ALT,
                 key: key_from_name("Q").unwrap(),
                 action: Action::CloseWindow,
             },
