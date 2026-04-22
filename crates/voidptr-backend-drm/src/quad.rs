@@ -53,12 +53,32 @@ void main() {
 }
 "#;
 
+/// Flat-color fragment shader for border/overlay rects. Writes
+/// `u_color` straight through; source-over blending with the existing
+/// framebuffer happens via the pipeline's `glBlendFunc`.
+const FS_SOLID: &str = r#"#version 100
+precision mediump float;
+uniform vec4 u_color;
+void main() { gl_FragColor = u_color; }
+"#;
+
 pub struct QuadProgram {
     pub program: NativeProgram,
     pub vbo: NativeBuffer,
     pub u_rect: NativeUniformLocation,
     pub u_tex: NativeUniformLocation,
     pub u_opaque: NativeUniformLocation,
+}
+
+/// Border / solid-color rect program. Same vertex pipeline and VBO
+/// convention as the textured quads, but the fragment shader just
+/// writes a uniform color. Kept separate from `QuadProgram` so we
+/// don't carry unused `u_tex` / `u_opaque` locations around.
+pub struct SolidProgram {
+    pub program: NativeProgram,
+    pub vbo: NativeBuffer,
+    pub u_rect: NativeUniformLocation,
+    pub u_color: NativeUniformLocation,
 }
 
 pub fn build(gl: &glow::Context) -> Result<QuadProgram> {
@@ -69,6 +89,52 @@ pub fn build(gl: &glow::Context) -> Result<QuadProgram> {
 /// shader for dmabuf-imported textures bound to `GL_TEXTURE_EXTERNAL_OES`.
 pub fn build_external(gl: &glow::Context) -> Result<QuadProgram> {
     build_with_fs(gl, FS_EXTERNAL)
+}
+
+pub fn build_solid(gl: &glow::Context) -> Result<SolidProgram> {
+    unsafe {
+        let vs = compile(gl, glow::VERTEX_SHADER, VS)?;
+        let fs = compile(gl, glow::FRAGMENT_SHADER, FS_SOLID)?;
+        let program = gl
+            .create_program()
+            .map_err(|e| anyhow!("create_program: {e}"))?;
+        gl.attach_shader(program, vs);
+        gl.attach_shader(program, fs);
+        gl.bind_attrib_location(program, 0, "a_pos");
+        gl.link_program(program);
+        if !gl.get_program_link_status(program) {
+            let log = gl.get_program_info_log(program);
+            return Err(anyhow!("solid link: {log}"));
+        }
+        gl.delete_shader(vs);
+        gl.delete_shader(fs);
+
+        let u_rect = gl
+            .get_uniform_location(program, "u_rect")
+            .ok_or_else(|| anyhow!("u_rect missing"))?;
+        let u_color = gl
+            .get_uniform_location(program, "u_color")
+            .ok_or_else(|| anyhow!("u_color missing"))?;
+
+        let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("create_buffer: {e}"))?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(
+            glow::ARRAY_BUFFER,
+            bytes_of_f32(&verts),
+            glow::STATIC_DRAW,
+        );
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
+        Ok(SolidProgram {
+            program,
+            vbo,
+            u_rect,
+            u_color,
+        })
+    }
 }
 
 fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {

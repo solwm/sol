@@ -18,8 +18,13 @@
 //!
 //! ```text
 //! # comments start with #
-//! bind  = MOD[+MOD2], KEY, exec, program with args
-//! remap = FROM, TO                  # rewrite a scancode before anything else
+//! bind         = MOD[+MOD2], KEY, exec, program with args
+//! remap        = FROM, TO                  # rewrite a scancode pre-everything
+//! exec-once    = program with args         # launched once at startup
+//! gaps_in      = 12                        # gap between adjacent tiles, px
+//! gaps_out     = 20                        # gap from tile to screen edge, px
+//! border_width = 2                         # focused-tile border, px (0 = off)
+//! border_color = ffff00                    # hex RRGGBB or #RRGGBB or 0xRRGGBB
 //! ```
 //!
 //! Modifiers (case-insensitive): `ALT`/`MOD1`, `CTRL`/`CONTROL`,
@@ -27,13 +32,24 @@
 //! `0`-`9`, `F1`-`F12`, `Return`/`Enter`, `Escape`, `Tab`, `Space`,
 //! `Backspace`, `CapsLock`, `Delete`, `Home`, `End`, `PageUp`,
 //! `PageDown`, `Insert`, `Left`, `Right`, `Up`, `Down`. Actions:
-//! `exec` only for now — future directives (quit, focus, workspace
-//! switching, …) plug in at `parse_action`.
+//! `exec PROGRAM ARGS...` spawns a child process; `focus_dir
+//! left|right|up|down` moves keyboard focus to the nearest mapped
+//! toplevel in the given direction; `move_dir ...` swaps the
+//! focused tile with its neighbor; `toggle_zoom` expands the
+//! focused tile to the full usable area (outer gaps respected)
+//! or restores the master-stack layout; `close_window` asks the
+//! focused toplevel to close via `xdg_toplevel.close`. Future
+//! directives (workspace switching, …) plug in at `parse_action`.
 //!
 //! `remap` rewrites at the evdev scancode layer, so it's invisible to
 //! both bindings and clients: the remapped code is what xkb sees and
 //! what gets fed to `wl_keyboard.key`. Built-in default remaps
 //! CapsLock to Escape because that's what the primary user expects.
+//!
+//! `exec-once` commands are spawned at compositor startup, after the
+//! Wayland socket is bound and `WAYLAND_DISPLAY` is exported — so a
+//! `swaybg` / `hyprpaper` / `mpvpaper` listed here can connect and
+//! paint a wallpaper without the user running anything by hand.
 
 use std::path::PathBuf;
 
@@ -44,10 +60,38 @@ pub const MOD_CTRL: u8 = 1 << 1;
 pub const MOD_SHIFT: u8 = 1 << 2;
 pub const MOD_SUPER: u8 = 1 << 3;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub bindings: Vec<Binding>,
     pub remaps: Vec<Remap>,
+    /// Commands spawned once at compositor startup, after the Wayland
+    /// socket is ready. Intended for wallpaper daemons, status bars,
+    /// notification daemons — any `layer-shell` client the user wants
+    /// up without a manual launch.
+    pub exec_once: Vec<ExecCommand>,
+    pub gaps_in: i32,
+    pub gaps_out: i32,
+    /// Pixel width of the border drawn around the keyboard-focused
+    /// toplevel. 0 disables the border entirely.
+    pub border_width: i32,
+    /// Straight RGBA in [0, 1]. Parsed from hex RGB in the config file;
+    /// alpha is fixed at 1.0 since a translucent border isn't a thing
+    /// anyone has asked for yet.
+    pub border_color: [f32; 4],
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bindings: Vec::new(),
+            remaps: Vec::new(),
+            exec_once: Vec::new(),
+            gaps_in: 12,
+            gaps_out: 20,
+            border_width: 2,
+            border_color: hex_to_rgba(0xFFFF00),
+        }
+    }
 }
 
 impl Config {
@@ -80,7 +124,47 @@ pub struct Remap {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Spawn { program: String, args: Vec<String> },
+    Spawn(ExecCommand),
+    /// Move keyboard focus to the nearest mapped toplevel in the
+    /// given direction (vim-style h/j/k/l navigation).
+    FocusDir(Direction),
+    /// Swap the currently focused tile with its neighbor in the
+    /// given direction — i.e. move the window through the tiling,
+    /// keeping focus on it.
+    MoveDir(Direction),
+    /// Toggle "zoom" on the focused tile: it expands to the full
+    /// usable area (outer gaps respected) and every other tile
+    /// stops rendering until zoom is toggled off. Not the Wayland
+    /// `xdg_toplevel.set_fullscreen` state — we don't tell the
+    /// client anything protocol-level; it just receives a larger
+    /// configure.
+    ToggleZoom,
+    /// Ask the focused toplevel to close via `xdg_toplevel.close`.
+    /// The client decides what to do (terminals exit, text editors
+    /// may prompt to save, etc.). If a client ignores the request
+    /// there's no escalation — we're not a window killer.
+    CloseWindow,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+fn hex_to_rgba(hex: u32) -> [f32; 4] {
+    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+    let b = (hex & 0xFF) as f32 / 255.0;
+    [r, g, b, 1.0]
 }
 
 pub fn load() -> Config {
@@ -126,59 +210,112 @@ fn config_path() -> PathBuf {
 }
 
 pub fn default_config() -> Config {
+    let bind_focus = |k: &str, d: Direction| Binding {
+        mods: MOD_ALT,
+        key: key_from_name(k).unwrap(),
+        action: Action::FocusDir(d),
+    };
+    let bind_move = |k: &str, d: Direction| Binding {
+        mods: MOD_ALT | MOD_CTRL,
+        key: key_from_name(k).unwrap(),
+        action: Action::MoveDir(d),
+    };
     Config {
         bindings: vec![
             Binding {
                 mods: MOD_ALT,
                 key: key_from_name("Return").unwrap(),
-                action: Action::Spawn {
+                action: Action::Spawn(ExecCommand {
                     program: "alacritty".to_string(),
                     // `-e zsh` so we get the user's real shell with
                     // their ~/.zshrc applied — otherwise alacritty
                     // defaults to $SHELL which on some setups skips
                     // interactive rc files.
                     args: vec!["-e".to_string(), "zsh".to_string()],
-                },
+                }),
             },
             Binding {
                 mods: MOD_ALT,
                 key: key_from_name("D").unwrap(),
-                action: Action::Spawn {
+                action: Action::Spawn(ExecCommand {
                     program: "rofi".to_string(),
                     args: vec!["-show".to_string(), "drun".to_string()],
-                },
+                }),
+            },
+            // vim-style focus movement across tiles.
+            bind_focus("H", Direction::Left),
+            bind_focus("J", Direction::Down),
+            bind_focus("K", Direction::Up),
+            bind_focus("L", Direction::Right),
+            // same layout, Ctrl added: move the focused tile itself.
+            bind_move("H", Direction::Left),
+            bind_move("J", Direction::Down),
+            bind_move("K", Direction::Up),
+            bind_move("L", Direction::Right),
+            // Alt+Tab zooms the focused tile to fill the screen
+            // (still respecting outer gaps). Pressing it again
+            // restores the master-stack layout.
+            Binding {
+                mods: MOD_ALT,
+                key: key_from_name("Tab").unwrap(),
+                action: Action::ToggleZoom,
+            },
+            // Ctrl+Q closes the focused window (polite request via
+            // xdg_toplevel.close; the client has final say).
+            Binding {
+                mods: MOD_CTRL,
+                key: key_from_name("Q").unwrap(),
+                action: Action::CloseWindow,
             },
         ],
         remaps: vec![Remap {
             from: key_from_name("CapsLock").unwrap(),
             to: key_from_name("Escape").unwrap(),
         }],
+        ..Config::default()
     }
 }
 
 enum Entry {
     Bind(Binding),
     Remap(Remap),
+    ExecOnce(ExecCommand),
+    GapsIn(i32),
+    GapsOut(i32),
+    BorderWidth(i32),
+    BorderColor([f32; 4]),
 }
 
 pub fn parse(text: &str) -> Config {
-    let mut bindings = Vec::new();
-    let mut remaps = Vec::new();
+    // Start from the defaults so unset numeric knobs keep sensible
+    // values even on a partial config; `bindings` / `remaps` are reset
+    // to empty so a user config file fully replaces the built-in
+    // bindings rather than appending to them (otherwise the defaults
+    // would shadow user overrides with the same mod+key).
+    let mut cfg = Config::default();
+    cfg.bindings.clear();
+    cfg.remaps.clear();
+    cfg.exec_once.clear();
     for (lineno, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
         if line.is_empty() {
             continue;
         }
         match parse_line(line) {
-            Ok(Some(Entry::Bind(b))) => bindings.push(b),
-            Ok(Some(Entry::Remap(r))) => remaps.push(r),
+            Ok(Some(Entry::Bind(b))) => cfg.bindings.push(b),
+            Ok(Some(Entry::Remap(r))) => cfg.remaps.push(r),
+            Ok(Some(Entry::ExecOnce(e))) => cfg.exec_once.push(e),
+            Ok(Some(Entry::GapsIn(v))) => cfg.gaps_in = v,
+            Ok(Some(Entry::GapsOut(v))) => cfg.gaps_out = v,
+            Ok(Some(Entry::BorderWidth(v))) => cfg.border_width = v,
+            Ok(Some(Entry::BorderColor(c))) => cfg.border_color = c,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
             }
         }
     }
-    Config { bindings, remaps }
+    cfg
 }
 
 /// Strip trailing `#` comments but keep `#` that appear inside an exec
@@ -196,11 +333,43 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
     let (lhs, rhs) = line
         .split_once('=')
         .ok_or_else(|| anyhow!("expected `key = value`"))?;
+    let rhs = rhs.trim();
     match lhs.trim() {
-        "bind" => Ok(Some(Entry::Bind(parse_bind(rhs.trim())?))),
-        "remap" => Ok(Some(Entry::Remap(parse_remap(rhs.trim())?))),
+        "bind" => Ok(Some(Entry::Bind(parse_bind(rhs)?))),
+        "remap" => Ok(Some(Entry::Remap(parse_remap(rhs)?))),
+        "exec-once" => Ok(Some(Entry::ExecOnce(parse_exec(rhs)?))),
+        "gaps_in" => Ok(Some(Entry::GapsIn(parse_int(rhs)?))),
+        "gaps_out" => Ok(Some(Entry::GapsOut(parse_int(rhs)?))),
+        "border_width" => Ok(Some(Entry::BorderWidth(parse_int(rhs)?))),
+        "border_color" => Ok(Some(Entry::BorderColor(parse_color(rhs)?))),
         other => bail!("unknown directive `{other}`"),
     }
+}
+
+fn parse_int(s: &str) -> Result<i32> {
+    s.parse::<i32>()
+        .with_context(|| format!("expected an integer, got `{s}`"))
+}
+
+fn parse_color(s: &str) -> Result<[f32; 4]> {
+    // Accept `RRGGBB`, `#RRGGBB`, or `0xRRGGBB`. Case-insensitive hex.
+    let s = s.strip_prefix('#').or_else(|| s.strip_prefix("0x")).unwrap_or(s);
+    if s.len() != 6 {
+        bail!("expected 6 hex digits for color, got `{s}`");
+    }
+    let hex = u32::from_str_radix(s, 16)
+        .with_context(|| format!("invalid hex color `{s}`"))?;
+    Ok(hex_to_rgba(hex))
+}
+
+fn parse_exec(rhs: &str) -> Result<ExecCommand> {
+    let mut words = rhs.split_whitespace();
+    let program = words
+        .next()
+        .context("`exec-once` needs a program name")?
+        .to_string();
+    let args = words.map(|s| s.to_string()).collect();
+    Ok(ExecCommand { program, args })
 }
 
 fn parse_remap(rhs: &str) -> Result<Remap> {
@@ -216,19 +385,21 @@ fn parse_remap(rhs: &str) -> Result<Remap> {
 }
 
 fn parse_bind(rhs: &str) -> Result<Binding> {
-    // RHS is MODS, KEY, ACTION, ARGS. `splitn(4, ',')` leaves commas
+    // RHS is MODS, KEY, ACTION[, ARGS]. `splitn(4, ',')` leaves commas
     // inside the ARGS portion intact, so `exec, foo --flag=a,b` works.
+    // ARGS is optional: actions like `toggle_zoom` take none.
     let parts: Vec<&str> = rhs.splitn(4, ',').map(|s| s.trim()).collect();
-    if parts.len() < 4 {
+    if parts.len() < 3 {
         bail!(
-            "`bind` expects `MODS, KEY, ACTION, ARGS` (got {} parts)",
+            "`bind` expects `MODS, KEY, ACTION[, ARGS]` (got {} parts)",
             parts.len()
         );
     }
     let mods = parse_mods(parts[0])?;
     let key = key_from_name(parts[1])
         .ok_or_else(|| anyhow!("unknown key `{}`", parts[1]))?;
-    let action = parse_action(parts[2], parts[3])?;
+    let args = parts.get(3).copied().unwrap_or("");
+    let action = parse_action(parts[2], args)?;
     Ok(Binding { mods, key, action })
 }
 
@@ -252,19 +423,27 @@ fn parse_mods(s: &str) -> Result<u8> {
 
 fn parse_action(kind: &str, args: &str) -> Result<Action> {
     match kind {
-        "exec" => {
-            // Whitespace-split for now. Quoted arguments would need a
-            // real tokenizer; punt on that until a user actually needs
-            // filenames with spaces.
-            let mut words = args.split_whitespace();
-            let program = words
-                .next()
-                .context("`exec` needs a program name")?
-                .to_string();
-            let args = words.map(|s| s.to_string()).collect();
-            Ok(Action::Spawn { program, args })
-        }
+        // Whitespace-split for now. Quoted arguments would need a
+        // real tokenizer; punt on that until a user actually needs
+        // filenames with spaces.
+        "exec" => Ok(Action::Spawn(parse_exec(args)?)),
+        "focus_dir" => Ok(Action::FocusDir(parse_direction(args)?)),
+        "move_dir" => Ok(Action::MoveDir(parse_direction(args)?)),
+        "toggle_zoom" => Ok(Action::ToggleZoom),
+        "close_window" => Ok(Action::CloseWindow),
         other => bail!("unknown action `{other}`"),
+    }
+}
+
+fn parse_direction(s: &str) -> Result<Direction> {
+    // Spelled out, not single-letter: the vim shorthand `l = right`
+    // conflicts with "l = left" and would be a foot-gun either way.
+    match s.trim().to_ascii_lowercase().as_str() {
+        "left" => Ok(Direction::Left),
+        "right" => Ok(Direction::Right),
+        "up" => Ok(Direction::Up),
+        "down" => Ok(Direction::Down),
+        other => bail!("unknown direction `{other}` (expected left/right/up/down)"),
     }
 }
 

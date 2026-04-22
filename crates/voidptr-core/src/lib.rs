@@ -34,7 +34,11 @@ pub enum SceneContent<'a> {
 
 /// One thing to draw on screen: a rectangle of pixels at a position. Produced
 /// by the Wayland server on each render tick and consumed by whichever
-/// backend is mounted (software PNG or DRM+GL).
+/// backend is mounted (software PNG or DRM+GL). Dimensions are the
+/// buffer's own size — no stretching; the compositor holds back layout
+/// transitions until client buffers match the new tile (see
+/// `Window::render_rect`), so source and output dimensions are always
+/// the same here.
 pub struct SceneElement<'a> {
     /// Stable-across-frames identifier for this texture. Backends can use
     /// this as a cache key so a reused wl_buffer keeps its GPU texture.
@@ -47,13 +51,31 @@ pub struct SceneElement<'a> {
     pub content: SceneContent<'a>,
 }
 
+/// Flat-colored rectangle overlay — drawn on top of all textured
+/// elements but below the cursor. Used today for the focused-tile
+/// border; the render path is generic enough to reuse later for
+/// notifications, window highlights, debug overlays, etc.
+pub struct SceneBorder {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// Straight RGBA in [0, 1]. The DRM presenter treats it as
+    /// un-premultiplied; the solid shader writes it directly.
+    pub rgba: [f32; 4],
+}
+
 pub struct Scene<'a> {
     pub elements: Vec<SceneElement<'a>>,
+    pub borders: Vec<SceneBorder>,
 }
 
 impl<'a> Scene<'a> {
     pub fn new() -> Self {
-        Self { elements: Vec::new() }
+        Self {
+            elements: Vec::new(),
+            borders: Vec::new(),
+        }
     }
 }
 

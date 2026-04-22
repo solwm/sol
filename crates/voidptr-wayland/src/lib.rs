@@ -72,12 +72,25 @@ pub struct Rect {
 }
 
 /// A mapped xdg_toplevel together with the screen-space rect the layout
-/// assigned to it. `pending_size` is the (w, h) most recently sent to the
-/// client via xdg_toplevel.configure; layout sends a fresh configure only
-/// when the target rect differs, so we don't spam configures every frame.
+/// assigned to it.
+///
+/// - `rect`: the target rect — what the layout wants the tile to be,
+///   right now. Updated immediately by `apply_layout` when the layout
+///   changes (tile closed, move/focus command, zoom, etc.).
+/// - `render_rect`: where the tile is actually drawn this frame. Held
+///   back from `rect` until the client has committed a buffer whose
+///   dimensions match `rect`. Without this gate, a layout change
+///   would either stretch the old buffer to the new tile (ugly
+///   distortion for 1–2 frames) or leave the clear color peeking
+///   through the unclaimed area.
+/// - `pending_size` is the (w, h) most recently sent to the client via
+///   `xdg_toplevel.configure`; layout sends a fresh configure only
+///   when the target rect differs, so we don't spam configures every
+///   frame.
 pub struct Window {
     pub surface: Weak<WlSurface>,
     pub rect: Rect,
+    pub render_rect: Rect,
     pub pending_size: Option<(i32, i32)>,
 }
 
@@ -138,6 +151,12 @@ pub struct State {
     /// (mod, key) combos dispatch `exec` actions instead of being
     /// forwarded to the focused client.
     pub config: config::Config,
+    /// If Some, the toplevel-like tile currently zoomed to the full
+    /// usable area (outer gaps respected). While set, other mapped
+    /// toplevels don't render. Cleared by a second toggle, by any
+    /// focus or move direction command, and automatically if the
+    /// zoomed surface dies.
+    pub zoomed: Option<Weak<WlSurface>>,
     /// Keys of texture cache entries the DRM presenter should evict on
     /// the next render tick. Filled by `Dispatch<WlBuffer, _>::Destroy`
     /// handlers when a client tears down a buffer; drained (and acted
@@ -392,6 +411,10 @@ fn master_stack_layout(n: usize, screen: Rect) -> Vec<Rect> {
 /// but compute the layout against the usable area — the screen minus any
 /// edge-reserved exclusive zones from layer surfaces (a top-anchored bar
 /// with exclusive_zone=30 shrinks tiled toplevels by 30 px off the top).
+/// Gaps come from the user config: `gaps_out` shrinks the usable area
+/// (so every tile sits at least that many pixels from the edge) and
+/// `gaps_in` is split half-each-side so adjacent tiles are exactly
+/// `gaps_in` apart.
 fn apply_layout(state: &mut State) {
     let screen = Rect {
         x: 0,
@@ -401,9 +424,64 @@ fn apply_layout(state: &mut State) {
     };
     let layers = layer_shell::mapped_layers(state, screen);
     let usable = layer_shell::usable_area(&layers, screen);
-    let rects = master_stack_layout(state.mapped_toplevels.len(), usable);
+    let inner = shrink_rect(usable, state.config.gaps_out);
+
+    // Zoom overrides the tile layout: the zoomed window gets the
+    // full inner area and we short-circuit before running
+    // master-stack. Other windows keep their last-known rects
+    // (collect_scene will skip them anyway while zoom is active).
+    if let Some(zs) = state.zoomed.as_ref().and_then(|w| w.upgrade().ok()) {
+        let zoomed_exists = state
+            .mapped_toplevels
+            .iter_mut()
+            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&zs))
+            .map(|w| {
+                w.rect = inner;
+            })
+            .is_some();
+        if zoomed_exists {
+            return;
+        }
+        // Zoomed surface vanished (client crashed, destroyed its
+        // toplevel, etc.). Drop the flag and fall through to the
+        // normal layout so we don't leave the screen stuck showing
+        // a dead tile.
+        state.zoomed = None;
+    }
+
+    let rects = master_stack_layout(state.mapped_toplevels.len(), inner);
+    let gaps_in = state.config.gaps_in;
     for (win, rect) in state.mapped_toplevels.iter_mut().zip(rects.into_iter()) {
-        win.rect = rect;
+        win.rect = shrink_interior_edges(rect, inner, gaps_in);
+    }
+}
+
+fn shrink_rect(r: Rect, by: i32) -> Rect {
+    Rect {
+        x: r.x + by,
+        y: r.y + by,
+        w: (r.w - 2 * by).max(1),
+        h: (r.h - 2 * by).max(1),
+    }
+}
+
+/// Shrink each edge of `r` by half of `gaps_in` iff that edge is an
+/// interior boundary (i.e. not sitting on the corresponding edge of
+/// `outer`). An edge that is on the outer boundary is already
+/// `gaps_out` away from the actual screen edge, so we leave it alone —
+/// the result is: tile ↔ tile gap = `gaps_in`, tile ↔ edge gap =
+/// `gaps_out`. Clean semantics, no compound.
+fn shrink_interior_edges(r: Rect, outer: Rect, gaps_in: i32) -> Rect {
+    let half = gaps_in / 2;
+    let left = if r.x == outer.x { 0 } else { half };
+    let right = if r.x + r.w == outer.x + outer.w { 0 } else { half };
+    let top = if r.y == outer.y { 0 } else { half };
+    let bottom = if r.y + r.h == outer.y + outer.h { 0 } else { half };
+    Rect {
+        x: r.x + left,
+        y: r.y + top,
+        w: (r.w - left - right).max(1),
+        h: (r.h - top - bottom).max(1),
     }
 }
 
@@ -486,9 +564,20 @@ fn collect_scene(
         }
     }
 
-    // 2. Tiled xdg_toplevels.
+    // 2. Tiled xdg_toplevels. While zoom is active, only the zoomed
+    // surface renders — other tiles are effectively hidden even
+    // though their mapped_toplevels entries remain untouched.
+    // Position uses `render_rect`, not `rect`: the tile stays at its
+    // pre-transition position/size until the client commits a
+    // matching buffer (see `reconcile_render_rects`).
+    let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     for win in state.mapped_toplevels.iter() {
         let Ok(surface) = win.surface.upgrade() else { continue };
+        if let Some(zs) = &zoomed {
+            if surface != *zs {
+                continue;
+            }
+        }
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
@@ -500,9 +589,9 @@ fn collect_scene(
             sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok())
         };
         if let Some(buf) = buf_opt {
-            out.push((buf, win.rect));
+            out.push((buf, win.render_rect));
         }
-        emit_subsurface_tree(&mut out, &surface, win.rect.x, win.rect.y);
+        emit_subsurface_tree(&mut out, &surface, win.render_rect.x, win.render_rect.y);
     }
 
     // 3. Top + Overlay layer surfaces.
@@ -635,6 +724,234 @@ fn scene_from_buffers<'a>(
 /// pointers works; pick something unlikely to collide.
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
+/// Sync each mapped window's `render_rect` to its target `rect` when
+/// the client's current buffer matches the target size. Until that
+/// happens the window keeps rendering at its previous `render_rect`,
+/// so the user sees the old layout for 1–2 frames instead of a
+/// stretched or background-leaking intermediate state. A newly-
+/// mapped window (render_rect still all zeros) is promoted
+/// immediately on first sight — no transition to smooth over since
+/// there was nothing on screen before.
+fn reconcile_render_rects(state: &mut State) {
+    for win in state.mapped_toplevels.iter_mut() {
+        // First-frame case: make the new window visible immediately.
+        if win.render_rect.w == 0 || win.render_rect.h == 0 {
+            win.render_rect = win.rect;
+            continue;
+        }
+        // Already where the layout wants it.
+        if win.render_rect == win.rect {
+            continue;
+        }
+        let Ok(surface) = win.surface.upgrade() else { continue };
+        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
+            continue;
+        };
+        let buf_dims = {
+            let sd = sd_arc.lock().unwrap();
+            sd.current
+                .buffer
+                .as_ref()
+                .and_then(|w| w.upgrade().ok())
+                .and_then(|b| surface_buffer_dims(&b))
+        };
+        if let Some((bw, bh)) = buf_dims {
+            if bw == win.rect.w && bh == win.rect.h {
+                win.render_rect = win.rect;
+            }
+        }
+    }
+}
+
+impl PartialEq for Rect {
+    fn eq(&self, other: &Self) -> bool {
+        self.x == other.x && self.y == other.y && self.w == other.w && self.h == other.h
+    }
+}
+impl Eq for Rect {}
+
+/// Pick the index (in `mapped_toplevels`) of the nearest tile to
+/// `from` in the given direction. Scoring is primary-axis distance
+/// plus 2× orthogonal distance, so from the master tile in a
+/// master-stack layout Alt+L lands on the vertically-nearest stack
+/// tile rather than bouncing between top and bottom. Returns None
+/// if nothing qualifies — the caller is expected to interpret that
+/// as "do nothing," i.e. no wrap-around at the edges.
+fn neighbor_in_direction(
+    windows: &[Window],
+    from_idx: usize,
+    dir: config::Direction,
+) -> Option<usize> {
+    use config::Direction;
+    let from = windows[from_idx].rect;
+    let cx = from.x + from.w / 2;
+    let cy = from.y + from.h / 2;
+    let mut best: Option<(usize, i32)> = None;
+    for (i, w) in windows.iter().enumerate() {
+        if i == from_idx {
+            continue;
+        }
+        if w.surface.upgrade().is_err() {
+            continue;
+        }
+        let tx = w.rect.x + w.rect.w / 2;
+        let ty = w.rect.y + w.rect.h / 2;
+        let dx = tx - cx;
+        let dy = ty - cy;
+        let in_dir = match dir {
+            Direction::Left => dx < 0,
+            Direction::Right => dx > 0,
+            Direction::Up => dy < 0,
+            Direction::Down => dy > 0,
+        };
+        if !in_dir {
+            continue;
+        }
+        let score = match dir {
+            Direction::Left | Direction::Right => dx.abs() + 2 * dy.abs(),
+            Direction::Up | Direction::Down => dy.abs() + 2 * dx.abs(),
+        };
+        if best.map_or(true, |(_, s)| score < s) {
+            best = Some((i, score));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Find the `mapped_toplevels` index of the currently keyboard-
+/// focused toplevel, or None if focus is empty / on a layer surface
+/// / on a popup. Both focus and move commands short-circuit on None.
+fn focused_toplevel_index(state: &State) -> Option<usize> {
+    let focus = state.keyboard_focus.as_ref()?;
+    state
+        .mapped_toplevels
+        .iter()
+        .position(|w| w.surface.upgrade().ok().as_ref() == Some(focus))
+}
+
+fn focus_direction(state: &mut State, dir: config::Direction) {
+    let Some(idx) = focused_toplevel_index(state) else { return };
+    let Some(n) = neighbor_in_direction(&state.mapped_toplevels, idx, dir) else {
+        return;
+    };
+    let Ok(target) = state.mapped_toplevels[n].surface.upgrade() else {
+        return;
+    };
+    // Moving focus while zoomed would leave the user looking at a
+    // hidden tile, so drop zoom before shifting focus. Explicit
+    // Alt+Tab is the only path to re-zoom on the new window.
+    state.zoomed = None;
+    state.set_keyboard_focus(Some(target));
+    // Border follows focus, so trigger a redraw.
+    state.needs_render = true;
+}
+
+/// Swap the focused tile's position in `mapped_toplevels` with its
+/// neighbor in the given direction. `apply_layout` on the next
+/// render tick recomputes every window's rect from its new slot and
+/// `send_pending_configures` fires fresh configures so the clients
+/// resize into their new tiles.
+fn move_direction(state: &mut State, dir: config::Direction) {
+    let Some(idx) = focused_toplevel_index(state) else { return };
+    let Some(n) = neighbor_in_direction(&state.mapped_toplevels, idx, dir) else {
+        return;
+    };
+    // Same reasoning as focus_direction: rearranging the tile layout
+    // while zoom hides everything but one tile would be confusing.
+    state.zoomed = None;
+    state.mapped_toplevels.swap(idx, n);
+    state.needs_render = true;
+}
+
+/// Ctrl+Q handler: send `xdg_toplevel.close` to whichever tile has
+/// keyboard focus. The client decides how to handle it — terminals
+/// and most CLI-ish apps exit immediately, GUI apps may show a
+/// save-changes prompt. If the client chooses to ignore the event,
+/// we don't escalate to SIGTERM; that's a different action.
+fn close_focused_window(state: &mut State) {
+    let Some(focus) = state.keyboard_focus.as_ref() else { return };
+    let Some(sd_arc) = focus.data::<Arc<Mutex<SurfaceData>>>() else { return };
+    let tl = sd_arc
+        .lock()
+        .unwrap()
+        .xdg_toplevel
+        .as_ref()
+        .and_then(|w| w.upgrade().ok());
+    let Some(tl) = tl else {
+        // Not a mapped xdg_toplevel — layer surface, popup, etc.
+        // Those don't have a close request in the same sense.
+        return;
+    };
+    tracing::info!(id = ?focus.id(), "close_window: sending xdg_toplevel.close");
+    tl.close();
+}
+
+/// Alt+Tab handler: toggle fullscreen-in-the-layout for the focused
+/// toplevel. First press zooms, second press (or any focus/move
+/// command) restores the master-stack.
+fn toggle_zoom(state: &mut State) {
+    let Some(focus) = state.keyboard_focus.as_ref() else { return };
+    // Only zoom actual tiled toplevels — popups, layer surfaces,
+    // etc. aren't in mapped_toplevels and zooming them would have
+    // no visible effect beyond breaking the layout invariant.
+    if !state
+        .mapped_toplevels
+        .iter()
+        .any(|w| w.surface.upgrade().ok().as_ref() == Some(focus))
+    {
+        return;
+    }
+    let already_zoomed = state
+        .zoomed
+        .as_ref()
+        .and_then(|w| w.upgrade().ok())
+        .as_ref()
+        == Some(focus);
+    state.zoomed = if already_zoomed { None } else { Some(focus.downgrade()) };
+    state.needs_render = true;
+}
+
+/// Build four thin rects outlining the keyboard-focused toplevel's
+/// tile — the visual cue for "this is where typing goes." Empty vec
+/// if no toplevel is focused, if the border is disabled
+/// (`border_width = 0`), or if the focused surface isn't a mapped
+/// toplevel (popup focus, layer-surface focus, etc. — those don't
+/// get a tile border).
+fn focus_border(state: &State) -> Vec<voidptr_core::SceneBorder> {
+    let w = state.config.border_width;
+    if w <= 0 {
+        return Vec::new();
+    }
+    let Some(focus) = state.keyboard_focus.as_ref() else {
+        return Vec::new();
+    };
+    let Some(win) = state
+        .mapped_toplevels
+        .iter()
+        .find(|ww| ww.surface.upgrade().ok().as_ref() == Some(focus))
+    else {
+        return Vec::new();
+    };
+    // Border tracks what's actually on screen, so it uses render_rect
+    // and stays visually glued to the tile during resize transitions.
+    let r = win.render_rect;
+    let c = state.config.border_color;
+    // Top / bottom span the full width including corners; left / right
+    // are insets so the four rects don't double-draw at the corners.
+    vec![
+        voidptr_core::SceneBorder { x: r.x, y: r.y, w: r.w, h: w, rgba: c },
+        voidptr_core::SceneBorder { x: r.x, y: r.y + r.h - w, w: r.w, h: w, rgba: c },
+        voidptr_core::SceneBorder { x: r.x, y: r.y + w, w, h: r.h - 2 * w, rgba: c },
+        voidptr_core::SceneBorder {
+            x: r.x + r.w - w,
+            y: r.y + w,
+            w,
+            h: r.h - 2 * w,
+            rgba: c,
+        },
+    ]
+}
+
 fn render_tick(comp: &mut Compositor) -> Result<()> {
     // If a page flip is already in flight, skip this tick. The flip
     // will complete asynchronously on the DRM fd; the calloop source
@@ -666,9 +983,17 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     rebalance_keyboard_focus(&mut comp.state);
     apply_layout(&mut comp.state);
     send_pending_configures(&mut comp.state);
+    // Promote each window's render_rect to match its target rect
+    // once the client has caught up (current buffer matches the
+    // target size). This is what actually makes layout transitions
+    // visually atomic: in-flight windows keep rendering at their
+    // old position/size until their next commit, then everyone
+    // snaps to the new layout at once.
+    reconcile_render_rects(&mut comp.state);
 
     let placed = collect_scene(&comp.state);
-    let scene = scene_from_buffers(&placed, &comp.state.cursor);
+    let mut scene = scene_from_buffers(&placed, &comp.state.cursor);
+    scene.borders.extend(focus_border(&comp.state));
     let drawn = scene.elements.len();
 
     match &mut comp.backend {
@@ -691,6 +1016,9 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
                         // feature.
                     }
                 }
+            }
+            for b in &scene.borders {
+                canvas.fill_rect(b.x, b.y, b.w, b.h, b.rgba);
             }
             canvas
                 .write_png(png_path)
@@ -957,6 +1285,7 @@ fn setup_event_loop(
         left_super_down: false,
         right_super_down: false,
         config: config::load(),
+        zoomed: None,
         pending_texture_evictions: Vec::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
@@ -973,6 +1302,15 @@ fn setup_event_loop(
         "ready: export WAYLAND_DISPLAY={} and run a client",
         socket_name
     );
+
+    // Fire `exec-once` commands from the config. Runs after the socket
+    // is bound and WAYLAND_DISPLAY is exported (above) so children can
+    // connect immediately; a wallpaper daemon (swaybg / hyprpaper /
+    // mpvpaper) listed here comes up without any manual launch.
+    for cmd in &compositor.state.config.exec_once {
+        let argrefs: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
+        spawn_client(&compositor.state, &cmd.program, &argrefs, "exec-once");
+    }
 
     // External stop signals (SIGTERM, SIGHUP — the ones `killall voidptr`
     // and `kill <pid>` send) trigger a clean shutdown: calloop returns
@@ -1151,12 +1489,27 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                     state.config.bindings.iter().find(|b| b.mods == mask && b.key == keycode)
                 {
                     match b.action.clone() {
-                        config::Action::Spawn { program, args } => {
+                        config::Action::Spawn(cmd) => {
                             let argrefs: Vec<&str> =
-                                args.iter().map(|s| s.as_str()).collect();
-                            let label =
-                                format!("{}+{}", config::mods_to_label(mask), program);
-                            spawn_client(state, &program, &argrefs, &label);
+                                cmd.args.iter().map(|s| s.as_str()).collect();
+                            let label = format!(
+                                "{}+{}",
+                                config::mods_to_label(mask),
+                                cmd.program
+                            );
+                            spawn_client(state, &cmd.program, &argrefs, &label);
+                        }
+                        config::Action::FocusDir(dir) => {
+                            focus_direction(state, dir);
+                        }
+                        config::Action::MoveDir(dir) => {
+                            move_direction(state, dir);
+                        }
+                        config::Action::ToggleZoom => {
+                            toggle_zoom(state);
+                        }
+                        config::Action::CloseWindow => {
+                            close_focused_window(state);
                         }
                     }
                     return;
@@ -1241,6 +1594,17 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         }
     };
 
+    // Given a parent surface that the cursor is currently over (at
+    // `lx, ly` in the parent's local coords), return the topmost
+    // subsurface descendant that also contains the cursor — or the
+    // parent itself if none do. This mirrors our scene walker, which
+    // draws subsurfaces on top of their parent: pointer input has to
+    // follow the same stacking so clicks actually reach popups,
+    // tooltips, and the close boxes on toast dialogs.
+    let resolve_hit = |parent: WlSurface, lx: f64, ly: f64| -> (WlSurface, f64, f64) {
+        hit_subsurfaces(&parent, lx, ly).unwrap_or((parent, lx, ly))
+    };
+
     let layers = layer_shell::mapped_layers(state, screen);
 
     // Pass 1: Overlay > Top. Iterate overlay-first (descending priority).
@@ -1250,13 +1614,21 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         .chain(layers.iter().filter(|m| matches!(m.layer, Layer::Top)))
     {
         if let Some((lx, ly)) = hit_rect(ml.rect) {
-            return Some((ml.surface.clone(), lx, ly));
+            return Some(resolve_hit(ml.surface.clone(), lx, ly));
         }
     }
 
-    // Pass 2: tiled toplevels (top of stack first).
+    // Pass 2: tiled toplevels (top of stack first). Honor zoom: while
+    // zoomed, the non-zoomed tiles don't render and mustn't catch
+    // clicks either.
+    let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     for win in state.mapped_toplevels.iter().rev() {
         let Ok(surface) = win.surface.upgrade() else { continue };
+        if let Some(zs) = &zoomed {
+            if surface != *zs {
+                continue;
+            }
+        }
         let sd_arc = match surface.data::<Arc<Mutex<SurfaceData>>>() {
             Some(s) => s,
             None => continue,
@@ -1267,8 +1639,11 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         ) {
             continue;
         }
-        if let Some((lx, ly)) = hit_rect(win.rect) {
-            return Some((surface, lx, ly));
+        // Hit test against what the user can actually see (render_rect)
+        // — clicking on the visible tile should hit, regardless of
+        // whether the layout target has moved past it already.
+        if let Some((lx, ly)) = hit_rect(win.render_rect) {
+            return Some(resolve_hit(surface, lx, ly));
         }
     }
 
@@ -1279,10 +1654,81 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         .chain(layers.iter().filter(|m| matches!(m.layer, Layer::Background)))
     {
         if let Some((lx, ly)) = hit_rect(ml.rect) {
-            return Some((ml.surface.clone(), lx, ly));
+            return Some(resolve_hit(ml.surface.clone(), lx, ly));
         }
     }
 
+    None
+}
+
+/// Walk `parent`'s subsurface tree topmost-first and return the
+/// deepest descendant whose buffer-sized rect covers the cursor
+/// (given `lx, ly` relative to `parent`'s origin). Without this,
+/// Chrome's toast-style dialogs (attached as subsurfaces) receive
+/// no pointer events because we deliver clicks to the outer
+/// toplevel instead of the subsurface the client is actually
+/// listening on.
+fn hit_subsurfaces(
+    parent: &WlSurface,
+    lx: f64,
+    ly: f64,
+) -> Option<(WlSurface, f64, f64)> {
+    let sd_arc = parent.data::<Arc<Mutex<SurfaceData>>>()?;
+    // Snapshot children while holding the parent lock only briefly;
+    // recurse outside so child locks don't nest.
+    let children: Vec<(WlSurface, (i32, i32), (i32, i32))> = {
+        let sd = sd_arc.lock().ok()?;
+        sd.subsurface_children
+            .iter()
+            .filter_map(|w| {
+                let s = w.upgrade().ok()?;
+                // Lock the child's SurfaceData, read out everything we
+                // need, then drop the guard before moving `s` into
+                // the tuple — otherwise the borrow checker sees the
+                // guard still holding a reference to `s` via its arc.
+                let (offset, dims) = {
+                    let csd_arc = s.data::<Arc<Mutex<SurfaceData>>>()?;
+                    let csd = csd_arc.lock().ok()?;
+                    let offset = csd.subsurface_offset;
+                    let buf = csd.current.buffer.as_ref()?.upgrade().ok()?;
+                    let dims = surface_buffer_dims(&buf)?;
+                    (offset, dims)
+                };
+                Some((s, offset, dims))
+            })
+            .collect()
+    };
+    // Topmost first: collect_scene draws in registration order, so
+    // last-registered is on top, so we iterate in reverse.
+    for (child, (ox, oy), (cw, ch)) in children.into_iter().rev() {
+        let child_lx = lx - ox as f64;
+        let child_ly = ly - oy as f64;
+        if child_lx >= 0.0
+            && child_lx < cw as f64
+            && child_ly >= 0.0
+            && child_ly < ch as f64
+        {
+            // Recurse so nested popups (rare but legal) still route
+            // correctly; if none of THIS child's children claim the
+            // cursor, the child itself gets the hit.
+            return Some(
+                hit_subsurfaces(&child, child_lx, child_ly)
+                    .unwrap_or((child, child_lx, child_ly)),
+            );
+        }
+    }
+    None
+}
+
+fn surface_buffer_dims(
+    buf: &wayland_server::protocol::wl_buffer::WlBuffer,
+) -> Option<(i32, i32)> {
+    if let Some(bd) = buf.data::<shm::BufferData>() {
+        return Some((bd.width, bd.height));
+    }
+    if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
+        return Some((db.width, db.height));
+    }
     None
 }
 

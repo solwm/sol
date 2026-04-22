@@ -16,7 +16,7 @@ use voidptr_core::{PixelFormat, Scene, SceneContent};
 
 use crate::{
     Card, GlStack, OutputSelection, dmabuf_egl, get_or_add_fb, pick_output,
-    quad::QuadProgram,
+    quad::{QuadProgram, SolidProgram},
 };
 
 /// Snapshot of the CRTC state the kernel/fbcon had configured before we
@@ -56,6 +56,8 @@ pub struct DrmPresenter {
     /// external-only EGLImages for dmabuf imports — binding those to
     /// GL_TEXTURE_2D silently yields all-zero samples.
     quad_external: QuadProgram,
+    /// Flat-color shader for border rects, debug overlays, etc.
+    solid: SolidProgram,
     /// GPU textures keyed by Scene::buffer_key. Kept across frames so
     /// uploads are glTexSubImage2D after the first sight.
     textures: HashMap<u64, TextureEntry>,
@@ -116,6 +118,7 @@ impl DrmPresenter {
         let gl_stack = GlStack::new(card.clone(), width, height)?;
         let quad = crate::quad::build(&gl_stack.gl)?;
         let quad_external = crate::quad::build_external(&gl_stack.gl)?;
+        let solid = crate::quad::build_solid(&gl_stack.gl)?;
 
         let mut presenter = Self {
             card,
@@ -127,6 +130,7 @@ impl DrmPresenter {
             pending_flip: false,
             quad,
             quad_external,
+            solid,
             textures: HashMap::new(),
             width,
             height,
@@ -297,10 +301,16 @@ impl DrmPresenter {
                 active_program = Some(prog_id);
             }
 
+            // No stretching: output size matches source (buffer) size.
+            // Scene_from_buffers pairs each buffer with a position rect
+            // that is held back from the layout target until the client
+            // has committed a buffer matching the target — so by the
+            // time a buffer lands here, its dimensions equal the tile
+            // it's being rendered into.
             let x0 = (elem.x as f32 / w as f32) * 2.0 - 1.0;
-            let y0 = 1.0 - ((elem.y + entry.height) as f32 / h as f32) * 2.0;
-            let rw = entry.width as f32 / w as f32 * 2.0;
-            let rh = entry.height as f32 / h as f32 * 2.0;
+            let y0 = 1.0 - ((elem.y + elem.height) as f32 / h as f32) * 2.0;
+            let rw = elem.width as f32 / w as f32 * 2.0;
+            let rh = elem.height as f32 / h as f32 * 2.0;
             let opaque = match &elem.content {
                 SceneContent::Shm {
                     format: PixelFormat::Argb8888,
@@ -326,6 +336,34 @@ impl DrmPresenter {
                 gl.uniform_1_f32(Some(&prog.u_opaque), opaque);
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_texture(entry.target, None);
+            }
+        }
+
+        // Border / overlay pass: flat-colored rects drawn on top of
+        // the textured pass, below the cursor (which gets rendered
+        // inside the textured pass because it's just another scene
+        // element). Separate shader program because u_tex / u_opaque
+        // aren't meaningful here.
+        if !scene.borders.is_empty() {
+            unsafe {
+                gl.use_program(Some(self.solid.program));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.solid.vbo));
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+            }
+            for b in &scene.borders {
+                let x0 = (b.x as f32 / w as f32) * 2.0 - 1.0;
+                let y0 = 1.0 - ((b.y + b.h) as f32 / h as f32) * 2.0;
+                let rw = b.w as f32 / w as f32 * 2.0;
+                let rh = b.h as f32 / h as f32 * 2.0;
+                unsafe {
+                    gl.uniform_4_f32(Some(&self.solid.u_rect), x0, y0, rw, rh);
+                    gl.uniform_4_f32(
+                        Some(&self.solid.u_color),
+                        b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3],
+                    );
+                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                }
             }
         }
 

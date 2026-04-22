@@ -92,6 +92,36 @@ impl Canvas {
         }
     }
 
+    /// Fill a rectangle with a flat RGBA color. RGBA components are in
+    /// [0, 1]; alpha is written straight into the framebuffer's alpha
+    /// channel (no blending — the headless canvas doesn't model
+    /// translucent overlays).
+    pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, rgba: [f32; 4]) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (cw, ch) = (self.width as i32, self.height as i32);
+        let xs = x.max(0);
+        let ys = y.max(0);
+        let xe = (x + w).min(cw);
+        let ye = (y + h).min(ch);
+        if xs >= xe || ys >= ye {
+            return;
+        }
+        let to_byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let [r, g, b, a] = [to_byte(rgba[0]), to_byte(rgba[1]), to_byte(rgba[2]), to_byte(rgba[3])];
+        for py in ys..ye {
+            let row = py as usize * self.width as usize * 4;
+            for px in xs..xe {
+                let d = row + px as usize * 4;
+                self.pixels[d] = r;
+                self.pixels[d + 1] = g;
+                self.pixels[d + 2] = b;
+                self.pixels[d + 3] = a;
+            }
+        }
+    }
+
     pub fn write_png(&self, path: &Path) -> Result<()> {
         let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
         let mut encoder = png::Encoder::new(file, self.width, self.height);
