@@ -24,6 +24,7 @@ use wayland_server::{
 };
 
 mod compositor;
+mod config;
 mod cursor;
 mod data_device;
 mod input;
@@ -121,13 +122,22 @@ pub struct State {
     /// keybinds that spawn clients (Alt+Enter → alacritty) can set
     /// `WAYLAND_DISPLAY` on the child process.
     pub socket_name: String,
-    /// Modifier-key tracking for built-in keybinds. libinput hands us raw
-    /// evdev keycodes; Alt is scancode 56 (left) or 100 (right), Ctrl
-    /// is 29 (left) / 97 (right).
+    /// Modifier-key tracking for config-driven keybinds. libinput hands
+    /// us raw evdev keycodes; Alt is scancode 56 (left) or 100 (right),
+    /// Ctrl is 29 / 97, Shift 42 / 54, Super 125 / 126.
     pub left_alt_down: bool,
     pub right_alt_down: bool,
     pub left_ctrl_down: bool,
     pub right_ctrl_down: bool,
+    pub left_shift_down: bool,
+    pub right_shift_down: bool,
+    pub left_super_down: bool,
+    pub right_super_down: bool,
+    /// User config loaded once at startup. Drives which evdev
+    /// keycodes get remapped (e.g. CapsLock→Escape) and which
+    /// (mod, key) combos dispatch `exec` actions instead of being
+    /// forwarded to the focused client.
+    pub config: config::Config,
     /// Keys of texture cache entries the DRM presenter should evict on
     /// the next render tick. Filled by `Dispatch<WlBuffer, _>::Destroy`
     /// handlers when a client tears down a buffer; drained (and acted
@@ -942,6 +952,11 @@ fn setup_event_loop(
         right_alt_down: false,
         left_ctrl_down: false,
         right_ctrl_down: false,
+        left_shift_down: false,
+        right_shift_down: false,
+        left_super_down: false,
+        right_super_down: false,
+        config: config::load(),
         pending_texture_evictions: Vec::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
@@ -1083,20 +1098,34 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             send_pointer_button(state, button, pressed);
         }
         InputEvent::Key { keycode, pressed } => {
-            // Track modifiers before anything else so keybinds see
-            // accurate state. Released modifiers stop participating.
+            // Apply user-declared scancode remaps before anything else
+            // so modifier tracking, config bindings, and the forwarded
+            // key all see the rewritten code. This is what makes
+            // `remap = CapsLock, Escape` behave as an Escape press end
+            // to end (xkb sees ESC, the client sees ESC).
+            let keycode = state.config.remap(keycode);
+
+            // Track modifiers so keybinds see accurate state. Released
+            // modifiers stop participating.
             match keycode {
                 KEY_LEFTALT => state.left_alt_down = pressed,
                 KEY_RIGHTALT => state.right_alt_down = pressed,
                 KEY_LEFTCTRL => state.left_ctrl_down = pressed,
                 KEY_RIGHTCTRL => state.right_ctrl_down = pressed,
+                KEY_LEFTSHIFT => state.left_shift_down = pressed,
+                KEY_RIGHTSHIFT => state.right_shift_down = pressed,
+                KEY_LEFTMETA => state.left_super_down = pressed,
+                KEY_RIGHTMETA => state.right_super_down = pressed,
                 _ => {}
             }
             let alt = state.left_alt_down || state.right_alt_down;
             let ctrl = state.left_ctrl_down || state.right_ctrl_down;
+            let shift = state.left_shift_down || state.right_shift_down;
+            let sup = state.left_super_down || state.right_super_down;
 
-            // Ctrl+Alt+F1..F12 → libseat VT switch. Intercept FIRST so
-            // clients don't see the Fn press. Matches sway/Hyprland.
+            // Ctrl+Alt+F1..F12 → libseat VT switch. Intentionally not
+            // overridable from the config: a misconfigured .conf must
+            // never be able to trap the user on the compositor.
             if pressed && ctrl && alt {
                 if let Some(vt) = vt_number_for_f_key(keycode) {
                     if let Some(s) = state.session.as_ref() {
@@ -1110,25 +1139,27 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                 }
             }
 
-            // Built-in keybinds:
-            //   Alt+Enter → alacritty (terminal)
-            //   Alt+D     → rofi (application launcher, layer-shell client)
-            if pressed && alt && !ctrl {
-                match keycode {
-                    KEY_ENTER => {
-                        spawn_client(state, "alacritty", &[], "Alt+Enter");
-                        return;
+            // Config-driven bindings. Exact match on the modifier mask
+            // so Alt+Return doesn't also fire on Ctrl+Alt+Return.
+            if pressed {
+                let mut mask = 0u8;
+                if alt { mask |= config::MOD_ALT; }
+                if ctrl { mask |= config::MOD_CTRL; }
+                if shift { mask |= config::MOD_SHIFT; }
+                if sup { mask |= config::MOD_SUPER; }
+                if let Some(b) =
+                    state.config.bindings.iter().find(|b| b.mods == mask && b.key == keycode)
+                {
+                    match b.action.clone() {
+                        config::Action::Spawn { program, args } => {
+                            let argrefs: Vec<&str> =
+                                args.iter().map(|s| s.as_str()).collect();
+                            let label =
+                                format!("{}+{}", config::mods_to_label(mask), program);
+                            spawn_client(state, &program, &argrefs, &label);
+                        }
                     }
-                    KEY_D => {
-                        spawn_client(
-                            state,
-                            "rofi",
-                            &["-show", "drun"],
-                            "Alt+D",
-                        );
-                        return;
-                    }
-                    _ => {}
+                    return;
                 }
             }
             send_keyboard_key(state, keycode, pressed);
@@ -1147,13 +1178,16 @@ fn vt_number_for_f_key(keycode: u32) -> Option<i32> {
     }
 }
 
-/// evdev scancodes, matching what libinput hands us via `key.key()`.
-const KEY_ENTER: u32 = 28;
-const KEY_D: u32 = 32;
+/// evdev scancodes for the modifier keys we track internally. Non-
+/// modifier scancodes live in `config::key_from_name`.
 const KEY_LEFTALT: u32 = 56;
 const KEY_RIGHTALT: u32 = 100;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_RIGHTCTRL: u32 = 97;
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTSHIFT: u32 = 54;
+const KEY_LEFTMETA: u32 = 125;
+const KEY_RIGHTMETA: u32 = 126;
 
 /// Fork/exec a Wayland client connected to our own socket. Env is
 /// inherited wholesale from voidptr's process, which was normalised at
