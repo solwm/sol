@@ -223,15 +223,16 @@ pub struct Cursor {
 
 impl Cursor {
     pub fn new(centre_x: f64, centre_y: f64) -> Self {
+        let sprite = cursor::load();
         Self {
             pos_x: centre_x,
             pos_y: centre_y,
             visible: true,
-            pixels: cursor::pixels(),
-            width: cursor::CURSOR_W,
-            height: cursor::CURSOR_H,
-            hot_x: cursor::CURSOR_HOT_X,
-            hot_y: cursor::CURSOR_HOT_Y,
+            pixels: sprite.pixels,
+            width: sprite.width,
+            height: sprite.height,
+            hot_x: sprite.hot_x,
+            hot_y: sprite.hot_y,
         }
     }
 }
