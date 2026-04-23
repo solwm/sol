@@ -197,6 +197,14 @@ pub struct State {
     /// Monotonically incrementing counter used as the MSC field in
     /// `presented`. Clients use it to detect missed vblanks.
     pub presentation_seq: u64,
+    /// Process-group IDs of `exec-once` children. Each is spawned
+    /// in its own group (via `setsid` in a pre_exec hook) so we
+    /// can `killpg` the whole subtree on shutdown — otherwise
+    /// wrapper-shell loops like `wp-cycle.sh` outlive voidptr,
+    /// accumulate across restarts, and each orphan keeps firing
+    /// its own 30-second wallpaper-cycle tick. After ~7 restarts
+    /// that shows up as "transitions every few seconds."
+    pub exec_once_pgids: Vec<libc::pid_t>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -1464,6 +1472,7 @@ fn setup_event_loop(
         flip_counter_reset: None,
         pending_presentation: presentation_time::empty(),
         presentation_seq: 0,
+        exec_once_pgids: Vec::new(),
         pending_texture_evictions: Vec::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
@@ -1485,9 +1494,12 @@ fn setup_event_loop(
     // is bound and WAYLAND_DISPLAY is exported (above) so children can
     // connect immediately; a wallpaper daemon (swaybg / hyprpaper /
     // mpvpaper) listed here comes up without any manual launch.
-    for cmd in &compositor.state.config.exec_once {
+    // Clone first so we can borrow &mut state inside the loop for
+    // PID tracking.
+    let exec_once: Vec<_> = compositor.state.config.exec_once.clone();
+    for cmd in &exec_once {
         let argrefs: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
-        spawn_client(&compositor.state, &cmd.program, &argrefs, "exec-once");
+        spawn_exec_once(&mut compositor.state, &cmd.program, &argrefs);
     }
 
     // External stop signals (SIGTERM, SIGHUP — the ones `killall voidptr`
@@ -1535,6 +1547,10 @@ fn setup_event_loop(
             let _ = comp.display.flush_clients();
         })
         .context("event loop errored")?;
+
+    // SIGTERM every exec-once pgroup so wallpaper daemons / cycler
+    // shells don't linger as orphans across voidptr restarts.
+    terminate_exec_once(&compositor.state);
 
     Ok(())
 }
@@ -1726,6 +1742,78 @@ const KEY_RIGHTMETA: u32 = 126;
 /// DISPLAY/XAUTHORITY unset, WAYLAND_DISPLAY set). Child handle is
 /// intentionally dropped — no reap, no wait; kernel cleans up on
 /// voidptr exit.
+/// Spawn an `exec-once` child in its own session / process group
+/// and record the pgid on `State` for shutdown cleanup. Using
+/// `setsid` (via `pre_exec`) puts the child and any grandchildren
+/// (e.g. `sleep` / `find` spawned by a wrapper shell like
+/// `wp-cycle.sh`) in a fresh pgroup that we can blanket-kill with
+/// `killpg(pgid, SIGTERM)` when voidptr exits. Without this, those
+/// wrapper scripts outlive every voidptr restart, accumulate as
+/// orphans, and each runs its own independent wallpaper-cycle
+/// timer — which surfaces as "transitions every few seconds"
+/// after a handful of compositor restarts.
+fn spawn_exec_once(state: &mut State, program: &str, args: &[&str]) {
+    use std::os::unix::process::CommandExt;
+    let socket = state.socket_name.clone();
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            // New session → new process group with the child as
+            // leader. Safe in the forked child; returns -1 with
+            // EPERM only if we're already a session leader, which
+            // we aren't (we just forked from voidptr).
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id() as libc::pid_t;
+            state.exec_once_pgids.push(pid);
+            tracing::info!(
+                pid,
+                socket = %socket,
+                program,
+                "exec-once: spawned (new pgroup)"
+            );
+            // Drop the Child handle — we don't want to wait on it,
+            // we'll signal the pgroup directly at shutdown. The
+            // kernel reaps the zombie once voidptr exits (our own
+            // process parent will reap us; our children left around
+            // get re-parented to init which reaps them).
+            std::mem::forget(child);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, program, "exec-once: spawn failed");
+        }
+    }
+}
+
+/// Send SIGTERM to every pgroup we spawned via `exec-once`. Called
+/// after the event loop returns so wrapper-shell loops and
+/// wallpaper daemons don't linger as orphans after voidptr exits.
+fn terminate_exec_once(state: &State) {
+    for &pgid in &state.exec_once_pgids {
+        // kill(-pgid, SIGTERM) addresses the whole process group.
+        let rc = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        if rc == -1 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH just means the group is already gone — fine.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                tracing::warn!(error = %err, pgid, "exec-once: killpg failed");
+            }
+        } else {
+            tracing::info!(pgid, "exec-once: killpg SIGTERM");
+        }
+    }
+}
+
 fn spawn_client(state: &State, program: &str, args: &[&str], label: &str) {
     let socket = state.socket_name.clone();
     match std::process::Command::new(program)
