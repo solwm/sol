@@ -240,7 +240,12 @@ pub struct Globals {
     pub data_device_manager: GlobalId,
     pub xdg_output_manager: GlobalId,
     pub presentation: GlobalId,
-    pub viewporter: GlobalId,
+    /// `wp_viewporter` global — advertised only when we need it.
+    /// Temporarily `None` to test whether Chrome's move-glitch is
+    /// triggered by Chrome taking a different render path when it
+    /// sees the global, even though our implementation no longer
+    /// uses the viewport destination for anything.
+    pub viewporter: Option<GlobalId>,
 }
 
 impl State {
@@ -713,8 +718,7 @@ fn scene_from_buffers<'a>(
     cursor: &'a Cursor,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
-    for (buf, rect, vdst) in placed {
-        let (dw, dh) = vdst.unwrap_or((0, 0));
+    for (buf, rect, _vdst) in placed {
         if let Some(bd) = buf.data::<shm::BufferData>() {
             let Some(bytes) = bd.bytes() else { continue };
             let Some(format) = bd.pixel_format() else { continue };
@@ -723,8 +727,6 @@ fn scene_from_buffers<'a>(
                 buffer_key: key,
                 width: bd.width,
                 height: bd.height,
-                dst_width: dw,
-                dst_height: dh,
                 x: rect.x,
                 y: rect.y,
                 content: SceneContent::Shm {
@@ -742,8 +744,6 @@ fn scene_from_buffers<'a>(
                 buffer_key: key,
                 width: db.width,
                 height: db.height,
-                dst_width: dw,
-                dst_height: dh,
                 x: rect.x,
                 y: rect.y,
                 content: SceneContent::Dmabuf {
@@ -756,15 +756,12 @@ fn scene_from_buffers<'a>(
             });
         }
     }
-    // Cursor last so it always draws on top. Fixed-size sprite —
-    // never stretched.
+    // Cursor last so it always draws on top.
     if cursor.visible {
         scene.elements.push(SceneElement {
             buffer_key: CURSOR_SCENE_KEY,
             width: cursor.width,
             height: cursor.height,
-            dst_width: 0,
-            dst_height: 0,
             x: cursor.pos_x as i32 - cursor.hot_x,
             y: cursor.pos_y as i32 - cursor.hot_y,
             content: SceneContent::Shm {
@@ -1157,10 +1154,7 @@ fn setup_event_loop(
             presentation_time::PRESENTATION_VERSION,
             (),
         ),
-        viewporter: dh.create_global::<State, WpViewporter, ()>(
-            viewporter::VIEWPORTER_VERSION,
-            (),
-        ),
+        viewporter: None, // not advertising while we test the Chrome-move glitch
     };
     tracing::info!(?globals, "advertised globals");
 

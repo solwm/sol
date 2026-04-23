@@ -34,25 +34,19 @@ pub enum SceneContent<'a> {
 
 /// One thing to draw on screen: a rectangle of pixels at a position. Produced
 /// by the Wayland server on each render tick and consumed by whichever
-/// backend is mounted (software PNG or DRM+GL).
-///
-/// `width`/`height` are the **source** buffer dimensions — what the
-/// client actually put in memory, used for texture upload. `dst_width`/
-/// `dst_height` are the **output** rect size. `0` for either means
-/// "render 1:1 at source size" (the common case; tile layout keeps
-/// buffer size in sync with tile size via `Window::render_rect`).
-/// Non-zero values stretch to that size — used by
-/// `wp_viewport.set_destination` so wallpaper daemons and similar
-/// clients can attach a small buffer and ask the compositor to scale
-/// it to the output.
+/// backend is mounted (software PNG or DRM+GL). Dimensions are always
+/// the buffer's intrinsic size — no stretching. `wp_viewport`'s
+/// `set_destination` is accepted for protocol compatibility (awww
+/// mandatorily unwraps the global) but doesn't drive output
+/// dimensions, since that would override the compositor's own
+/// placement (tile rect / layer-shell anchor) and was what made
+/// browsers glitch during moves.
 pub struct SceneElement<'a> {
     /// Stable-across-frames identifier for this texture. Backends can use
     /// this as a cache key so a reused wl_buffer keeps its GPU texture.
     pub buffer_key: u64,
     pub width: i32,
     pub height: i32,
-    pub dst_width: i32,
-    pub dst_height: i32,
     /// Top-left in screen coordinates.
     pub x: i32,
     pub y: i32,
