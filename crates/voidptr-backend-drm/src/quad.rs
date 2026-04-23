@@ -16,13 +16,20 @@ use glow::{HasContext, NativeBuffer, NativeProgram, NativeUniformLocation};
 const VS: &str = r#"#version 100
 attribute vec2 a_pos;
 uniform vec4 u_rect;
+uniform vec4 u_uv;    // (x, y, w, h) in normalized [0,1] texture coords
 varying vec2 v_uv;
 void main() {
     vec2 p = u_rect.xy + a_pos * u_rect.zw;
     gl_Position = vec4(p, 0.0, 1.0);
-    // Wayland surface coordinates go top-to-bottom; GL texture origin is at
-    // the bottom, so flip v to match.
-    v_uv = vec2(a_pos.x, 1.0 - a_pos.y);
+    // Sample a sub-rect of the texture, picked by the caller per draw.
+    // Full-texture default is u_uv = (0, 0, 1, 1). Wayland surface coords
+    // go top-to-bottom; GL texture origin is bottom, so flip the v term
+    // inside the sub-rect: start at uv.y + uv.h at a_pos.y = 0, decrease
+    // to uv.y at a_pos.y = 1.
+    v_uv = vec2(
+        u_uv.x + a_pos.x * u_uv.z,
+        u_uv.y + (1.0 - a_pos.y) * u_uv.w
+    );
 }
 "#;
 
@@ -66,6 +73,7 @@ pub struct QuadProgram {
     pub program: NativeProgram,
     pub vbo: NativeBuffer,
     pub u_rect: NativeUniformLocation,
+    pub u_uv: NativeUniformLocation,
     pub u_tex: NativeUniformLocation,
     pub u_opaque: NativeUniformLocation,
 }
@@ -158,6 +166,9 @@ fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
         let u_rect = gl
             .get_uniform_location(program, "u_rect")
             .ok_or_else(|| anyhow!("u_rect missing"))?;
+        let u_uv = gl
+            .get_uniform_location(program, "u_uv")
+            .ok_or_else(|| anyhow!("u_uv missing"))?;
         let u_tex = gl
             .get_uniform_location(program, "u_tex")
             .ok_or_else(|| anyhow!("u_tex missing"))?;
@@ -181,6 +192,7 @@ fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
             program,
             vbo,
             u_rect,
+            u_uv,
             u_tex,
             u_opaque,
         })

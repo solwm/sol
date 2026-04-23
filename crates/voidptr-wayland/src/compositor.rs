@@ -98,13 +98,23 @@ pub struct SurfaceData {
     /// implemented yet so the stacking matches the client's
     /// attachment sequence.
     pub subsurface_children: Vec<Weak<WlSurface>>,
-    /// Destination size declared via `wp_viewport.set_destination`,
-    /// in surface-local pixels. When Some, the scene walker stretches
-    /// this surface's buffer to (w, h) on output — the canonical use
-    /// case is a wallpaper daemon that keeps a small source image in
-    /// memory and asks the compositor to scale it to the output
-    /// size.
+    /// Logical destination size declared via
+    /// `wp_viewport.set_destination`, in surface-local pixels.
+    /// **Not** an on-screen output rect — the compositor still owns
+    /// that (tile rect / layer-shell anchor). Destination affects
+    /// how the client labels its own logical size for input / damage
+    /// math; we store it for protocol correctness but don't use it
+    /// to drive output placement.
     pub viewport_dst: Option<(i32, i32)>,
+    /// Source crop rect declared via `wp_viewport.set_source`, in
+    /// buffer coordinates (fixed-point 24.8 on the wire; we store
+    /// as f64). Tuple layout is `(x, y, w, h)`. When Some, the
+    /// compositor samples this sub-rect of the buffer instead of
+    /// the full texture; UVs are computed at render time as
+    /// `source / buffer_size`. Used by video / shell integration
+    /// clients that render into a larger buffer than they want
+    /// displayed.
+    pub viewport_src: Option<(f64, f64, f64, f64)>,
 }
 
 impl GlobalDispatch<WlCompositor, ()> for State {

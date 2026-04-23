@@ -1,17 +1,28 @@
-//! `wp_viewporter` — per-surface source crop + destination scale.
+//! `wp_viewporter` — per-surface source crop + destination logical size.
 //!
-//! awww (and many wallpaper daemons, video apps, and browsers) require
-//! this protocol *mandatorily* — awww unwraps the global reference
-//! and panics at startup if we don't advertise it. Implementing at
-//! least the stub unblocks those clients.
+//! **Semantics** (matching Hyprland's interpretation, which matches
+//! what Chromium/Ozone expects):
 //!
-//! Current scope: advertise the global, hand out `wp_viewport` per
-//! surface on request, track the `set_destination` size on the
-//! surface's `SurfaceData` so the scene walker can stretch the
-//! buffer to that size. `set_source` (source-rect cropping in
-//! fixed-point surface coords) is accepted silently — we don't
-//! honor it yet, but no known client we care about needs it for
-//! rendering correctness.
+//! - `set_source(x, y, w, h)` → sub-rect of the buffer that the
+//!   compositor should sample from, in buffer coordinates. Stored
+//!   on the surface's `SurfaceData`; at render time we translate to
+//!   UVs by dividing by the buffer size, and the shader samples
+//!   the corresponding texture patch.
+//!
+//! - `set_destination(w, h)` → the surface's **logical** size (for
+//!   input hit-testing, damage math, a client's "how big am I?"
+//!   answer). It is **not** the on-screen output rect. The
+//!   compositor still places the surface at whatever position and
+//!   size it chose (tile rect for toplevels, anchor rect for
+//!   layer surfaces). Mis-interpreting destination as "stretch the
+//!   buffer to this size and draw at that size" (which an earlier
+//!   implementation here did) broke Chrome's move/resize path
+//!   because Chrome's Ozone assumes the compositor respects the
+//!   buffer-to-output geometry implied by its `xdg_toplevel` size.
+//!
+//! Wire-format note: source coords are `wl_fixed_t` (24.8). The
+//! `wayland-protocols` bindings hand them to us as pre-converted
+//! `f64`, so no manual shift.
 
 use std::sync::{Arc, Mutex};
 
@@ -94,20 +105,46 @@ impl Dispatch<WpViewport, ViewportData> for State {
                 } else {
                     None
                 };
+                tracing::debug!(
+                    surface = ?data.surface.id(),
+                    width, height,
+                    dst = ?dst,
+                    "viewport.set_destination"
+                );
                 if let Some(sd_arc) =
                     data.surface.data::<Arc<Mutex<SurfaceData>>>()
                 {
                     sd_arc.lock().unwrap().viewport_dst = dst;
                 }
             }
-            wp_viewport::Request::SetSource { .. } => {
-                // Source cropping isn't honored yet — see module doc.
+            wp_viewport::Request::SetSource { x, y, width, height } => {
+                tracing::debug!(
+                    surface = ?data.surface.id(),
+                    x, y, width, height,
+                    "viewport.set_source"
+                );
+                // -1 on any field per spec means "unset" (clear the
+                // source). A valid rect has all four >= 0 with w, h
+                // strictly positive; otherwise bail and clear.
+                let src = if x >= 0.0 && y >= 0.0 && width > 0.0 && height > 0.0
+                {
+                    Some((x, y, width, height))
+                } else {
+                    None
+                };
+                if let Some(sd_arc) =
+                    data.surface.data::<Arc<Mutex<SurfaceData>>>()
+                {
+                    sd_arc.lock().unwrap().viewport_src = src;
+                }
             }
             wp_viewport::Request::Destroy => {
                 if let Some(sd_arc) =
                     data.surface.data::<Arc<Mutex<SurfaceData>>>()
                 {
-                    sd_arc.lock().unwrap().viewport_dst = None;
+                    let mut sd = sd_arc.lock().unwrap();
+                    sd.viewport_dst = None;
+                    sd.viewport_src = None;
                 }
             }
             _ => {}

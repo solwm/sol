@@ -308,16 +308,27 @@ impl DrmPresenter {
                 active_program = Some(prog_id);
             }
 
-            // Output rect always uses the buffer's intrinsic size.
-            // The compositor has already positioned this element at
-            // the right tile/layer rect via `elem.x`/`elem.y`;
-            // stretching the buffer to something else (the old
-            // viewport.set_destination path) broke browsers whose
-            // viewport dst ≠ tile rect during moves.
+            // Output rect size = dst_width/height when set (the tile
+            // / layer rect the compositor assigned), else fall back
+            // to the buffer's intrinsic size (subsurfaces / cursor).
+            // UV in the vertex shader samples whatever sub-rect the
+            // client declared via wp_viewport.set_source, so the
+            // output quad can be bigger, smaller, or cropped
+            // relative to the actual buffer.
+            let dst_w = if elem.dst_width > 0 {
+                elem.dst_width
+            } else {
+                elem.width
+            };
+            let dst_h = if elem.dst_height > 0 {
+                elem.dst_height
+            } else {
+                elem.height
+            };
             let x0 = (elem.x as f32 / w as f32) * 2.0 - 1.0;
-            let y0 = 1.0 - ((elem.y + elem.height) as f32 / h as f32) * 2.0;
-            let rw = elem.width as f32 / w as f32 * 2.0;
-            let rh = elem.height as f32 / h as f32 * 2.0;
+            let y0 = 1.0 - ((elem.y + dst_h) as f32 / h as f32) * 2.0;
+            let rw = dst_w as f32 / w as f32 * 2.0;
+            let rh = dst_h as f32 / h as f32 * 2.0;
             let opaque = match &elem.content {
                 SceneContent::Shm {
                     format: PixelFormat::Argb8888,
@@ -340,6 +351,16 @@ impl DrmPresenter {
             unsafe {
                 gl.bind_texture(entry.target, Some(entry.tex));
                 gl.uniform_4_f32(Some(&prog.u_rect), x0, y0, rw, rh);
+                // UV sub-rect: set by scene_from_buffers from the
+                // surface's wp_viewport.set_source (or (0,0,1,1) for
+                // the full texture).
+                gl.uniform_4_f32(
+                    Some(&prog.u_uv),
+                    elem.uv_x,
+                    elem.uv_y,
+                    elem.uv_w,
+                    elem.uv_h,
+                );
                 gl.uniform_1_f32(Some(&prog.u_opaque), opaque);
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_texture(entry.target, None);

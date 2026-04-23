@@ -27,6 +27,7 @@ mod compositor;
 mod config;
 mod cursor;
 mod data_device;
+mod fractional_scale;
 mod input;
 mod layer_shell;
 mod linux_dmabuf;
@@ -48,6 +49,7 @@ use input::{InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
@@ -240,12 +242,8 @@ pub struct Globals {
     pub data_device_manager: GlobalId,
     pub xdg_output_manager: GlobalId,
     pub presentation: GlobalId,
-    /// `wp_viewporter` global — advertised only when we need it.
-    /// Temporarily `None` to test whether Chrome's move-glitch is
-    /// triggered by Chrome taking a different render path when it
-    /// sees the global, even though our implementation no longer
-    /// uses the viewport destination for anything.
-    pub viewporter: Option<GlobalId>,
+    pub viewporter: GlobalId,
+    pub fractional_scale: GlobalId,
 }
 
 impl State {
@@ -576,14 +574,15 @@ fn send_pending_configures(state: &mut State) {
 /// it should be drawn at; callers keep the buffers alive for the
 /// duration of rendering.
 /// Entry passed from `collect_scene` to `scene_from_buffers`. Carries
-/// the buffer to draw, its output top-left, and an optional
-/// `viewport.set_destination` override — used by wallpaper daemons
-/// to attach a small image and ask the compositor to scale it up.
-/// None means "render 1:1 at source size."
+/// the buffer to draw, the on-screen rect to draw it in (compositor's
+/// chosen position and size), and an optional `wp_viewport.set_source`
+/// crop rect in buffer coordinates (x, y, w, h). When the source rect
+/// is Some, the presenter samples only that sub-rect of the buffer;
+/// otherwise the full texture is used.
 type PlacedBuffer = (
     wayland_server::protocol::wl_buffer::WlBuffer,
     Rect,
-    Option<(i32, i32)>,
+    Option<(f64, f64, f64, f64)>,
 );
 
 fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
@@ -601,8 +600,8 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     // 1. Background + Bottom layer surfaces.
     for ml in &layers {
         if matches!(ml.layer, Layer::Background | Layer::Bottom) {
-            let vdst = surface_viewport_dst(&ml.surface);
-            out.push((ml.buffer.clone(), ml.rect, vdst));
+            let vsrc = surface_viewport_src(&ml.surface);
+            out.push((ml.buffer.clone(), ml.rect, vsrc));
             emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
         }
     }
@@ -624,18 +623,20 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let (buf_opt, vdst) = {
+        let (buf_opt, vsrc, vdst) = {
             let sd = sd_arc.lock().unwrap();
             if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
                 continue;
             }
             (
                 sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok()),
+                sd.viewport_src,
                 sd.viewport_dst,
             )
         };
+        let _ = vdst;
         if let Some(buf) = buf_opt {
-            out.push((buf, win.render_rect, vdst));
+            out.push((buf, win.render_rect, vsrc));
         }
         emit_subsurface_tree(&mut out, &surface, win.render_rect.x, win.render_rect.y);
     }
@@ -643,8 +644,8 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     // 3. Top + Overlay layer surfaces.
     for ml in &layers {
         if matches!(ml.layer, Layer::Top | Layer::Overlay) {
-            let vdst = surface_viewport_dst(&ml.surface);
-            out.push((ml.buffer.clone(), ml.rect, vdst));
+            let vsrc = surface_viewport_src(&ml.surface);
+            out.push((ml.buffer.clone(), ml.rect, vsrc));
             emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
         }
     }
@@ -652,11 +653,11 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     out
 }
 
-fn surface_viewport_dst(s: &WlSurface) -> Option<(i32, i32)> {
+fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
     s.data::<Arc<Mutex<SurfaceData>>>()?
         .lock()
         .ok()?
-        .viewport_dst
+        .viewport_src
 }
 
 /// Walk a surface's subsurface_children recursively, pushing each mapped
@@ -688,16 +689,18 @@ fn emit_subsurface_tree(
         let Some(child_sd_arc) = child.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let (buf_opt, child_x, child_y, vdst) = {
+        let (buf_opt, child_x, child_y, vsrc) = {
             let sd = child_sd_arc.lock().unwrap();
             let (ox, oy) = sd.subsurface_offset;
             let buf = sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok());
-            (buf, parent_x + ox, parent_y + oy, sd.viewport_dst)
+            (buf, parent_x + ox, parent_y + oy, sd.viewport_src)
         };
         if let Some(buf) = buf_opt {
-            // rect.w/h aren't used when rendering — scene_from_buffers
-            // pulls the intrinsic size from the buffer's own metadata
-            // (SHM width/height, dmabuf width/height). Only x/y matters.
+            // Subsurfaces: the output rect width/height is whatever
+            // the buffer's intrinsic size is (w=0,h=0 signals "use
+            // source size" downstream in scene_from_buffers), and
+            // the UV rect either reflects the client's viewport
+            // source crop or (0,0,1,1) when absent.
             out.push((
                 buf,
                 Rect {
@@ -706,7 +709,7 @@ fn emit_subsurface_tree(
                     w: 0,
                     h: 0,
                 },
-                vdst,
+                vsrc,
             ));
         }
         emit_subsurface_tree(out, &child, child_x, child_y);
@@ -718,17 +721,24 @@ fn scene_from_buffers<'a>(
     cursor: &'a Cursor,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
-    for (buf, rect, _vdst) in placed {
+    for (buf, rect, vsrc) in placed {
         if let Some(bd) = buf.data::<shm::BufferData>() {
             let Some(bytes) = bd.bytes() else { continue };
             let Some(format) = bd.pixel_format() else { continue };
             let key = (bd as *const shm::BufferData) as usize as u64;
+            let (ux, uy, uw, uh) = compute_uv(*vsrc, bd.width, bd.height);
             scene.elements.push(SceneElement {
                 buffer_key: key,
                 width: bd.width,
                 height: bd.height,
+                dst_width: rect.w,
+                dst_height: rect.h,
                 x: rect.x,
                 y: rect.y,
+                uv_x: ux,
+                uv_y: uy,
+                uv_w: uw,
+                uv_h: uh,
                 content: SceneContent::Shm {
                     pixels: bytes,
                     stride: bd.stride,
@@ -740,12 +750,19 @@ fn scene_from_buffers<'a>(
             // when we care about video, not for alacritty/terminals.
             let Some(p0) = db.planes.first() else { continue };
             let key = (db as *const linux_dmabuf::DmabufBuffer) as usize as u64;
+            let (ux, uy, uw, uh) = compute_uv(*vsrc, db.width, db.height);
             scene.elements.push(SceneElement {
                 buffer_key: key,
                 width: db.width,
                 height: db.height,
+                dst_width: rect.w,
+                dst_height: rect.h,
                 x: rect.x,
                 y: rect.y,
+                uv_x: ux,
+                uv_y: uy,
+                uv_w: uw,
+                uv_h: uh,
                 content: SceneContent::Dmabuf {
                     fd: p0.fd.as_raw_fd(),
                     fourcc: db.format,
@@ -756,14 +773,21 @@ fn scene_from_buffers<'a>(
             });
         }
     }
-    // Cursor last so it always draws on top.
+    // Cursor last so it always draws on top. dst_* = 0 forces the
+    // presenter to render at the sprite's intrinsic size.
     if cursor.visible {
         scene.elements.push(SceneElement {
             buffer_key: CURSOR_SCENE_KEY,
             width: cursor.width,
             height: cursor.height,
+            dst_width: 0,
+            dst_height: 0,
             x: cursor.pos_x as i32 - cursor.hot_x,
             y: cursor.pos_y as i32 - cursor.hot_y,
+            uv_x: 0.0,
+            uv_y: 0.0,
+            uv_w: 1.0,
+            uv_h: 1.0,
             content: SceneContent::Shm {
                 pixels: &cursor.pixels,
                 stride: cursor.width * 4,
@@ -772,6 +796,31 @@ fn scene_from_buffers<'a>(
         });
     }
     scene
+}
+
+/// Translate a `wp_viewport.set_source` rect (in buffer coords) plus
+/// the buffer's intrinsic dimensions into normalized `[0, 1]` UVs
+/// for the sampler. `None` means "sample the whole texture."
+/// Clamped into range so a client that posts a slightly-out-of-bounds
+/// source doesn't blow up the shader; protocol-level clamping should
+/// also happen in the viewporter dispatch precommit check.
+fn compute_uv(
+    src: Option<(f64, f64, f64, f64)>,
+    buf_w: i32,
+    buf_h: i32,
+) -> (f32, f32, f32, f32) {
+    match src {
+        Some((x, y, w, h)) if buf_w > 0 && buf_h > 0 => {
+            let bw = buf_w as f64;
+            let bh = buf_h as f64;
+            let ux = (x / bw).clamp(0.0, 1.0) as f32;
+            let uy = (y / bh).clamp(0.0, 1.0) as f32;
+            let uw = (w / bw).clamp(0.0, 1.0) as f32;
+            let uh = (h / bh).clamp(0.0, 1.0) as f32;
+            (ux, uy, uw, uh)
+        }
+        _ => (0.0, 0.0, 1.0, 1.0),
+    }
 }
 
 /// Stable key the DRM renderer uses to avoid re-uploading the cursor
@@ -802,20 +851,39 @@ fn reconcile_render_rects(state: &mut State) {
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let buf_dims = {
+        let logical = {
             let sd = sd_arc.lock().unwrap();
-            sd.current
-                .buffer
-                .as_ref()
-                .and_then(|w| w.upgrade().ok())
-                .and_then(|b| surface_buffer_dims(&b))
+            surface_logical_size(&sd)
         };
-        if let Some((bw, bh)) = buf_dims {
-            if bw == win.rect.w && bh == win.rect.h {
+        if let Some((lw, lh)) = logical {
+            if lw == win.rect.w && lh == win.rect.h {
                 win.render_rect = win.rect;
             }
         }
     }
+}
+
+/// A surface's logical size per the Wayland protocol layering:
+///
+/// 1. `wp_viewport.set_destination` — the client explicitly declared it.
+/// 2. `wp_viewport.set_source` — implied from the source-rect size.
+/// 3. Buffer intrinsic size — the legacy path, still the common case.
+///
+/// Chrome exploits path (2) when it's cheaper to shrink the
+/// displayed window: instead of reallocating a smaller buffer, it
+/// keeps the big buffer and crops with `set_source`. If we compared
+/// raw buffer dims to the target rect, Chrome's resize would never
+/// look "caught up" and `render_rect` would get stuck at the old
+/// position, which is exactly the ~1-second hang we were debugging.
+fn surface_logical_size(sd: &compositor::SurfaceData) -> Option<(i32, i32)> {
+    if let Some((w, h)) = sd.viewport_dst {
+        return Some((w, h));
+    }
+    if let Some((_, _, w, h)) = sd.viewport_src {
+        return Some((w as i32, h as i32));
+    }
+    let buf = sd.current.buffer.as_ref()?.upgrade().ok()?;
+    surface_buffer_dims(&buf)
 }
 
 impl PartialEq for Rect {
@@ -1154,7 +1222,15 @@ fn setup_event_loop(
             presentation_time::PRESENTATION_VERSION,
             (),
         ),
-        viewporter: None, // not advertising while we test the Chrome-move glitch
+        viewporter: dh.create_global::<State, WpViewporter, ()>(
+            viewporter::VIEWPORTER_VERSION,
+            (),
+        ),
+        fractional_scale: dh
+            .create_global::<State, WpFractionalScaleManagerV1, ()>(
+                fractional_scale::FRACTIONAL_SCALE_VERSION,
+                (),
+            ),
     };
     tracing::info!(?globals, "advertised globals");
 

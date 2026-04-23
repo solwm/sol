@@ -34,13 +34,16 @@ pub enum SceneContent<'a> {
 
 /// One thing to draw on screen: a rectangle of pixels at a position. Produced
 /// by the Wayland server on each render tick and consumed by whichever
-/// backend is mounted (software PNG or DRM+GL). Dimensions are always
-/// the buffer's intrinsic size — no stretching. `wp_viewport`'s
-/// `set_destination` is accepted for protocol compatibility (awww
-/// mandatorily unwraps the global) but doesn't drive output
-/// dimensions, since that would override the compositor's own
-/// placement (tile rect / layer-shell anchor) and was what made
-/// browsers glitch during moves.
+/// backend is mounted (software PNG or DRM+GL).
+///
+/// `width`/`height` are the draw-quad size on screen — the
+/// compositor's chosen output rect (tile rect for toplevels,
+/// anchor rect for layer surfaces). `uv_*` describe the sub-rect
+/// of the texture to sample from, in normalized `[0, 1]` coords;
+/// populated from `wp_viewport.set_source` when the client uses
+/// it, else the full texture `(0, 0, 1, 1)`. `wp_viewport`'s
+/// destination is the surface's *logical* size and is **not**
+/// fed here — it never drives output dimensions.
 pub struct SceneElement<'a> {
     /// Stable-across-frames identifier for this texture. Backends can use
     /// this as a cache key so a reused wl_buffer keeps its GPU texture.
@@ -50,6 +53,20 @@ pub struct SceneElement<'a> {
     /// Top-left in screen coordinates.
     pub x: i32,
     pub y: i32,
+    /// Output rect size (the compositor's chosen on-screen dimensions).
+    /// When `0`, fall back to `width`/`height` (source) — the
+    /// sentinel for subsurfaces / cursor that always render 1:1
+    /// at buffer size. Toplevels and layer-shell surfaces pass
+    /// the tile / anchor rect so a buffer larger or smaller than
+    /// the output rect (common when `wp_viewport.set_source` is
+    /// used to crop a buffer down to a sub-rect) gets stretched
+    /// or cropped via UV into the intended quad.
+    pub dst_width: i32,
+    pub dst_height: i32,
+    pub uv_x: f32,
+    pub uv_y: f32,
+    pub uv_w: f32,
+    pub uv_h: f32,
     pub content: SceneContent<'a>,
 }
 
