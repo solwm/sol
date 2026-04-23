@@ -37,6 +37,7 @@ mod seat;
 mod session;
 mod shm;
 mod subcompositor;
+mod viewporter;
 mod xdg_decoration;
 mod xdg_output;
 mod xdg_shell;
@@ -48,6 +49,7 @@ use render::Canvas;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
+use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
 use wayland_server::protocol::{
@@ -238,6 +240,7 @@ pub struct Globals {
     pub data_device_manager: GlobalId,
     pub xdg_output_manager: GlobalId,
     pub presentation: GlobalId,
+    pub viewporter: GlobalId,
 }
 
 impl State {
@@ -567,10 +570,19 @@ fn send_pending_configures(state: &mut State) {
 /// `scene_from_buffers`. Each entry pairs a `WlBuffer` with the rect
 /// it should be drawn at; callers keep the buffers alive for the
 /// duration of rendering.
-fn collect_scene(
-    state: &State,
-) -> Vec<(wayland_server::protocol::wl_buffer::WlBuffer, Rect)> {
-    let mut out = Vec::new();
+/// Entry passed from `collect_scene` to `scene_from_buffers`. Carries
+/// the buffer to draw, its output top-left, and an optional
+/// `viewport.set_destination` override — used by wallpaper daemons
+/// to attach a small image and ask the compositor to scale it up.
+/// None means "render 1:1 at source size."
+type PlacedBuffer = (
+    wayland_server::protocol::wl_buffer::WlBuffer,
+    Rect,
+    Option<(i32, i32)>,
+);
+
+fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
+    let mut out: Vec<PlacedBuffer> = Vec::new();
     let screen = Rect {
         x: 0,
         y: 0,
@@ -584,7 +596,8 @@ fn collect_scene(
     // 1. Background + Bottom layer surfaces.
     for ml in &layers {
         if matches!(ml.layer, Layer::Background | Layer::Bottom) {
-            out.push((ml.buffer.clone(), ml.rect));
+            let vdst = surface_viewport_dst(&ml.surface);
+            out.push((ml.buffer.clone(), ml.rect, vdst));
             emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
         }
     }
@@ -606,15 +619,18 @@ fn collect_scene(
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let buf_opt = {
+        let (buf_opt, vdst) = {
             let sd = sd_arc.lock().unwrap();
             if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
                 continue;
             }
-            sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok())
+            (
+                sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok()),
+                sd.viewport_dst,
+            )
         };
         if let Some(buf) = buf_opt {
-            out.push((buf, win.render_rect));
+            out.push((buf, win.render_rect, vdst));
         }
         emit_subsurface_tree(&mut out, &surface, win.render_rect.x, win.render_rect.y);
     }
@@ -622,12 +638,20 @@ fn collect_scene(
     // 3. Top + Overlay layer surfaces.
     for ml in &layers {
         if matches!(ml.layer, Layer::Top | Layer::Overlay) {
-            out.push((ml.buffer.clone(), ml.rect));
+            let vdst = surface_viewport_dst(&ml.surface);
+            out.push((ml.buffer.clone(), ml.rect, vdst));
             emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
         }
     }
 
     out
+}
+
+fn surface_viewport_dst(s: &WlSurface) -> Option<(i32, i32)> {
+    s.data::<Arc<Mutex<SurfaceData>>>()?
+        .lock()
+        .ok()?
+        .viewport_dst
 }
 
 /// Walk a surface's subsurface_children recursively, pushing each mapped
@@ -637,7 +661,7 @@ fn collect_scene(
 /// Stacking follows registration order in `subsurface_children`;
 /// `place_above` / `place_below` aren't implemented.
 fn emit_subsurface_tree(
-    out: &mut Vec<(wayland_server::protocol::wl_buffer::WlBuffer, Rect)>,
+    out: &mut Vec<PlacedBuffer>,
     parent: &WlSurface,
     parent_x: i32,
     parent_y: i32,
@@ -659,11 +683,11 @@ fn emit_subsurface_tree(
         let Some(child_sd_arc) = child.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let (buf_opt, child_x, child_y) = {
+        let (buf_opt, child_x, child_y, vdst) = {
             let sd = child_sd_arc.lock().unwrap();
             let (ox, oy) = sd.subsurface_offset;
             let buf = sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok());
-            (buf, parent_x + ox, parent_y + oy)
+            (buf, parent_x + ox, parent_y + oy, sd.viewport_dst)
         };
         if let Some(buf) = buf_opt {
             // rect.w/h aren't used when rendering — scene_from_buffers
@@ -677,6 +701,7 @@ fn emit_subsurface_tree(
                     w: 0,
                     h: 0,
                 },
+                vdst,
             ));
         }
         emit_subsurface_tree(out, &child, child_x, child_y);
@@ -684,11 +709,12 @@ fn emit_subsurface_tree(
 }
 
 fn scene_from_buffers<'a>(
-    placed: &'a [(wayland_server::protocol::wl_buffer::WlBuffer, Rect)],
+    placed: &'a [PlacedBuffer],
     cursor: &'a Cursor,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
-    for (buf, rect) in placed {
+    for (buf, rect, vdst) in placed {
+        let (dw, dh) = vdst.unwrap_or((0, 0));
         if let Some(bd) = buf.data::<shm::BufferData>() {
             let Some(bytes) = bd.bytes() else { continue };
             let Some(format) = bd.pixel_format() else { continue };
@@ -697,6 +723,8 @@ fn scene_from_buffers<'a>(
                 buffer_key: key,
                 width: bd.width,
                 height: bd.height,
+                dst_width: dw,
+                dst_height: dh,
                 x: rect.x,
                 y: rect.y,
                 content: SceneContent::Shm {
@@ -714,6 +742,8 @@ fn scene_from_buffers<'a>(
                 buffer_key: key,
                 width: db.width,
                 height: db.height,
+                dst_width: dw,
+                dst_height: dh,
                 x: rect.x,
                 y: rect.y,
                 content: SceneContent::Dmabuf {
@@ -726,12 +756,15 @@ fn scene_from_buffers<'a>(
             });
         }
     }
-    // Cursor last so it always draws on top.
+    // Cursor last so it always draws on top. Fixed-size sprite —
+    // never stretched.
     if cursor.visible {
         scene.elements.push(SceneElement {
             buffer_key: CURSOR_SCENE_KEY,
             width: cursor.width,
             height: cursor.height,
+            dst_width: 0,
+            dst_height: 0,
             x: cursor.pos_x as i32 - cursor.hot_x,
             y: cursor.pos_y as i32 - cursor.hot_y,
             content: SceneContent::Shm {
@@ -1122,6 +1155,10 @@ fn setup_event_loop(
         ),
         presentation: dh.create_global::<State, WpPresentation, ()>(
             presentation_time::PRESENTATION_VERSION,
+            (),
+        ),
+        viewporter: dh.create_global::<State, WpViewporter, ()>(
+            viewporter::VIEWPORTER_VERSION,
             (),
         ),
     };

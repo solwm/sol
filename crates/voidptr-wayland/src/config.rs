@@ -365,13 +365,67 @@ fn parse_color(s: &str) -> Result<[f32; 4]> {
 }
 
 fn parse_exec(rhs: &str) -> Result<ExecCommand> {
-    let mut words = rhs.split_whitespace();
-    let program = words
+    let mut tokens = tokenize_command(rhs)?.into_iter();
+    let program = tokens
         .next()
-        .context("`exec-once` needs a program name")?
-        .to_string();
-    let args = words.map(|s| s.to_string()).collect();
+        .context("`exec-once` needs a program name")?;
+    let args = tokens.collect();
     Ok(ExecCommand { program, args })
+}
+
+/// Shell-ish tokenizer for `exec` / `exec-once` argument lists.
+/// Splits on whitespace but treats matching single or double quotes
+/// as a group boundary, so things like
+///
+///   exec-once = sh -c "swww-daemon & exec ~/scripts/wp.sh"
+///
+/// work as a single three-argument command (sh, -c, <rest>). No
+/// escape handling, no variable expansion — just quote grouping,
+/// which is what the 90%-case `sh -c "..."` pattern wants. A
+/// mismatched quote is an error so typos fail loud instead of
+/// swallowing the rest of the line.
+fn tokenize_command(s: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut has_content = false;
+    for c in s.chars() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                cur.push(c);
+            }
+        } else if in_double {
+            if c == '"' {
+                in_double = false;
+            } else {
+                cur.push(c);
+            }
+        } else if c == '\'' {
+            in_single = true;
+            has_content = true;
+        } else if c == '"' {
+            in_double = true;
+            has_content = true;
+        } else if c.is_whitespace() {
+            if has_content {
+                tokens.push(std::mem::take(&mut cur));
+                has_content = false;
+            }
+        } else {
+            cur.push(c);
+            has_content = true;
+        }
+    }
+    if in_single || in_double {
+        bail!("unterminated quoted string in exec args");
+    }
+    if has_content {
+        tokens.push(cur);
+    }
+    Ok(tokens)
 }
 
 fn parse_remap(rhs: &str) -> Result<Remap> {

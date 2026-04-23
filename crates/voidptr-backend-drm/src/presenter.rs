@@ -308,16 +308,26 @@ impl DrmPresenter {
                 active_program = Some(prog_id);
             }
 
-            // No stretching: output size matches source (buffer) size.
-            // Scene_from_buffers pairs each buffer with a position rect
-            // that is held back from the layout target until the client
-            // has committed a buffer matching the target — so by the
-            // time a buffer lands here, its dimensions equal the tile
-            // it's being rendered into.
+            // Output rect uses elem.dst_* when non-zero (the
+            // wp_viewport set_destination path: clients attach a
+            // smaller buffer and ask us to stretch it on scanout).
+            // Zero means "render 1:1 at source size," the common case
+            // for tiles that already match their buffer thanks to
+            // render_rect reconciliation.
+            let dst_w = if elem.dst_width > 0 {
+                elem.dst_width
+            } else {
+                elem.width
+            };
+            let dst_h = if elem.dst_height > 0 {
+                elem.dst_height
+            } else {
+                elem.height
+            };
             let x0 = (elem.x as f32 / w as f32) * 2.0 - 1.0;
-            let y0 = 1.0 - ((elem.y + elem.height) as f32 / h as f32) * 2.0;
-            let rw = elem.width as f32 / w as f32 * 2.0;
-            let rh = elem.height as f32 / h as f32 * 2.0;
+            let y0 = 1.0 - ((elem.y + dst_h) as f32 / h as f32) * 2.0;
+            let rw = dst_w as f32 / w as f32 * 2.0;
+            let rh = dst_h as f32 / h as f32 * 2.0;
             let opaque = match &elem.content {
                 SceneContent::Shm {
                     format: PixelFormat::Argb8888,

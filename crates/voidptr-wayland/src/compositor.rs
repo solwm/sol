@@ -98,6 +98,13 @@ pub struct SurfaceData {
     /// implemented yet so the stacking matches the client's
     /// attachment sequence.
     pub subsurface_children: Vec<Weak<WlSurface>>,
+    /// Destination size declared via `wp_viewport.set_destination`,
+    /// in surface-local pixels. When Some, the scene walker stretches
+    /// this surface's buffer to (w, h) on output — the canonical use
+    /// case is a wallpaper daemon that keeps a small source image in
+    /// memory and asks the compositor to scale it to the output
+    /// size.
+    pub viewport_dst: Option<(i32, i32)>,
 }
 
 impl GlobalDispatch<WlCompositor, ()> for State {
