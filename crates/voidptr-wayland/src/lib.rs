@@ -45,7 +45,7 @@ mod xdg_shell;
 mod xkb;
 
 use compositor::{SurfaceData, SurfaceRole};
-use input::{InputEvent, InputState};
+use input::{AxisSource, InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
@@ -65,7 +65,7 @@ use xkb::KeymapState;
 const COMPOSITOR_VERSION: u32 = 6;
 const SHM_VERSION: u32 = 1;
 const OUTPUT_VERSION: u32 = 4;
-const SEAT_VERSION: u32 = 7;
+const SEAT_VERSION: u32 = 8;
 const XDG_WM_BASE_VERSION: u32 = 5;
 
 /// Screen-space rectangle assigned to a mapped window by the layout.
@@ -1630,6 +1630,15 @@ fn apply_input(state: &mut State, ev: InputEvent) {
         InputEvent::PointerButton { button, pressed } => {
             send_pointer_button(state, button, pressed);
         }
+        InputEvent::PointerAxis {
+            source,
+            v_value,
+            h_value,
+            v120_v,
+            v120_h,
+        } => {
+            send_pointer_axis(state, source, v_value, h_value, v120_v, v120_h);
+        }
         InputEvent::Key { keycode, pressed } => {
             // Apply user-declared scancode remaps before anything else
             // so modifier tracking, config bindings, and the forwarded
@@ -2041,6 +2050,90 @@ fn update_pointer_focus_and_motion(state: &mut State) {
 fn pointer_frame(p: &WlPointer) {
     if p.version() >= 5 {
         p.frame();
+    }
+}
+
+/// Forward a libinput scroll event to the focused client as a
+/// wl_pointer axis frame. Scroll always targets the surface currently
+/// under the cursor (`pointer_focus`) — it does not change focus.
+///
+/// Wire format:
+///   - v5+: axis_source(source)
+///   - for each axis with data:
+///       * if the value is 0 and the source is a kinetic one (Finger /
+///         Continuous), emit axis_stop — this is libinput's contract
+///         for end-of-gesture and clients use it to trigger kinetic
+///         deceleration
+///       * otherwise emit axis(time, axis, value)
+///   - wheel sources additionally emit high-res step info:
+///       * v8+: axis_value120(axis, v120) — preferred
+///       * v5..=v7: axis_discrete(axis, v120 / 120) — best-effort
+///         fallback; loses sub-click resolution
+///   - v5+: frame() to commit the group
+fn send_pointer_axis(
+    state: &mut State,
+    source: AxisSource,
+    v_value: Option<f64>,
+    h_value: Option<f64>,
+    v120_v: Option<f64>,
+    v120_h: Option<f64>,
+) {
+    let Some(focus) = state.pointer_focus.clone() else { return };
+    if !focus.is_alive() {
+        return;
+    }
+    let time = state.elapsed_ms();
+    let wl_source = match source {
+        AxisSource::Wheel => wl_pointer::AxisSource::Wheel,
+        AxisSource::Finger => wl_pointer::AxisSource::Finger,
+        AxisSource::Continuous => wl_pointer::AxisSource::Continuous,
+    };
+    let kinetic = matches!(source, AxisSource::Finger | AxisSource::Continuous);
+    for p in &state.pointers {
+        if !same_client(p, &focus) {
+            continue;
+        }
+        let v = p.version();
+        if v >= 5 {
+            p.axis_source(wl_source);
+        }
+        if let Some(val) = v_value {
+            if val == 0.0 && kinetic && v >= 5 {
+                p.axis_stop(time, wl_pointer::Axis::VerticalScroll);
+            } else {
+                p.axis(time, wl_pointer::Axis::VerticalScroll, val);
+            }
+        }
+        if let Some(val) = h_value {
+            if val == 0.0 && kinetic && v >= 5 {
+                p.axis_stop(time, wl_pointer::Axis::HorizontalScroll);
+            } else {
+                p.axis(time, wl_pointer::Axis::HorizontalScroll, val);
+            }
+        }
+        if matches!(source, AxisSource::Wheel) {
+            if let Some(step) = v120_v {
+                if v >= 8 {
+                    p.axis_value120(wl_pointer::Axis::VerticalScroll, step as i32);
+                } else if v >= 5 {
+                    let discrete = (step / 120.0).round() as i32;
+                    if discrete != 0 {
+                        p.axis_discrete(wl_pointer::Axis::VerticalScroll, discrete);
+                    }
+                }
+            }
+            if let Some(step) = v120_h {
+                if v >= 8 {
+                    p.axis_value120(wl_pointer::Axis::HorizontalScroll, step as i32);
+                } else if v >= 5 {
+                    let discrete = (step / 120.0).round() as i32;
+                    if discrete != 0 {
+                        p.axis_discrete(wl_pointer::Axis::HorizontalScroll, discrete);
+                    }
+                }
+            }
+        }
+        pointer_frame(p);
     }
 }
 

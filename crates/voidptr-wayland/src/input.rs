@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use input::event::Event as LiEvent;
 use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
-use input::event::pointer::{ButtonState, PointerEvent};
+use input::event::pointer::{Axis, ButtonState, PointerEvent, PointerScrollEvent};
 use input::{Libinput, LibinputInterface};
 use libseat::Device as SeatDevice;
 
@@ -28,7 +28,28 @@ pub enum InputEvent {
     PointerMotion { dx: f64, dy: f64 },
     PointerMotionAbsolute { x_mm: f64, y_mm: f64 },
     PointerButton { button: u32, pressed: bool },
+    /// Scroll from a mouse wheel, trackpad, or other continuous source.
+    /// Each axis is `Some(value)` only if the libinput event carried data
+    /// for it. `v120_*` is populated only for `Wheel` — it's the high-res
+    /// discrete step count, 120 units per logical click, per the Windows
+    /// Vista wheel convention libinput borrowed. Finger sources emit a
+    /// terminating event with value 0, which we forward as `axis_stop`
+    /// on the Wayland side.
+    PointerAxis {
+        source: AxisSource,
+        v_value: Option<f64>,
+        h_value: Option<f64>,
+        v120_v: Option<f64>,
+        v120_h: Option<f64>,
+    },
     Key { keycode: u32, pressed: bool },
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AxisSource {
+    Wheel,
+    Finger,
+    Continuous,
 }
 
 /// libinput's open_restricted / close_restricted glue. Every call goes
@@ -144,6 +165,41 @@ impl InputState {
                         button: b.button(),
                         pressed: matches!(b.button_state(), ButtonState::Pressed),
                     }),
+                    PointerEvent::ScrollWheel(s) => {
+                        let v = s.has_axis(Axis::Vertical).then(|| s.scroll_value(Axis::Vertical));
+                        let h = s.has_axis(Axis::Horizontal).then(|| s.scroll_value(Axis::Horizontal));
+                        let v120_v = s.has_axis(Axis::Vertical).then(|| s.scroll_value_v120(Axis::Vertical));
+                        let v120_h = s.has_axis(Axis::Horizontal).then(|| s.scroll_value_v120(Axis::Horizontal));
+                        out.push(InputEvent::PointerAxis {
+                            source: AxisSource::Wheel,
+                            v_value: v,
+                            h_value: h,
+                            v120_v,
+                            v120_h,
+                        });
+                    }
+                    PointerEvent::ScrollFinger(s) => {
+                        let v = s.has_axis(Axis::Vertical).then(|| s.scroll_value(Axis::Vertical));
+                        let h = s.has_axis(Axis::Horizontal).then(|| s.scroll_value(Axis::Horizontal));
+                        out.push(InputEvent::PointerAxis {
+                            source: AxisSource::Finger,
+                            v_value: v,
+                            h_value: h,
+                            v120_v: None,
+                            v120_h: None,
+                        });
+                    }
+                    PointerEvent::ScrollContinuous(s) => {
+                        let v = s.has_axis(Axis::Vertical).then(|| s.scroll_value(Axis::Vertical));
+                        let h = s.has_axis(Axis::Horizontal).then(|| s.scroll_value(Axis::Horizontal));
+                        out.push(InputEvent::PointerAxis {
+                            source: AxisSource::Continuous,
+                            v_value: v,
+                            h_value: h,
+                            v120_v: None,
+                            v120_h: None,
+                        });
+                    }
                     _ => {}
                 },
                 LiEvent::Keyboard(k) => {
