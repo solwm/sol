@@ -13,7 +13,7 @@ impl GlobalDispatch<WlOutput, ()> for State {
     fn bind(
         state: &mut Self,
         _dh: &DisplayHandle,
-        _client: &Client,
+        client: &Client,
         resource: New<WlOutput>,
         _gd: &(),
         init: &mut DataInit<'_, Self>,
@@ -53,6 +53,14 @@ impl GlobalDispatch<WlOutput, ()> for State {
             o.done();
         }
         tracing::info!(id = ?o.id(), width = w, height = h, "bind wl_output");
+
+        // Track live outputs so `ext_workspace_v1` can emit
+        // `output_enter` on the workspace group. Prune dead
+        // references first to keep the list bounded across
+        // reconnects.
+        state.outputs.retain(|existing| existing.is_alive());
+        state.outputs.push(o.clone());
+        crate::ext_workspace::notify_output_bound(state, client, &o);
     }
 }
 

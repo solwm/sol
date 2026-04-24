@@ -38,8 +38,9 @@
 //! focused tile with its neighbor; `toggle_zoom` expands the
 //! focused tile to the full usable area (outer gaps respected)
 //! or restores the master-stack layout; `close_window` asks the
-//! focused toplevel to close via `xdg_toplevel.close`. Future
-//! directives (workspace switching, …) plug in at `parse_action`.
+//! focused toplevel to close via `xdg_toplevel.close`;
+//! `workspace N` switches to workspace N (1-based); `move_to_workspace
+//! N` sends the focused window to workspace N without following it.
 //!
 //! `remap` rewrites at the evdev scancode layer, so it's invisible to
 //! both bindings and clients: the remapped code is what xkb sees and
@@ -144,6 +145,16 @@ pub enum Action {
     /// may prompt to save, etc.). If a client ignores the request
     /// there's no escalation — we're not a window killer.
     CloseWindow,
+    /// Switch to the numbered workspace. Workspaces are purely a
+    /// compositor concept — clients don't know about them. Toplevels
+    /// on the active workspace render and receive input; others stay
+    /// mapped but are skipped by the scene walker.
+    Workspace(u32),
+    /// Move the focused toplevel to the numbered workspace. Focus
+    /// falls back to the topmost remaining window on the current
+    /// workspace; the moved window keeps whatever rect it had until
+    /// the target workspace becomes active and re-lays it out.
+    MoveToWorkspace(u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -487,8 +498,26 @@ fn parse_action(kind: &str, args: &str) -> Result<Action> {
         "move_dir" => Ok(Action::MoveDir(parse_direction(args)?)),
         "toggle_zoom" => Ok(Action::ToggleZoom),
         "close_window" => Ok(Action::CloseWindow),
+        "workspace" => Ok(Action::Workspace(parse_workspace_num(args)?)),
+        "move_to_workspace" => Ok(Action::MoveToWorkspace(parse_workspace_num(args)?)),
         other => bail!("unknown action `{other}`"),
     }
+}
+
+/// Workspace numbers are u32 with a guarded 1-based minimum so
+/// `workspace, 0` is a loud error rather than a silent off-by-one.
+/// No upper bound: the state vector is sparse (HashMap-ish via
+/// `Window.workspace == N` filtering), so binding to workspace 42
+/// is legal if pointless.
+fn parse_workspace_num(s: &str) -> Result<u32> {
+    let n: u32 = s
+        .trim()
+        .parse()
+        .with_context(|| format!("expected a workspace number, got `{s}`"))?;
+    if n == 0 {
+        bail!("workspace numbers start at 1");
+    }
+    Ok(n)
 }
 
 fn parse_direction(s: &str) -> Result<Direction> {

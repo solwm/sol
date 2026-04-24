@@ -27,6 +27,7 @@ mod compositor;
 mod config;
 mod cursor;
 mod data_device;
+mod ext_workspace;
 mod fractional_scale;
 mod input;
 mod layer_shell;
@@ -60,6 +61,7 @@ use wayland_server::protocol::{
     wl_pointer::{self, WlPointer},
     wl_subcompositor::WlSubcompositor,
 };
+use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use xkb::KeymapState;
 
 const COMPOSITOR_VERSION: u32 = 6;
@@ -98,6 +100,10 @@ pub struct Window {
     pub rect: Rect,
     pub render_rect: Rect,
     pub pending_size: Option<(i32, i32)>,
+    /// Which workspace this window belongs to. 1-based. A window
+    /// renders and receives input only when its workspace matches
+    /// `State.active_ws`; otherwise it stays mapped but hidden.
+    pub workspace: u32,
 }
 
 /// Compositor state shared across Dispatch impls. Backend-specific resources
@@ -197,6 +203,22 @@ pub struct State {
     /// Monotonically incrementing counter used as the MSC field in
     /// `presented`. Clients use it to detect missed vblanks.
     pub presentation_seq: u64,
+    /// Currently-visible workspace. 1-based. Only toplevels whose
+    /// `Window.workspace` matches this render, receive input, and
+    /// participate in focus navigation. Layer surfaces (bars,
+    /// wallpapers) and the cursor are global, i.e. not gated by
+    /// this.
+    pub active_ws: u32,
+    /// All `wl_output` resources that clients have bound. Tracked so
+    /// the `ext_workspace_v1` manager can emit `output_enter` on the
+    /// workspace group for each client's output.
+    pub outputs: Vec<WlOutput>,
+    /// Per-binding state for `ext_workspace_v1` — the workspace
+    /// protocol that taskbars use to show + activate our
+    /// workspaces. Each binding owns a server-created group + N
+    /// workspace handles. `switch_workspace` walks this list on
+    /// every switch to emit state changes atomically.
+    pub ext_workspace_managers: Vec<ext_workspace::ManagerBinding>,
     /// Process-group IDs of `exec-once` children. Each is spawned
     /// in its own group (via `setsid` in a pre_exec hook) so we
     /// can `killpg` the whole subtree on shutdown — otherwise
@@ -253,6 +275,7 @@ pub struct Globals {
     pub presentation: GlobalId,
     pub viewporter: GlobalId,
     pub fractional_scale: GlobalId,
+    pub ext_workspace: GlobalId,
 }
 
 impl State {
@@ -403,10 +426,12 @@ fn rebalance_keyboard_focus(state: &mut State) {
     if focus_alive {
         return;
     }
+    let active_ws = state.active_ws;
     let next = state
         .mapped_toplevels
         .iter()
         .rev()
+        .filter(|w| w.workspace == active_ws)
         .find_map(|w| w.surface.upgrade().ok());
     state.set_keyboard_focus(next);
 }
@@ -466,15 +491,23 @@ fn apply_layout(state: &mut State) {
     let usable = layer_shell::usable_area(&layers, screen);
     let inner = shrink_rect(usable, state.config.gaps_out);
 
+    let active_ws = state.active_ws;
+
     // Zoom overrides the tile layout: the zoomed window gets the
     // full inner area and we short-circuit before running
     // master-stack. Other windows keep their last-known rects
     // (collect_scene will skip them anyway while zoom is active).
+    // If the zoomed surface isn't on the active workspace (e.g. we
+    // just switched away), treat zoom as cleared — zoom doesn't
+    // follow the user across workspaces.
     if let Some(zs) = state.zoomed.as_ref().and_then(|w| w.upgrade().ok()) {
         let zoomed_exists = state
             .mapped_toplevels
             .iter_mut()
-            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&zs))
+            .find(|w| {
+                w.workspace == active_ws
+                    && w.surface.upgrade().ok().as_ref() == Some(&zs)
+            })
             .map(|w| {
                 w.rect = inner;
             })
@@ -482,16 +515,24 @@ fn apply_layout(state: &mut State) {
         if zoomed_exists {
             return;
         }
-        // Zoomed surface vanished (client crashed, destroyed its
-        // toplevel, etc.). Drop the flag and fall through to the
-        // normal layout so we don't leave the screen stuck showing
-        // a dead tile.
+        // Zoomed surface vanished or isn't on this workspace. Drop
+        // the flag and fall through to normal layout.
         state.zoomed = None;
     }
 
-    let rects = master_stack_layout(state.mapped_toplevels.len(), inner);
+    let n = state
+        .mapped_toplevels
+        .iter()
+        .filter(|w| w.workspace == active_ws)
+        .count();
+    let rects = master_stack_layout(n, inner);
     let gaps_in = state.config.gaps_in;
-    for (win, rect) in state.mapped_toplevels.iter_mut().zip(rects.into_iter()) {
+    let mut rect_iter = rects.into_iter();
+    for win in state.mapped_toplevels.iter_mut() {
+        if win.workspace != active_ws {
+            continue;
+        }
+        let Some(rect) = rect_iter.next() else { break };
         win.rect = shrink_interior_edges(rect, inner, gaps_in);
     }
 }
@@ -623,6 +664,9 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     // matching buffer (see `reconcile_render_rects`).
     let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     for win in state.mapped_toplevels.iter() {
+        if win.workspace != state.active_ws {
+            continue;
+        }
         let Ok(surface) = win.surface.upgrade() else { continue };
         if let Some(zs) = &zoomed {
             if surface != *zs {
@@ -913,6 +957,7 @@ fn neighbor_in_direction(
     windows: &[Window],
     from_idx: usize,
     dir: config::Direction,
+    ws: u32,
 ) -> Option<usize> {
     use config::Direction;
     let from = windows[from_idx].rect;
@@ -921,6 +966,9 @@ fn neighbor_in_direction(
     let mut best: Option<(usize, i32)> = None;
     for (i, w) in windows.iter().enumerate() {
         if i == from_idx {
+            continue;
+        }
+        if w.workspace != ws {
             continue;
         }
         if w.surface.upgrade().is_err() {
@@ -963,7 +1011,9 @@ fn focused_toplevel_index(state: &State) -> Option<usize> {
 
 fn focus_direction(state: &mut State, dir: config::Direction) {
     let Some(idx) = focused_toplevel_index(state) else { return };
-    let Some(n) = neighbor_in_direction(&state.mapped_toplevels, idx, dir) else {
+    let Some(n) =
+        neighbor_in_direction(&state.mapped_toplevels, idx, dir, state.active_ws)
+    else {
         return;
     };
     let Ok(target) = state.mapped_toplevels[n].surface.upgrade() else {
@@ -985,7 +1035,9 @@ fn focus_direction(state: &mut State, dir: config::Direction) {
 /// resize into their new tiles.
 fn move_direction(state: &mut State, dir: config::Direction) {
     let Some(idx) = focused_toplevel_index(state) else { return };
-    let Some(n) = neighbor_in_direction(&state.mapped_toplevels, idx, dir) else {
+    let Some(n) =
+        neighbor_in_direction(&state.mapped_toplevels, idx, dir, state.active_ws)
+    else {
         return;
     };
     // Same reasoning as focus_direction: rearranging the tile layout
@@ -1043,6 +1095,95 @@ fn toggle_zoom(state: &mut State) {
     state.needs_render = true;
 }
 
+/// Switch to the given workspace. Zoom doesn't follow the user
+/// across workspaces — it's tied to the window that was zoomed, so
+/// a second Alt+Tab on the new workspace is required to re-zoom.
+/// Keyboard focus moves to the topmost (= most recently mapped)
+/// toplevel on the target workspace; if it's empty, focus drops to
+/// None, which means subsequent keystrokes go nowhere until a
+/// window maps or a focus command is issued.
+pub(crate) fn switch_workspace(state: &mut State, n: u32) {
+    if state.active_ws == n {
+        return;
+    }
+    let old = state.active_ws;
+    tracing::info!(from = old, to = n, "workspace switch");
+    state.active_ws = n;
+    state.zoomed = None;
+    ext_workspace::notify_active_changed(state, old, n);
+    // Windows coming back into view get the "first-frame" treatment
+    // in reconcile_render_rects, so they snap to the new layout
+    // rather than flashing through their old rect for a frame.
+    for win in state.mapped_toplevels.iter_mut() {
+        if win.workspace == n {
+            win.render_rect = Rect::default();
+        }
+    }
+    let new_focus = state
+        .mapped_toplevels
+        .iter()
+        .rev()
+        .filter(|w| w.workspace == n)
+        .find_map(|w| w.surface.upgrade().ok());
+    state.set_keyboard_focus(new_focus);
+    state.needs_render = true;
+    update_pointer_focus_and_motion(state);
+}
+
+/// Send the keyboard-focused window to the given workspace. No-op
+/// if the target is already the current workspace. The window keeps
+/// whatever size it had — layout + configure for it land the next
+/// time that workspace becomes active (apply_layout sees a changed
+/// tile count on both the source and destination workspaces and
+/// recomputes rects accordingly).
+fn move_focused_to_workspace(state: &mut State, n: u32) {
+    if n == state.active_ws {
+        return;
+    }
+    let Some(focus) = state.keyboard_focus.clone() else {
+        return;
+    };
+    let moved = state
+        .mapped_toplevels
+        .iter_mut()
+        .find(|w| w.surface.upgrade().ok().as_ref() == Some(&focus))
+        .map(|w| {
+            w.workspace = n;
+            // Clear render_rect so the window gets first-frame
+            // treatment when the user switches to `n`.
+            w.render_rect = Rect::default();
+        })
+        .is_some();
+    if !moved {
+        // Focus is on a layer surface or popup, not a tiled
+        // toplevel — nothing to move.
+        return;
+    }
+    // If the moved window was zoomed, zoom goes with it semantically
+    // (it's cleared on the next switch anyway).
+    let was_zoomed = state
+        .zoomed
+        .as_ref()
+        .and_then(|w| w.upgrade().ok())
+        .as_ref()
+        == Some(&focus);
+    if was_zoomed {
+        state.zoomed = None;
+    }
+    // Focus falls to the topmost remaining window on the current
+    // (source) workspace.
+    let new_focus = state
+        .mapped_toplevels
+        .iter()
+        .rev()
+        .filter(|w| w.workspace == state.active_ws)
+        .find_map(|w| w.surface.upgrade().ok());
+    state.set_keyboard_focus(new_focus);
+    state.needs_render = true;
+    update_pointer_focus_and_motion(state);
+    tracing::info!(to_ws = n, "moved focused window to workspace");
+}
+
 /// Build four thin rects outlining the keyboard-focused toplevel's
 /// tile — the visual cue for "this is where typing goes." Empty vec
 /// if no toplevel is focused, if the border is disabled
@@ -1060,7 +1201,10 @@ fn focus_border(state: &State) -> Vec<voidptr_core::SceneBorder> {
     let Some(win) = state
         .mapped_toplevels
         .iter()
-        .find(|ww| ww.surface.upgrade().ok().as_ref() == Some(focus))
+        .find(|ww| {
+            ww.workspace == state.active_ws
+                && ww.surface.upgrade().ok().as_ref() == Some(focus)
+        })
     else {
         return Vec::new();
     };
@@ -1240,6 +1384,10 @@ fn setup_event_loop(
                 fractional_scale::FRACTIONAL_SCALE_VERSION,
                 (),
             ),
+        ext_workspace: dh.create_global::<State, ExtWorkspaceManagerV1, ()>(
+            ext_workspace::EXT_WORKSPACE_MANAGER_VERSION,
+            (),
+        ),
     };
     tracing::info!(?globals, "advertised globals");
 
@@ -1443,6 +1591,9 @@ fn setup_event_loop(
         globals,
         clients_seen: 0,
         mapped_toplevels: Vec::new(),
+        active_ws: 1,
+        outputs: Vec::new(),
+        ext_workspace_managers: Vec::new(),
         screen_width,
         screen_height,
         screen_refresh_mhz,
@@ -1715,6 +1866,12 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                         config::Action::CloseWindow => {
                             close_focused_window(state);
                         }
+                        config::Action::Workspace(n) => {
+                            switch_workspace(state, n);
+                        }
+                        config::Action::MoveToWorkspace(n) => {
+                            move_focused_to_workspace(state, n);
+                        }
                     }
                     return;
                 }
@@ -1899,6 +2056,9 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
     // clicks either.
     let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     for win in state.mapped_toplevels.iter().rev() {
+        if win.workspace != state.active_ws {
+            continue;
+        }
         let Ok(surface) = win.surface.upgrade() else { continue };
         if let Some(zs) = &zoomed {
             if surface != *zs {

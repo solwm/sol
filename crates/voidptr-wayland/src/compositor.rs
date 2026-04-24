@@ -276,6 +276,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                     rect: crate::Rect::default(),
                                     render_rect: crate::Rect::default(),
                                     pending_size: None,
+                                    workspace: state.active_ws,
                                 });
                             }
                         } else {
