@@ -350,7 +350,7 @@ pub fn mapped_layers(state: &State, screen: crate::Rect) -> Vec<MappedLayer> {
     for weak in state.pending_layer_surfaces.iter() {
         let Ok(surface) = weak.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (ls_weak, buf_weak) = {
+        let (ls_weak, buffer) = {
             let sd = sd_arc.lock().unwrap();
             if !matches!(sd.role, SurfaceRole::LayerSurface { mapped: true, .. }) {
                 continue;
@@ -360,7 +360,6 @@ pub fn mapped_layers(state: &State, screen: crate::Rect) -> Vec<MappedLayer> {
         };
         let Some(ls_weak) = ls_weak else { continue };
         let Ok(ls) = ls_weak.upgrade() else { continue };
-        let Ok(buffer) = buf_weak.upgrade() else { continue };
         let Some(ls_data) = ls.data::<LayerSurfaceData>() else { continue };
         let (layer, rect, kbi, anchor, exclusive_zone) = {
             let inner = ls_data.inner.lock().unwrap();

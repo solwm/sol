@@ -53,7 +53,18 @@ pub enum SurfaceRole {
 
 #[derive(Default)]
 pub struct SurfaceState {
-    pub buffer: Option<Weak<WlBuffer>>,
+    /// Strong handle to the currently-attached wl_buffer, **not** a
+    /// `Weak`. Holding a strong `WlBuffer` keeps the resource (and its
+    /// user_data — BufferData / DmabufBuffer — and the underlying
+    /// SHM mapping or imported EGLImage) alive even after the client
+    /// destroys its end. Alacritty (and any GL client managing its
+    /// own swapchain) destroys old buffers ahead of committing the
+    /// new one across a resize; with `Weak<WlBuffer>` that race
+    /// produced ~5 frames where `upgrade()` failed and we skipped
+    /// drawing the surface entirely → wallpaper bleed-through.
+    /// Keeping a strong ref means we still have a valid texture
+    /// source until the next attach replaces it.
+    pub buffer: Option<WlBuffer>,
     /// Accumulated damage since last commit (surface-local coords).
     pub damage: Vec<(i32, i32, i32, i32)>,
 }
@@ -168,7 +179,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
         match request {
             wl_surface::Request::Attach { buffer, x: _, y: _ } => {
                 let mut sd = data.lock().unwrap();
-                sd.pending.buffer = buffer.as_ref().map(|b| b.downgrade());
+                sd.pending.buffer = buffer;
                 sd.pending_attach = true;
             }
             wl_surface::Request::Damage {
@@ -228,23 +239,16 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 // Only when old != new (same-buffer re-attach keeps the
                 // current reference live) and only after we've released
                 // the SurfaceData lock so any handlers don't re-enter us.
-                let new_buffer_id = sd
-                    .current
-                    .buffer
-                    .as_ref()
-                    .and_then(|w| w.upgrade().ok())
-                    .map(|b| b.id());
+                let new_buffer_id = sd.current.buffer.as_ref().map(|b| b.id());
                 drop(sd);
-                // old_buffer is Option<Option<Weak>>: outer None means
+                // old_buffer is Option<Option<WlBuffer>>: outer None means
                 // no attach happened (nothing to release); outer Some
                 // with inner None means we promoted but had no prior
                 // buffer; outer Some(Some) is the actual replaced
                 // buffer.
-                if let Some(Some(old_weak)) = old_buffer {
-                    if let Ok(old_buf) = old_weak.upgrade() {
-                        if Some(old_buf.id()) != new_buffer_id {
-                            old_buf.release();
-                        }
+                if let Some(Some(old_buf)) = old_buffer {
+                    if Some(old_buf.id()) != new_buffer_id {
+                        old_buf.release();
                     }
                 }
                 let sd = data.lock().unwrap();
@@ -279,8 +283,21 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                     workspace: state.active_ws,
                                 });
                             }
-                        } else {
+                        } else if *mapped {
+                            // Null-buffer commit unmaps per wl_surface
+                            // spec. Drop from the layout immediately:
+                            // alacritty (and others) unmap this way
+                            // before issuing xdg_toplevel.destroy, and
+                            // if we leave the entry in mapped_toplevels
+                            // apply_layout keeps its tile rect reserved
+                            // while collect_scene's mapped-filter skips
+                            // drawing it — wallpaper bleeds through
+                            // until destroy lands.
                             *mapped = false;
+                            state
+                                .mapped_toplevels
+                                .retain(|w| w.surface.upgrade().ok().as_ref() != Some(surface));
+                            state.needs_render = true;
                         }
                     }
                     SurfaceRole::LayerSurface {

@@ -722,7 +722,7 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
                 continue;
             }
             (
-                sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok()),
+                sd.current.buffer.clone(),
                 sd.viewport_src,
                 sd.viewport_dst,
             )
@@ -785,7 +785,7 @@ fn emit_subsurface_tree(
         let (buf_opt, child_x, child_y, vsrc, logical) = {
             let sd = child_sd_arc.lock().unwrap();
             let (ox, oy) = sd.subsurface_offset;
-            let buf = sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok());
+            let buf = sd.current.buffer.clone();
             (
                 buf,
                 parent_x + ox,
@@ -936,14 +936,29 @@ fn compute_uv(
 /// pointers works; pick something unlikely to collide.
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
-/// Sync each mapped window's `render_rect` to its target `rect` when
-/// the client's current buffer matches the target size. Until that
-/// happens the window keeps rendering at its previous `render_rect`,
-/// so the user sees the old layout for 1–2 frames instead of a
-/// stretched or background-leaking intermediate state. A newly-
-/// mapped window (render_rect still all zeros) is promoted
-/// immediately on first sight — no transition to smooth over since
-/// there was nothing on screen before.
+/// Sync each mapped window's `render_rect` to its target `rect`. Two
+/// promotion paths:
+///
+/// 1. **Eager (extends outward).** If the new rect reaches past the
+///    current `render_rect` on any edge — i.e. the tile is growing
+///    into space that wasn't previously covered by this window — we
+///    promote immediately and let the GPU stretch the existing buffer
+///    until the client commits at the new size. The alternative is a
+///    visible background-color gap between the old render_rect and
+///    the new rect for 1–2 frames; the most obvious case is closing
+///    a tile in the middle of the stack column, where neighbours grow
+///    upward/downward into the vacated slot. A briefly-stretched
+///    buffer is far less perceptible than a flash of wallpaper.
+///
+/// 2. **Held-back (shrinking or repositioning inside old bounds).**
+///    Otherwise we wait until the client has committed a buffer
+///    whose logical size matches the target rect. This preserves the
+///    old layout for 1–2 frames during opens and swaps, where the
+///    new tile's slot is filled either by the new window's first
+///    commit or by an unchanged neighbour — so no gap appears.
+///
+/// A newly-mapped window (render_rect still all zeros) is promoted
+/// on first sight; there is nothing on screen to smooth over.
 fn reconcile_render_rects(state: &mut State) {
     for win in state.mapped_toplevels.iter_mut() {
         // First-frame case: make the new window visible immediately.
@@ -953,6 +968,17 @@ fn reconcile_render_rects(state: &mut State) {
         }
         // Already where the layout wants it.
         if win.render_rect == win.rect {
+            continue;
+        }
+        // If the target rect extends past the current render_rect on
+        // any edge, the un-covered strip would otherwise show the
+        // clear color until the client catches up. Promote eagerly.
+        let extends_outward = win.rect.x < win.render_rect.x
+            || win.rect.y < win.render_rect.y
+            || win.rect.x + win.rect.w > win.render_rect.x + win.render_rect.w
+            || win.rect.y + win.rect.h > win.render_rect.y + win.render_rect.h;
+        if extends_outward {
+            win.render_rect = win.rect;
             continue;
         }
         let Ok(surface) = win.surface.upgrade() else { continue };
@@ -990,8 +1016,8 @@ fn surface_logical_size(sd: &compositor::SurfaceData) -> Option<(i32, i32)> {
     if let Some((_, _, w, h)) = sd.viewport_src {
         return Some((w as i32, h as i32));
     }
-    let buf = sd.current.buffer.as_ref()?.upgrade().ok()?;
-    surface_buffer_dims(&buf)
+    let buf = sd.current.buffer.as_ref()?;
+    surface_buffer_dims(buf)
 }
 
 impl PartialEq for Rect {
@@ -2261,8 +2287,8 @@ fn hit_subsurfaces(
                     let csd_arc = s.data::<Arc<Mutex<SurfaceData>>>()?;
                     let csd = csd_arc.lock().ok()?;
                     let offset = csd.subsurface_offset;
-                    let buf = csd.current.buffer.as_ref()?.upgrade().ok()?;
-                    let dims = surface_buffer_dims(&buf)?;
+                    let buf = csd.current.buffer.as_ref()?;
+                    let dims = surface_buffer_dims(buf)?;
                     (offset, dims)
                 };
                 Some((s, offset, dims))
