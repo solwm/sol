@@ -25,6 +25,7 @@
 //! gaps_out     = 20                        # gap from tile to screen edge, px
 //! border_width = 2                         # focused-tile border, px (0 = off)
 //! border_color = ffff00                    # hex RRGGBB or #RRGGBB or 0xRRGGBB
+//! idle_timeout = 300                       # DPMS-off after N idle seconds (0 = off)
 //! ```
 //!
 //! Modifiers (case-insensitive): `ALT`/`MOD1`, `CTRL`/`CONTROL`,
@@ -79,6 +80,12 @@ pub struct Config {
     /// alpha is fixed at 1.0 since a translucent border isn't a thing
     /// anyone has asked for yet.
     pub border_color: [f32; 4],
+    /// Seconds of no user input before voidptr turns the monitor off
+    /// via DPMS. 0 disables the feature entirely. Clients that want
+    /// to prevent this (video players, presentation tools) create
+    /// `zwp_idle_inhibitor_v1` inhibitors on their surfaces and the
+    /// timer is suppressed while any inhibitor is live.
+    pub idle_timeout: u32,
 }
 
 impl Default for Config {
@@ -91,6 +98,7 @@ impl Default for Config {
             gaps_out: 20,
             border_width: 2,
             border_color: hex_to_rgba(0xFFFF00),
+            idle_timeout: 0,
         }
     }
 }
@@ -297,6 +305,7 @@ enum Entry {
     GapsOut(i32),
     BorderWidth(i32),
     BorderColor([f32; 4]),
+    IdleTimeout(u32),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -322,6 +331,7 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::GapsOut(v))) => cfg.gaps_out = v,
             Ok(Some(Entry::BorderWidth(v))) => cfg.border_width = v,
             Ok(Some(Entry::BorderColor(c))) => cfg.border_color = c,
+            Ok(Some(Entry::IdleTimeout(v))) => cfg.idle_timeout = v,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -355,6 +365,7 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "gaps_out" => Ok(Some(Entry::GapsOut(parse_int(rhs)?))),
         "border_width" => Ok(Some(Entry::BorderWidth(parse_int(rhs)?))),
         "border_color" => Ok(Some(Entry::BorderColor(parse_color(rhs)?))),
+        "idle_timeout" => Ok(Some(Entry::IdleTimeout(parse_uint(rhs)?))),
         other => bail!("unknown directive `{other}`"),
     }
 }
@@ -362,6 +373,11 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
 fn parse_int(s: &str) -> Result<i32> {
     s.parse::<i32>()
         .with_context(|| format!("expected an integer, got `{s}`"))
+}
+
+fn parse_uint(s: &str) -> Result<u32> {
+    s.parse::<u32>()
+        .with_context(|| format!("expected a non-negative integer, got `{s}`"))
 }
 
 fn parse_color(s: &str) -> Result<[f32; 4]> {

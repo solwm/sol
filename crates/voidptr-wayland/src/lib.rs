@@ -29,6 +29,7 @@ mod cursor;
 mod data_device;
 mod ext_workspace;
 mod fractional_scale;
+mod idle_inhibit;
 mod input;
 mod layer_shell;
 mod linux_dmabuf;
@@ -62,6 +63,10 @@ use wayland_server::protocol::{
     wl_subcompositor::WlSubcompositor,
 };
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
+use wayland_protocols::wp::idle_inhibit::zv1::server::{
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+    zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+};
 use xkb::KeymapState;
 
 const COMPOSITOR_VERSION: u32 = 6;
@@ -219,6 +224,26 @@ pub struct State {
     /// workspace handles. `switch_workspace` walks this list on
     /// every switch to emit state changes atomically.
     pub ext_workspace_managers: Vec<ext_workspace::ManagerBinding>,
+    /// Live `zwp_idle_inhibitor_v1` resources. Non-empty → video
+    /// players / presentation tools have asked us not to idle-blank.
+    /// The idle timer consults this before DPMS-off. Cleaned up
+    /// in the inhibitor's `Destroy` dispatch.
+    pub idle_inhibitors: Vec<ZwpIdleInhibitorV1>,
+    /// Monotonic timestamp of the most recent user input. Updated
+    /// on every `apply_input` call; the idle timer compares it to
+    /// `now - config.idle_timeout` to decide whether to blank. Also
+    /// re-set to `now` whenever the screen wakes, so a wake doesn't
+    /// immediately re-arm another blank countdown.
+    pub last_input_at: Instant,
+    /// True while the monitor is DPMS-off. Lets apply_input cheaply
+    /// detect "first input since blank" and re-power the display.
+    pub idle: bool,
+    /// Set by `State`-only callers (e.g. idle-inhibit creation) that
+    /// want the screen to wake but don't have access to the backend.
+    /// The main loop reads+clears this after each client dispatch
+    /// and flips DPMS back on. Input-driven wake doesn't need this
+    /// path — the input source has direct backend access.
+    pub pending_wake: bool,
     /// Process-group IDs of `exec-once` children. Each is spawned
     /// in its own group (via `setsid` in a pre_exec hook) so we
     /// can `killpg` the whole subtree on shutdown — otherwise
@@ -276,6 +301,7 @@ pub struct Globals {
     pub viewporter: GlobalId,
     pub fractional_scale: GlobalId,
     pub ext_workspace: GlobalId,
+    pub idle_inhibit: GlobalId,
 }
 
 impl State {
@@ -373,6 +399,20 @@ impl ClientData for ClientState {
 pub enum BackendState {
     Headless { canvas: Canvas, png_path: PathBuf },
     Drm(DrmPresenter),
+}
+
+impl BackendState {
+    /// Drive the display's DPMS state, if the backend supports it.
+    /// Headless is a no-op — the idle-blank path still updates the
+    /// internal `idle` flag so tests can exercise it, but there's
+    /// no monitor to power down.
+    pub fn set_dpms(&mut self, blank: bool) {
+        if let BackendState::Drm(p) = self {
+            if let Err(e) = p.set_dpms(blank) {
+                tracing::warn!(error = %e, "set_dpms failed");
+            }
+        }
+    }
 }
 
 /// Pairs Display + State + backend so calloop callbacks can reach everything.
@@ -1388,6 +1428,10 @@ fn setup_event_loop(
             ext_workspace::EXT_WORKSPACE_MANAGER_VERSION,
             (),
         ),
+        idle_inhibit: dh.create_global::<State, ZwpIdleInhibitManagerV1, ()>(
+            idle_inhibit::IDLE_INHIBIT_MANAGER_VERSION,
+            (),
+        ),
     };
     tracing::info!(?globals, "advertised globals");
 
@@ -1437,6 +1481,19 @@ fn setup_event_loop(
                 comp.display
                     .flush_clients()
                     .map_err(std::io::Error::other)?;
+                // A client dispatch may have created an idle
+                // inhibitor while the screen was blanked — the
+                // inhibit handler raises `pending_wake` because
+                // it can't reach the backend. Act on it here,
+                // where we do have backend access, before yielding
+                // back to the event loop.
+                if comp.state.pending_wake {
+                    comp.state.pending_wake = false;
+                    comp.state.idle = false;
+                    comp.state.last_input_at = Instant::now();
+                    comp.backend.set_dpms(false);
+                    comp.state.needs_render = true;
+                }
                 // Any client request/disconnect can dirty our layout
                 // or focus state — e.g. the client that just exited
                 // left its toplevel dead in mapped_toplevels and
@@ -1463,6 +1520,22 @@ fn setup_event_loop(
                         Some(i) => i.drain(),
                         None => return Ok(PostAction::Continue),
                     };
+                    if !events.is_empty() {
+                        comp.state.last_input_at = Instant::now();
+                        if comp.state.idle {
+                            // Wake the screen on the first input after a
+                            // blank. We don't forward this input to any
+                            // client — a keystroke meant to wake up the
+                            // monitor shouldn't also, say, close the
+                            // currently-focused app because it happened
+                            // to be Alt+Q. Consume-and-drop is what sway
+                            // and hyprland do for the same reason.
+                            comp.state.idle = false;
+                            comp.backend.set_dpms(false);
+                            comp.state.needs_render = true;
+                            return Ok(PostAction::Continue);
+                        }
+                    }
                     for ev in events {
                         apply_input(&mut comp.state, ev);
                     }
@@ -1594,6 +1667,10 @@ fn setup_event_loop(
         active_ws: 1,
         outputs: Vec::new(),
         ext_workspace_managers: Vec::new(),
+        idle_inhibitors: Vec::new(),
+        last_input_at: Instant::now(),
+        idle: false,
+        pending_wake: false,
         screen_width,
         screen_height,
         screen_refresh_mhz,
@@ -1635,6 +1712,42 @@ fn setup_event_loop(
         backend,
     };
     let _ = compositor.display.flush_clients();
+
+    // Idle timer: 1 Hz tick that checks "have we been idle longer
+    // than the configured threshold, and is no client holding an
+    // inhibitor?" — if yes, DPMS-off. Skipped entirely when
+    // `idle_timeout == 0` (the default) so the feature stays out of
+    // the way for users who haven't opted in. 1 Hz bounds worst-case
+    // blank latency to a second after the threshold expires while
+    // keeping the callback nearly free.
+    let idle_timeout_secs = compositor.state.config.idle_timeout;
+    if idle_timeout_secs > 0 {
+        use calloop::timer::{TimeoutAction, Timer};
+        let tick = std::time::Duration::from_secs(1);
+        event_loop
+            .handle()
+            .insert_source(
+                Timer::from_duration(tick),
+                move |_deadline, _meta, comp| {
+                    if !comp.state.idle {
+                        let elapsed = comp.state.last_input_at.elapsed().as_secs();
+                        if elapsed >= idle_timeout_secs as u64
+                            && !idle_inhibit::any_active(&mut comp.state)
+                        {
+                            tracing::info!(
+                                elapsed,
+                                inhibitors = comp.state.idle_inhibitors.len(),
+                                "idle: blanking display"
+                            );
+                            comp.state.idle = true;
+                            comp.backend.set_dpms(true);
+                        }
+                    }
+                    TimeoutAction::ToDuration(tick)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("insert idle timer: {e}"))?;
+    }
 
     tracing::info!(
         socket = %socket_name,
@@ -1750,6 +1863,13 @@ fn handle_session_event(comp: &mut Compositor, ev: libseat::SeatEvent) {
                     tracing::warn!("libinput resume failed — input may be dead");
                 }
             }
+            // A VT switch back to voidptr should land on a lit
+            // screen regardless of where the idle state was when
+            // we left. Reset idle + reset the input clock so the
+            // user doesn't immediately re-blank on resume.
+            comp.state.idle = false;
+            comp.state.last_input_at = Instant::now();
+            comp.backend.set_dpms(false);
             comp.state.needs_render = true;
         }
     }

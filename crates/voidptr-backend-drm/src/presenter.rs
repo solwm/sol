@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow};
-use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, framebuffer};
+use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, framebuffer, property};
 use glow::HasContext;
 use khronos_egl as egl;
 use voidptr_core::{PixelFormat, Scene, SceneContent};
@@ -64,6 +64,11 @@ pub struct DrmPresenter {
     width: u32,
     height: u32,
     saved_crtc: Option<SavedCrtc>,
+    /// Cached handle for the connector's DPMS property. Resolved
+    /// lazily on the first `set_dpms` call (via a linear scan of
+    /// connector properties) and reused for every subsequent call,
+    /// so blank/unblank transitions are a single ioctl.
+    dpms_prop: Option<property::Handle>,
 }
 
 struct TextureEntry {
@@ -135,6 +140,7 @@ impl DrmPresenter {
             width,
             height,
             saved_crtc,
+            dpms_prop: None,
         };
         presenter.initial_modeset()?;
         Ok(presenter)
@@ -183,6 +189,51 @@ impl DrmPresenter {
                 .context("re-apply modeset on Enable")?;
         }
         tracing::info!("DRM master reacquired (session enabled)");
+        Ok(())
+    }
+
+    /// Drive the connector's DPMS property to ON (blank=false) or
+    /// OFF (blank=true). Used by the idle-blank path in the
+    /// compositor — the monitor powers down (real power save, not
+    /// just a black frame) and wakes back on the next input.
+    ///
+    /// The DPMS property handle is resolved once from the connector's
+    /// property table and cached on the presenter; subsequent calls
+    /// are a single `drmModeConnectorSetProperty` ioctl. If the
+    /// connector doesn't advertise a DPMS property (rare — nouveau
+    /// on some old cards, or atomic-only drivers that expose DPMS
+    /// only through the CRTC's `ACTIVE` property), we log and skip
+    /// rather than erroring; the screen just stays on.
+    pub fn set_dpms(&mut self, blank: bool) -> Result<()> {
+        if self.dpms_prop.is_none() {
+            let props = self
+                .card
+                .get_properties(self.sel.connector)
+                .context("get connector properties for DPMS")?;
+            for (handle, _) in props.iter() {
+                let info = match self.card.get_property(*handle) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                if info.name().to_bytes() == b"DPMS" {
+                    self.dpms_prop = Some(*handle);
+                    break;
+                }
+            }
+        }
+        let Some(handle) = self.dpms_prop else {
+            tracing::warn!("connector has no DPMS property; screen stays on");
+            return Ok(());
+        };
+        // Legacy DPMS values: 0 = ON, 1 = STANDBY, 2 = SUSPEND, 3 = OFF.
+        // We use only the two extremes — STANDBY/SUSPEND's actual
+        // behavior varies per driver and doesn't buy us anything
+        // over OFF for an idle blank.
+        let value = if blank { 3 } else { 0 };
+        self.card
+            .set_property(self.sel.connector, handle, value)
+            .context("drm set DPMS")?;
+        tracing::info!(dpms_off = blank, "set DPMS");
         Ok(())
     }
 
