@@ -782,25 +782,40 @@ fn emit_subsurface_tree(
         let Some(child_sd_arc) = child.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let (buf_opt, child_x, child_y, vsrc) = {
+        let (buf_opt, child_x, child_y, vsrc, logical) = {
             let sd = child_sd_arc.lock().unwrap();
             let (ox, oy) = sd.subsurface_offset;
             let buf = sd.current.buffer.as_ref().and_then(|w| w.upgrade().ok());
-            (buf, parent_x + ox, parent_y + oy, sd.viewport_src)
+            (
+                buf,
+                parent_x + ox,
+                parent_y + oy,
+                sd.viewport_src,
+                surface_logical_size(&sd),
+            )
         };
         if let Some(buf) = buf_opt {
-            // Subsurfaces: the output rect width/height is whatever
-            // the buffer's intrinsic size is (w=0,h=0 signals "use
-            // source size" downstream in scene_from_buffers), and
-            // the UV rect either reflects the client's viewport
-            // source crop or (0,0,1,1) when absent.
+            // Output rect uses the surface's *logical* size, not the
+            // buffer's intrinsic dims. Chrome's URL-bar autocomplete
+            // popup, when the list shrinks, keeps the big buffer
+            // allocated and crops with `wp_viewport.set_source`
+            // instead of reallocating; logical size = source size.
+            // Falling back to buffer dims here would stretch the
+            // (smaller) cropped region into the (larger) buffer's
+            // quad on every commit where the popup shrinks.
+            //
+            // `surface_logical_size` collapses destination → source
+            // → buffer in the order the protocol layers them, so
+            // this also covers `set_destination` and the legacy
+            // no-viewport path.
+            let (w, h) = logical.unwrap_or((0, 0));
             out.push((
                 buf,
                 Rect {
                     x: child_x,
                     y: child_y,
-                    w: 0,
-                    h: 0,
+                    w,
+                    h,
                 },
                 vsrc,
             ));
