@@ -1902,12 +1902,20 @@ fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
 }
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
-    // If a page flip is already in flight, skip this tick. The flip
-    // will complete asynchronously on the DRM fd; the calloop source
-    // there will fire frame callbacks and re-trigger a render if more
-    // work has piled up in the meantime.
+    // If a page flip is already in flight, skip this tick and re-arm
+    // `needs_render` so the next loop iteration retries once the flip
+    // lands. Pre-idle-skip the page-flip handler set `needs_render`
+    // unconditionally on every flip, which masked the loss; with the
+    // idle optimisation in place it no longer does (`has_active_animation`
+    // gates it), so the request would otherwise be dropped on the floor.
+    // That dropped request is what produces the ~1s stall on `Ctrl+D`
+    // close: the disconnect dispatch sets `needs_render`, the loop
+    // callback clears it on the way into `render_tick`, we bail here on
+    // the still-pending blink/cursor flip, and nothing re-arms us until
+    // an unrelated event (next blink, input, etc.) ticks the loop.
     if let BackendState::Drm(presenter) = &comp.backend {
         if presenter.is_pending_flip() {
+            comp.state.needs_render = true;
             return Ok(());
         }
     }
