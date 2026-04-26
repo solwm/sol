@@ -78,7 +78,24 @@ pub struct DrmPresenter {
     /// Per-frame flag set by `prepare_blur_backdrop` so we only blur
     /// once even if multiple inactive-window backdrop elements appear
     /// in the same scene. Reset at the top of every `render_scene`.
+    /// Also pre-set to `true` (without running anything) when the
+    /// blur-cache check decides the previous frame's blur output is
+    /// still valid — see `last_bg_sig` / `last_blur_params`.
     blur_ready_this_frame: bool,
+    /// Hash of the last frame's background scene elements
+    /// (buffer keys + on-screen rects). When the current frame's
+    /// signature matches and the blur params haven't changed, the
+    /// blur FBOs from the previous frame are still valid — we skip
+    /// both the bg pre-pass *and* the blur passes. This is the big
+    /// win for "active client but static wallpaper" cases (cmatrix
+    /// in alacritty, scrolling browser, etc.) where the scene is
+    /// changing every frame but the blur *input* is not.
+    last_bg_sig: u64,
+    /// Last frame's `(passes, radius_bits)`. `radius_bits` is the
+    /// f32 radius reinterpreted as u32 so we can equality-test
+    /// without worrying about NaN. Changing either invalidates the
+    /// blur cache.
+    last_blur_params: (u32, u32),
     /// GPU textures keyed by Scene::buffer_key. Kept across frames so
     /// uploads are glTexSubImage2D after the first sight.
     textures: HashMap<u64, TextureEntry>,
@@ -304,6 +321,8 @@ impl DrmPresenter {
             backdrop,
             blur_fbos,
             blur_ready_this_frame: false,
+            last_bg_sig: 0,
+            last_blur_params: (0, 0),
             textures: HashMap::new(),
             width,
             height,
@@ -470,11 +489,42 @@ impl DrmPresenter {
         }
         let w = self.width as i32;
         let h = self.height as i32;
-        // Blur is captured-on-demand at most once per frame. Even if
-        // multiple inactive windows ask for a backdrop, they all
-        // share a single capture+blur and just sample different
-        // sub-rects of the result.
-        self.blur_ready_this_frame = false;
+        // Blur cache check: if the bg slice and the blur params
+        // haven't changed since last frame, the blur FBOs from the
+        // previous render still hold the right result — short-circuit
+        // both the bg pre-pass *and* the actual blur passes by
+        // marking blur_ready_this_frame up front. This is the
+        // hot-path for "client churns its own buffer but the
+        // wallpaper is static" (cmatrix etc.) — exactly the case
+        // where the blur cost is otherwise wasted.
+        //
+        // Signature includes buffer_key + on-screen rect of every
+        // background element so a moved / resized wallpaper layer
+        // also invalidates. Blur params: (passes, radius_bits).
+        let bg_sig = compute_bg_signature(
+            &scene.elements[..scene.background_count],
+        );
+        let scene_blur_params = scene
+            .elements
+            .iter()
+            .find_map(|e| match &e.content {
+                SceneContent::BlurredBackdrop { passes, radius } => {
+                    Some((*passes, radius.to_bits()))
+                }
+                _ => None,
+            })
+            .unwrap_or((0, 0));
+        let scene_has_backdrop = scene_blur_params.0 > 0;
+        let blur_cache_valid = scene_has_backdrop
+            && bg_sig == self.last_bg_sig
+            && scene_blur_params == self.last_blur_params;
+        // When the cache is valid prepare_blur_backdrop becomes a
+        // no-op for the rest of the frame — the previous frame's
+        // ping/pong textures still hold the result, and
+        // final_blur_tex(passes) will return the right one.
+        self.blur_ready_this_frame = blur_cache_valid;
+        self.last_bg_sig = bg_sig;
+        self.last_blur_params = scene_blur_params;
 
         // Pass 1: make sure every scene element has an up-to-date texture.
         // SHM elements blit pixels via glTex{Sub,}Image2D; dmabuf elements
@@ -509,8 +559,17 @@ impl DrmPresenter {
         // into the default FBO by the main loop below; the cost is
         // small (a handful of fullscreen quads) and the correctness
         // win is large.
+        //
+        // Skipped when there's no backdrop in the scene at all (no
+        // inactive windows, or inactive_blur=off — capture_tex would
+        // never be sampled), and skipped when the cache is valid
+        // (capture_tex still holds the right content from a previous
+        // frame).
         if let Some(fbos) = self.blur_fbos.as_ref() {
-            if scene.background_count > 0 {
+            if scene.background_count > 0
+                && scene_has_backdrop
+                && !blur_cache_valid
+            {
                 unsafe {
                     let gl = &self.gl_stack.gl;
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbos.capture_fbo));
@@ -1098,6 +1157,27 @@ impl Drop for DrmPresenter {
             tracing::info!("restored prior CRTC state");
         }
     }
+}
+
+/// Hash the bg slice into a u64 the presenter can equality-compare
+/// across frames. Captures buffer identity *and* on-screen rect of
+/// every element so a moved or resized wallpaper (or a fresh buffer
+/// from `wp-cycle.sh` swapping wallpapers) invalidates the blur
+/// cache. Includes the slice length implicitly via the hashed
+/// elements; an empty bg slice hashes to a stable "empty" value so
+/// the cache check still works in degenerate scenes.
+fn compute_bg_signature(elems: &[sol_core::SceneElement<'_>]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    elems.len().hash(&mut h);
+    for e in elems {
+        e.buffer_key.hash(&mut h);
+        e.x.to_bits().hash(&mut h);
+        e.y.to_bits().hash(&mut h);
+        e.dst_width.to_bits().hash(&mut h);
+        e.dst_height.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Upload (or re-upload) a SHM-backed scene element to a GL texture.
