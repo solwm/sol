@@ -42,11 +42,14 @@ varying vec2 v_uv;
 void main() {
     vec4 t = texture2D(u_tex, v_uv);
     float a = mix(t.a, 1.0, u_opaque) * u_alpha;
-    // Pre-multiply the colour by u_alpha too so the SRC_ALPHA blend
-    // function fades the colour contribution along with coverage —
-    // otherwise a faded surface darkens whatever's behind it because
-    // we're feeding full-strength colour into a smaller alpha weight.
-    gl_FragColor = vec4(t.bgr * u_alpha, a);
+    // Non-premultiplied alpha: pair with `glBlendFunc(SRC_ALPHA,
+    // ONE_MINUS_SRC_ALPHA)`. Multiplying the rgb by u_alpha here
+    // would double-fade — the blend already weights src by
+    // src_alpha, so an extra * u_alpha squashes the colour without
+    // changing how much dst shows through (looks dim, not
+    // transparent). Keep colour at full strength and let the blend
+    // do its job.
+    gl_FragColor = vec4(t.bgr, a);
 }
 "#;
 
@@ -62,7 +65,9 @@ void main() {
     float a = mix(t.a, 1.0, u_opaque) * u_alpha;
     // Driver returns (R, G, B, A) in fourcc order for external images,
     // so no channel swizzle needed here (unlike the SHM path).
-    gl_FragColor = vec4(t.rgb * u_alpha, a);
+    // Non-premultiplied — see FS above for the blend-function
+    // pairing rationale.
+    gl_FragColor = vec4(t.rgb, a);
 }
 "#;
 
@@ -111,8 +116,9 @@ uniform sampler2D u_tex;
 uniform float u_alpha;
 varying vec2 v_uv;
 void main() {
-    vec4 t = texture2D(u_tex, v_uv);
-    gl_FragColor = vec4(t.rgb * u_alpha, u_alpha);
+    // Non-premultiplied — same convention as the textured-quad
+    // path so the blend function pairs correctly.
+    gl_FragColor = vec4(texture2D(u_tex, v_uv).rgb, u_alpha);
 }
 "#;
 
