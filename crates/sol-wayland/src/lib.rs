@@ -1851,8 +1851,8 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
 /// toplevel (popup focus, layer-surface focus, etc. — those don't
 /// get a tile border).
 fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
-    let w = state.config.border_width;
-    if w <= 0 {
+    let bw = state.config.border_width;
+    if bw <= 0 {
         return Vec::new();
     }
     let Some(focus) = state.keyboard_focus.as_ref() else {
@@ -1870,24 +1870,20 @@ fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
     };
     // Border tracks what's actually on screen, so it uses render_rect
     // and stays visually glued to the tile during resize transitions.
-    // Round to int — borders only need whole-pixel placement; the
-    // sub-pixel render_rect is for the texture scale, not the border.
-    let r = win.render_rect.round();
-    let c = state.config.border_color;
-    // Top / bottom span the full width including corners; left / right
-    // are insets so the four rects don't double-draw at the corners.
-    vec![
-        sol_core::SceneBorder { x: r.x, y: r.y, w: r.w, h: w, rgba: c },
-        sol_core::SceneBorder { x: r.x, y: r.y + r.h - w, w: r.w, h: w, rgba: c },
-        sol_core::SceneBorder { x: r.x, y: r.y + w, w, h: r.h - 2 * w, rgba: c },
-        sol_core::SceneBorder {
-            x: r.x + r.w - w,
-            y: r.y + w,
-            w,
-            h: r.h - 2 * w,
-            rgba: c,
-        },
-    ]
+    // Sub-pixel rect: the rounded-ring fragment shader does its own
+    // SDF-based AA so we don't need to round. One full-window quad;
+    // the shader masks alpha to just the ring band, with the same
+    // corner_radius as the window content.
+    let r = win.render_rect;
+    vec![sol_core::SceneBorder {
+        x: r.x,
+        y: r.y,
+        w: r.w,
+        h: r.h,
+        rgba: state.config.border_color,
+        corner_radius: state.config.corner_radius as f32,
+        border_width: bw as f32,
+    }]
 }
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
@@ -1973,7 +1969,17 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
                 }
             }
             for b in &scene.borders {
-                canvas.fill_rect(b.x, b.y, b.w, b.h, b.rgba);
+                // Headless backend has no shader; it draws a plain
+                // rectangular fill regardless of corner_radius /
+                // border_width. The PNG dump is for debug, not
+                // shipping pretty pixels — close enough.
+                canvas.fill_rect(
+                    b.x.round() as i32,
+                    b.y.round() as i32,
+                    b.w.round() as i32,
+                    b.h.round() as i32,
+                    b.rgba,
+                );
             }
             canvas
                 .write_png(png_path)

@@ -650,15 +650,26 @@ impl DrmPresenter {
                 gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
             }
             for b in &scene.borders {
-                let x0 = (b.x as f32 / w as f32) * 2.0 - 1.0;
-                let y0 = 1.0 - ((b.y + b.h) as f32 / h as f32) * 2.0;
-                let rw = b.w as f32 / w as f32 * 2.0;
-                let rh = b.h as f32 / h as f32 * 2.0;
+                let fb_w = w as f32;
+                let fb_h = h as f32;
+                let x0 = (b.x / fb_w) * 2.0 - 1.0;
+                let y0 = 1.0 - ((b.y + b.h) / fb_h) * 2.0;
+                let rw = b.w / fb_w * 2.0;
+                let rh = b.h / fb_h * 2.0;
                 unsafe {
                     gl.uniform_4_f32(Some(&self.solid.u_rect), x0, y0, rw, rh);
                     gl.uniform_4_f32(
                         Some(&self.solid.u_color),
                         b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3],
+                    );
+                    gl.uniform_2_f32(Some(&self.solid.u_size), b.w, b.h);
+                    gl.uniform_1_f32(
+                        Some(&self.solid.u_radius),
+                        b.corner_radius.max(0.0),
+                    );
+                    gl.uniform_1_f32(
+                        Some(&self.solid.u_border_width),
+                        b.border_width.max(0.0),
                     );
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 }

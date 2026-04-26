@@ -103,14 +103,32 @@ pub struct SceneElement<'a> {
 /// elements but below the cursor. Used today for the focused-tile
 /// border; the render path is generic enough to reuse later for
 /// notifications, window highlights, debug overlays, etc.
+///
+/// The fragment shader treats this as one of three shapes depending
+/// on the trailing fields:
+/// - `corner_radius == 0 && border_width == 0` → solid filled rect.
+/// - `corner_radius > 0  && border_width == 0` → solid rounded rect.
+/// - `border_width > 0`                        → rounded ring with
+///   `border_width` thickness (both outer and inner edges follow
+///   `corner_radius`; inner radius auto-shrinks by `border_width`).
+///
+/// `x` / `y` / `w` / `h` are f32 so the border can subscribe to
+/// the same sub-pixel render_rect the window content uses, keeping
+/// the ring concentric with the window during a layout-tween
+/// animation.
 pub struct SceneBorder {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
     /// Straight RGBA in [0, 1]. The DRM presenter treats it as
     /// un-premultiplied; the solid shader writes it directly.
     pub rgba: [f32; 4],
+    /// Outer corner radius in pixels. `0.0` = rectangular.
+    pub corner_radius: f32,
+    /// Ring thickness in pixels; `0.0` collapses to a filled
+    /// (possibly-rounded) rect.
+    pub border_width: f32,
 }
 
 pub struct Scene<'a> {

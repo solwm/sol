@@ -106,13 +106,60 @@ void main() {
 }
 "#;
 
-/// Flat-color fragment shader for border/overlay rects. Writes
-/// `u_color` straight through; source-over blending with the existing
-/// framebuffer happens via the pipeline's `glBlendFunc`.
+/// Flat-color fragment shader for border / overlay rects, with
+/// optional rounded corners and ring (border) cutout. Math:
+///
+/// 1. Compute the outer rounded-rect SDF for size `u_size` with
+///    radius `u_radius`. `d_outer` is negative inside the shape,
+///    positive outside, with a 1-pixel transition for AA.
+/// 2. If `u_border_width > 0`, also compute the inner rounded-rect
+///    SDF (window inset by `u_border_width`, radius shrunk by the
+///    same amount but clamped at 0). The output covers fragments
+///    that are inside the outer shape AND outside the inner shape
+///    — i.e. the ring band — anti-aliased on both edges.
+/// 3. Multiply alpha by the resulting mask. Blending against the
+///    framebuffer uses the same SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+///    blend func as everything else, so the border edges blend
+///    smoothly with whatever the windows below drew.
+///
+/// `u_radius == 0` collapses to a rectangular ring (no curve);
+/// `u_border_width == 0` collapses to a filled rounded rect (the
+/// inner SDF branch is skipped). Pass both zero and you get the
+/// pre-rounding behaviour: a solid filled rectangle.
 const FS_SOLID: &str = r#"#version 100
 precision mediump float;
 uniform vec4 u_color;
-void main() { gl_FragColor = u_color; }
+uniform vec2 u_size;
+uniform float u_radius;
+uniform float u_border_width;
+varying vec2 v_pos;
+void main() {
+    vec2 pos = v_pos * u_size;
+    vec2 half_size = u_size * 0.5;
+    // Outer SDF.
+    vec2 q = abs(pos - half_size) - (half_size - vec2(u_radius));
+    float d_outer = length(max(q, vec2(0.0)))
+                  + min(max(q.x, q.y), 0.0)
+                  - u_radius;
+    float alpha = clamp(0.5 - d_outer, 0.0, 1.0);
+
+    if (u_border_width > 0.0) {
+        // Inner SDF: rect inset by border_width, radius shrunk to
+        // keep the curves concentric (or zero, whichever is larger).
+        float inner_radius = max(u_radius - u_border_width, 0.0);
+        vec2 inner_size = u_size - vec2(2.0 * u_border_width);
+        vec2 inner_pos = pos - vec2(u_border_width);
+        vec2 ihalf = inner_size * 0.5;
+        vec2 iq = abs(inner_pos - ihalf) - (ihalf - vec2(inner_radius));
+        float d_inner = length(max(iq, vec2(0.0)))
+                      + min(max(iq.x, iq.y), 0.0)
+                      - inner_radius;
+        // Want fragments OUTSIDE the inner shape (positive d_inner).
+        alpha *= clamp(0.5 + d_inner, 0.0, 1.0);
+    }
+
+    gl_FragColor = vec4(u_color.rgb, u_color.a * alpha);
+}
 "#;
 
 /// Box-blur fragment shader. Samples a 5×5 neighbourhood (25 taps)
@@ -170,14 +217,18 @@ pub struct QuadProgram {
 }
 
 /// Border / solid-color rect program. Same vertex pipeline and VBO
-/// convention as the textured quads, but the fragment shader just
-/// writes a uniform color. Kept separate from `QuadProgram` so we
-/// don't carry unused `u_tex` / `u_opaque` locations around.
+/// convention as the textured quads, but the fragment shader runs
+/// the rounded-ring SDF instead of sampling a texture. Kept separate
+/// from `QuadProgram` so we don't carry unused `u_tex` / `u_opaque`
+/// locations around.
 pub struct SolidProgram {
     pub program: NativeProgram,
     pub vbo: NativeBuffer,
     pub u_rect: NativeUniformLocation,
     pub u_color: NativeUniformLocation,
+    pub u_size: NativeUniformLocation,
+    pub u_radius: NativeUniformLocation,
+    pub u_border_width: NativeUniformLocation,
 }
 
 /// 5×5 box-blur ping-pong program. Operates on FBO-attached colour
@@ -375,6 +426,15 @@ pub fn build_solid(gl: &glow::Context) -> Result<SolidProgram> {
         let u_color = gl
             .get_uniform_location(program, "u_color")
             .ok_or_else(|| anyhow!("u_color missing"))?;
+        let u_size = gl
+            .get_uniform_location(program, "u_size")
+            .ok_or_else(|| anyhow!("u_size missing"))?;
+        let u_radius = gl
+            .get_uniform_location(program, "u_radius")
+            .ok_or_else(|| anyhow!("u_radius missing"))?;
+        let u_border_width = gl
+            .get_uniform_location(program, "u_border_width")
+            .ok_or_else(|| anyhow!("u_border_width missing"))?;
 
         let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let vbo = gl
@@ -393,6 +453,9 @@ pub fn build_solid(gl: &glow::Context) -> Result<SolidProgram> {
             vbo,
             u_rect,
             u_color,
+            u_size,
+            u_radius,
+            u_border_width,
         })
     }
 }
