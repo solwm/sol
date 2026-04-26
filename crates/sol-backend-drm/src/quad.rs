@@ -43,7 +43,13 @@ void main() {
 /// linear ramp for anti-aliasing along the curve. When `u_radius == 0`
 /// the SDF reduces to inside-the-rect (always 1) so rectangular elements
 /// pay only a few extra arithmetic ops.
+///
+/// Includes the default-precision declaration so the uniforms below it
+/// don't trip GLSL ES's "no default precision for float" rule. The body
+/// shaders deliberately don't repeat `precision mediump float;` —
+/// redeclaring would still work on Mesa but is a needless duplicate.
 const FS_ROUNDED_PRELUDE: &str = r#"
+precision mediump float;
 uniform vec2 u_size;     // output rect size in pixels
 uniform float u_radius;  // corner radius in pixels (0 = rectangular)
 varying vec2 v_pos;      // a_pos passthrough, [0,1] across the quad
@@ -63,7 +69,6 @@ float rounded_alpha() {
 // `assemble_fs` below.
 
 const FS: &str = r#"
-precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_opaque;
 uniform float u_alpha;
@@ -86,7 +91,6 @@ const FS_EXTERNAL_EXTENSIONS: &str =
     "#extension GL_OES_EGL_image_external : require\n";
 
 const FS_EXTERNAL: &str = r#"
-precision mediump float;
 uniform samplerExternalOES u_tex;
 uniform float u_opaque;
 uniform float u_alpha;
@@ -142,7 +146,6 @@ void main() {
 /// alpha multiplied by `u_alpha` so the caller can fade the
 /// backdrop in/out (e.g. during a workspace crossfade).
 const FS_BACKDROP: &str = r#"
-precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_alpha;
 varying vec2 v_uv;
