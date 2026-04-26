@@ -654,6 +654,10 @@ fn apply_config_reload(state: &mut State) {
         }
     }
 
+    let kb_repeat_changed = new_cfg.keyboard_repeat_rate
+        != state.config.keyboard_repeat_rate
+        || new_cfg.keyboard_repeat_delay != state.config.keyboard_repeat_delay;
+
     tracing::info!(
         bindings = new_cfg.bindings.len(),
         remaps = new_cfg.remaps.len(),
@@ -661,9 +665,27 @@ fn apply_config_reload(state: &mut State) {
         gaps_out = new_cfg.gaps_out,
         border_width = new_cfg.border_width,
         idle_timeout = new_cfg.idle_timeout,
+        keyboard_repeat_rate = new_cfg.keyboard_repeat_rate,
+        keyboard_repeat_delay = new_cfg.keyboard_repeat_delay,
         "config reloaded"
     );
     state.config = new_cfg;
+
+    // wl_keyboard.repeat_info is allowed to be re-sent at any time, so
+    // push the new rate/delay to every already-bound keyboard. Dead
+    // keyboards are skipped via is_alive. Clients pick the new values
+    // up on their next keypress — no event loop dance needed.
+    if kb_repeat_changed {
+        for kb in state.keyboards.iter() {
+            if kb.version() >= 4 && kb.is_alive() {
+                kb.repeat_info(
+                    state.config.keyboard_repeat_rate,
+                    state.config.keyboard_repeat_delay,
+                );
+            }
+        }
+    }
+
     // Force a fresh layout pass so gap / border tweaks animate in.
     state.needs_render = true;
 }

@@ -69,9 +69,10 @@ impl Dispatch<WlSeat, ()> for State {
                         km.size,
                     );
                     if keyboard.version() >= 4 {
-                        // 25 keys/sec repeat, 200ms delay. Arbitrary but
-                        // matches sway's defaults.
-                        keyboard.repeat_info(25, 200);
+                        keyboard.repeat_info(
+                            state.config.keyboard_repeat_rate,
+                            state.config.keyboard_repeat_delay,
+                        );
                     }
                 }
                 // If this client owns the currently focused surface, send

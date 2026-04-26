@@ -27,6 +27,8 @@
 //! border_color = ffff00                    # hex RRGGBB or #RRGGBB or 0xRRGGBB
 //! idle_timeout = 300                       # DPMS-off after N idle seconds (0 = off)
 //! mode         = 3840x2160@240             # output WIDTHxHEIGHT@HZ; SOL_MODE env wins
+//! keyboard_repeat_rate  = 100              # wl_keyboard.repeat_info chars/sec (0 disables)
+//! keyboard_repeat_delay = 200              # wl_keyboard.repeat_info delay, ms
 //! ```
 //!
 //! The file is watched at runtime (inotify on its parent dir): saves
@@ -108,6 +110,14 @@ pub struct Config {
     /// is currently a warn-and-keep-old-mode (changing mode requires
     /// rebuilding the GBM/EGL surface; restart sol to apply).
     pub mode: Option<ModePref>,
+    /// `wl_keyboard.repeat_info` rate, in characters per second. The
+    /// compositor does not implement repeat itself — clients do, off
+    /// the rate/delay we advertise. Rate `0` disables auto-repeat.
+    /// Default 100 keys/sec to match Hyprland's tuning.
+    pub keyboard_repeat_rate: i32,
+    /// `wl_keyboard.repeat_info` delay before repeat starts, in
+    /// milliseconds. Default 200 ms (Hyprland's tuning).
+    pub keyboard_repeat_delay: i32,
 }
 
 impl Default for Config {
@@ -122,6 +132,8 @@ impl Default for Config {
             border_color: hex_to_rgba(0xFFFF00),
             idle_timeout: 0,
             mode: None,
+            keyboard_repeat_rate: 100,
+            keyboard_repeat_delay: 200,
         }
     }
 }
@@ -330,6 +342,8 @@ enum Entry {
     BorderColor([f32; 4]),
     IdleTimeout(u32),
     Mode(ModePref),
+    KeyboardRepeatRate(i32),
+    KeyboardRepeatDelay(i32),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -357,6 +371,8 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::BorderColor(c))) => cfg.border_color = c,
             Ok(Some(Entry::IdleTimeout(v))) => cfg.idle_timeout = v,
             Ok(Some(Entry::Mode(m))) => cfg.mode = Some(m),
+            Ok(Some(Entry::KeyboardRepeatRate(v))) => cfg.keyboard_repeat_rate = v,
+            Ok(Some(Entry::KeyboardRepeatDelay(v))) => cfg.keyboard_repeat_delay = v,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -392,6 +408,8 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "border_color" => Ok(Some(Entry::BorderColor(parse_color(rhs)?))),
         "idle_timeout" => Ok(Some(Entry::IdleTimeout(parse_uint(rhs)?))),
         "mode" => Ok(Some(Entry::Mode(parse_mode(rhs)?))),
+        "keyboard_repeat_rate" => Ok(Some(Entry::KeyboardRepeatRate(parse_int(rhs)?))),
+        "keyboard_repeat_delay" => Ok(Some(Entry::KeyboardRepeatDelay(parse_int(rhs)?))),
         other => bail!("unknown directive `{other}`"),
     }
 }
