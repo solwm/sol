@@ -1554,6 +1554,21 @@ fn tick_workspace_animation(state: &mut State, now: Instant) -> bool {
     }
 }
 
+/// True iff any layout tween or workspace crossfade is currently in
+/// flight. The DRM page-flip-complete handler consults this to
+/// decide whether to keep auto-rendering at vblank cadence (so the
+/// animation actually progresses) or let the compositor go idle
+/// (event-driven renders only). Cheap O(N) scan over mapped
+/// toplevels — N is at most a handful and this only fires once per
+/// flip event, not per frame body.
+fn has_active_animation(state: &State) -> bool {
+    state.workspace_anim.is_some()
+        || state
+            .mapped_toplevels
+            .iter()
+            .any(|w| w.anim_started_at.is_some())
+}
+
 /// A surface's logical size per the Wayland protocol layering:
 ///
 /// 1. `wp_viewport.set_destination` — the client explicitly declared it.
@@ -2241,10 +2256,22 @@ fn setup_event_loop(
                             Instant::now(),
                             refresh_ns,
                         );
-                        // Another commit may have piled up while we
-                        // were waiting; trigger a fresh render so the
-                        // pipeline stays full.
-                        comp.state.needs_render = true;
+                        // Used to set needs_render unconditionally
+                        // here, which kept the compositor at the full
+                        // display refresh rate even with no scene
+                        // changes — at 4K@240 with the visual effects
+                        // pipeline (transparency + per-frame blur,
+                        // even cached) that's a sustained ~70% GPU
+                        // load just sitting idle. Now we only
+                        // continue auto-rendering when there's
+                        // actually motion to advance: any toplevel
+                        // tween in flight, or a workspace crossfade.
+                        // Static scenes coast on event-driven
+                        // renders (client commits, input, focus
+                        // changes) instead of pumping at vblank.
+                        if has_active_animation(&comp.state) {
+                            comp.state.needs_render = true;
+                        }
 
                         // Rough FPS counter: tally page flips and log
                         // once a second so the user can confirm the

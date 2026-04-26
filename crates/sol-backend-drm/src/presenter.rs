@@ -99,8 +99,20 @@ pub struct DrmPresenter {
 /// `GL_RGBA8` colour attachment, no depth/stencil — we don't need
 /// either for a 2D scene.
 struct BlurFbos {
-    width: i32,
-    height: i32,
+    /// Full output resolution. The bg pre-pass renders into
+    /// `capture_*` at this size so the on-screen blit (and the first
+    /// blur sample) operate on the same spatial reference as the
+    /// rest of the scene.
+    full_width: i32,
+    full_height: i32,
+    /// Half-resolution dimensions used by `ping_*` / `pong_*`. The
+    /// blur passes ping-pong here to cut per-pass cost by ~4× —
+    /// rotating between 5×5 box-blur samples at half resolution
+    /// produces a result that's visually indistinguishable from
+    /// full-res after upscale through the texture's bilinear filter.
+    /// Standard dual-Kawase trick.
+    blur_width: i32,
+    blur_height: i32,
     /// Render target for the background pass. The presenter draws the
     /// `Scene::background_count` leading elements (wallpaper + bottom
     /// layer-shell surfaces) into here instead of the default FBO,
@@ -119,8 +131,10 @@ struct BlurFbos {
 
 impl BlurFbos {
     fn new(gl: &glow::Context, width: i32, height: i32) -> Result<Self> {
+        let blur_width = (width / 2).max(1);
+        let blur_height = (height / 2).max(1);
         unsafe {
-            let alloc_tex = |gl: &glow::Context| -> Result<glow::NativeTexture> {
+            let alloc_tex = |gl: &glow::Context, w: i32, h: i32| -> Result<glow::NativeTexture> {
                 let tex = gl
                     .create_texture()
                     .map_err(|e| anyhow!("create blur texture: {e}"))?;
@@ -149,8 +163,8 @@ impl BlurFbos {
                     glow::TEXTURE_2D,
                     0,
                     glow::RGBA as i32,
-                    width,
-                    height,
+                    w,
+                    h,
                     0,
                     glow::RGBA,
                     glow::UNSIGNED_BYTE,
@@ -176,17 +190,24 @@ impl BlurFbos {
                 }
                 Ok(fbo)
             };
-            let capture_tex = alloc_tex(gl)?;
+            // Capture stays full-res so the bg pre-pass renders the
+            // wallpaper at the same scale as the screen.
+            let capture_tex = alloc_tex(gl, width, height)?;
             let capture_fbo = attach_fbo(gl, capture_tex)?;
-            let ping_tex = alloc_tex(gl)?;
+            // Ping/pong are half-res — each pass costs ~1/4 of full
+            // res, and the eye doesn't see the resolution loss after
+            // the blur smooths things out.
+            let ping_tex = alloc_tex(gl, blur_width, blur_height)?;
             let ping_fbo = attach_fbo(gl, ping_tex)?;
-            let pong_tex = alloc_tex(gl)?;
+            let pong_tex = alloc_tex(gl, blur_width, blur_height)?;
             let pong_fbo = attach_fbo(gl, pong_tex)?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.bind_texture(glow::TEXTURE_2D, None);
             Ok(Self {
-                width,
-                height,
+                full_width: width,
+                full_height: height,
+                blur_width,
+                blur_height,
                 capture_fbo,
                 capture_tex,
                 ping_fbo,
@@ -493,7 +514,7 @@ impl DrmPresenter {
                 unsafe {
                     let gl = &self.gl_stack.gl;
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbos.capture_fbo));
-                    gl.viewport(0, 0, fbos.width, fbos.height);
+                    gl.viewport(0, 0, fbos.full_width, fbos.full_height);
                     gl.clear_color(0.02, 0.02, 0.04, 1.0);
                     gl.clear(glow::COLOR_BUFFER_BIT);
                     gl.enable(glow::BLEND);
@@ -504,8 +525,8 @@ impl DrmPresenter {
                 for elem in &scene.elements[..scene.background_count] {
                     self.draw_textured_element(
                         elem,
-                        fbos.width as f32,
-                        fbos.height as f32,
+                        fbos.full_width as f32,
+                        fbos.full_height as f32,
                         &mut bg_active_program,
                     );
                 }
@@ -817,14 +838,12 @@ impl DrmPresenter {
             // Per-pass kernel reach: shader's hardcoded -2..2 offsets
             // are multiplied by u_texel, so scaling u_texel by `radius`
             // widens (or shrinks) each pass's effective area without
-            // changing sample count. radius=0 collapses every sample
-            // onto the centre pixel → pass becomes a passthrough.
+            // changing sample count. The first pass samples the
+            // full-res capture and writes into the half-res ping FBO,
+            // so its texel stride is twice as effective in source
+            // pixels — the downsample is "free" blur reach. The
+            // remaining passes operate ping↔pong at half res.
             let r = radius.max(0.0);
-            gl.uniform_2_f32(
-                Some(&self.blur.u_texel),
-                r / fbos.width as f32,
-                r / fbos.height as f32,
-            );
 
             // Ping-pong N times. Source = capture_tex on the first
             // pass, then swaps each iteration. Destination alternates
@@ -833,20 +852,25 @@ impl DrmPresenter {
             // — `final_blur_tex` reports which.
             let total = passes.max(1);
             for i in 0..total {
-                let src_tex = if i == 0 {
-                    fbos.capture_tex
+                let (src_tex, src_w, src_h) = if i == 0 {
+                    (fbos.capture_tex, fbos.full_width, fbos.full_height)
                 } else if i % 2 == 1 {
-                    fbos.ping_tex
+                    (fbos.ping_tex, fbos.blur_width, fbos.blur_height)
                 } else {
-                    fbos.pong_tex
+                    (fbos.pong_tex, fbos.blur_width, fbos.blur_height)
                 };
                 let dst_fbo = if i % 2 == 0 {
                     fbos.ping_fbo
                 } else {
                     fbos.pong_fbo
                 };
+                gl.uniform_2_f32(
+                    Some(&self.blur.u_texel),
+                    r / src_w as f32,
+                    r / src_h as f32,
+                );
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dst_fbo));
-                gl.viewport(0, 0, fbos.width, fbos.height);
+                gl.viewport(0, 0, fbos.blur_width, fbos.blur_height);
                 gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
