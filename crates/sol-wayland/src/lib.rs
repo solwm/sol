@@ -972,6 +972,7 @@ enum Placed {
         rect: RectF,
         alpha: f32,
         passes: u32,
+        radius: f32,
     },
 }
 
@@ -1030,6 +1031,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
     let inactive_alpha = state.config.inactive_alpha;
     let inactive_blur = state.config.inactive_blur && state.config.inactive_alpha < 1.0;
     let inactive_blur_passes = state.config.inactive_blur_passes;
+    let inactive_blur_radius = state.config.inactive_blur_radius;
 
     let emit_for_ws = |out: &mut Vec<Placed>, ws: u32, ws_alpha: f32| {
         for win in state.mapped_toplevels.iter() {
@@ -1082,6 +1084,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                     rect: win.render_rect,
                     alpha: ws_alpha,
                     passes: inactive_blur_passes,
+                    radius: inactive_blur_radius,
                 });
             }
 
@@ -1220,7 +1223,7 @@ fn scene_from_buffers<'a>(
     for p in placed {
         let (buf, rect, vsrc, alpha) = match p {
             Placed::Buffer { buf, rect, vsrc, alpha } => (buf, rect, vsrc, alpha),
-            Placed::Backdrop { rect, alpha, passes } => {
+            Placed::Backdrop { rect, alpha, passes, radius } => {
                 // Frosted backdrop: no client buffer, no UV crop.
                 // Use a sentinel buffer_key so the presenter's
                 // texture map never matches; the BlurredBackdrop
@@ -1239,7 +1242,10 @@ fn scene_from_buffers<'a>(
                     uv_w: 1.0,
                     uv_h: 1.0,
                     alpha: *alpha,
-                    content: SceneContent::BlurredBackdrop { passes: *passes },
+                    content: SceneContent::BlurredBackdrop {
+                        passes: *passes,
+                        radius: *radius,
+                    },
                 });
                 continue;
             }

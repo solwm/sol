@@ -536,8 +536,8 @@ impl DrmPresenter {
             // sampled at this element's screen rect. Different
             // shader pipeline from the textured quad path, so
             // active_program is forced to refresh next iteration.
-            if let SceneContent::BlurredBackdrop { passes } = &elem.content {
-                if let Err(e) = self.draw_blurred_backdrop(elem, *passes) {
+            if let SceneContent::BlurredBackdrop { passes, radius } = &elem.content {
+                if let Err(e) = self.draw_blurred_backdrop(elem, *passes, *radius) {
                     tracing::warn!(error = %e, "backdrop draw skipped");
                 }
                 active_program = None;
@@ -763,7 +763,7 @@ impl DrmPresenter {
     ///
     /// Idempotent within a frame: `blur_ready_this_frame` short-circuits
     /// re-runs so multiple inactive windows share one blur.
-    fn prepare_blur_backdrop(&mut self, passes: u32) -> Result<()> {
+    fn prepare_blur_backdrop(&mut self, passes: u32, radius: f32) -> Result<()> {
         if self.blur_ready_this_frame {
             return Ok(());
         }
@@ -793,10 +793,16 @@ impl DrmPresenter {
             // clip space, uv = full texture.
             gl.uniform_4_f32(Some(&self.blur.u_rect), -1.0, -1.0, 2.0, 2.0);
             gl.uniform_4_f32(Some(&self.blur.u_uv), 0.0, 0.0, 1.0, 1.0);
+            // Per-pass kernel reach: shader's hardcoded -2..2 offsets
+            // are multiplied by u_texel, so scaling u_texel by `radius`
+            // widens (or shrinks) each pass's effective area without
+            // changing sample count. radius=0 collapses every sample
+            // onto the centre pixel → pass becomes a passthrough.
+            let r = radius.max(0.0);
             gl.uniform_2_f32(
                 Some(&self.blur.u_texel),
-                1.0 / fbos.width as f32,
-                1.0 / fbos.height as f32,
+                r / fbos.width as f32,
+                r / fbos.height as f32,
             );
 
             // Ping-pong N times. Source = capture_tex on the first
@@ -855,8 +861,9 @@ impl DrmPresenter {
         &mut self,
         elem: &sol_core::SceneElement<'_>,
         passes: u32,
+        radius: f32,
     ) -> Result<()> {
-        self.prepare_blur_backdrop(passes)?;
+        self.prepare_blur_backdrop(passes, radius)?;
         let Some(blur_tex) = self.final_blur_tex(passes) else {
             anyhow::bail!("blur tex unavailable");
         };

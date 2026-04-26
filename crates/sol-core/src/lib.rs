@@ -35,8 +35,9 @@ pub enum SceneContent<'a> {
     /// blur, and draws the blurred result back. Used to put a softened
     /// version of the wallpaper / lower layers behind partially-transparent
     /// inactive toplevels. Has no associated wl_buffer; sampling is
-    /// driven entirely by screen position.
-    BlurredBackdrop { passes: u32 },
+    /// driven entirely by screen position. `radius` scales the per-pass
+    /// kernel offsets — 1.0 is the shader's natural 2-texel reach.
+    BlurredBackdrop { passes: u32, radius: f32 },
 }
 
 /// One thing to draw on screen: a rectangle of pixels at a position. Produced

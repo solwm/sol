@@ -36,6 +36,7 @@
 //! inactive_alpha        = 0.85             # alpha for non-focused toplevels (1.0 = no effect)
 //! inactive_blur         = on               # frosted-glass blur behind inactive toplevels
 //! inactive_blur_passes  = 4                # blur intensity (more passes = blurrier, costs a bit more GPU)
+//! inactive_blur_radius  = 1.0              # per-pass kernel reach in texels (1.0 = default 2-texel reach, 2.0 = 4-texel reach)
 //! ```
 //!
 //! The file is watched at runtime (inotify on its parent dir): saves
@@ -163,6 +164,15 @@ pub struct Config {
     /// is heavily blurred. Each pass is a downsample-then-upsample
     /// pair on a half-resolution FBO, so the cost scales mildly.
     pub inactive_blur_passes: u32,
+    /// Per-pass kernel radius scale, in texels. The blur shader
+    /// samples a 5×5 box (offsets `dx, dy ∈ {-2..2}`) multiplied
+    /// by `u_texel * radius`. `1.0` = the original 2-texel reach
+    /// per pass; `2.0` = same kernel but 4-texel reach (sparser
+    /// sampling, blurrier-but-noisier). Each pass widens the
+    /// effective kernel by convolution, so most users get the
+    /// strongest payoff from raising `inactive_blur_passes` first
+    /// and only nudging this when they want something dramatic.
+    pub inactive_blur_radius: f32,
 }
 
 /// Easing functions exposed to the config. All map `t ∈ [0, 1]`
@@ -217,6 +227,7 @@ impl Default for Config {
             inactive_alpha: 0.85,
             inactive_blur: true,
             inactive_blur_passes: 4,
+            inactive_blur_radius: 1.0,
         }
     }
 }
@@ -434,6 +445,7 @@ enum Entry {
     InactiveAlpha(f32),
     InactiveBlur(bool),
     InactiveBlurPasses(u32),
+    InactiveBlurRadius(f32),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -472,6 +484,7 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::InactiveAlpha(v))) => cfg.inactive_alpha = v,
             Ok(Some(Entry::InactiveBlur(v))) => cfg.inactive_blur = v,
             Ok(Some(Entry::InactiveBlurPasses(v))) => cfg.inactive_blur_passes = v,
+            Ok(Some(Entry::InactiveBlurRadius(v))) => cfg.inactive_blur_radius = v,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -520,6 +533,7 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "inactive_alpha" => Ok(Some(Entry::InactiveAlpha(parse_float01(rhs)?))),
         "inactive_blur" => Ok(Some(Entry::InactiveBlur(parse_bool(rhs)?))),
         "inactive_blur_passes" => Ok(Some(Entry::InactiveBlurPasses(parse_uint(rhs)?))),
+        "inactive_blur_radius" => Ok(Some(Entry::InactiveBlurRadius(parse_pos_float(rhs)?))),
         other => bail!("unknown directive `{other}`"),
     }
 }
@@ -544,6 +558,18 @@ fn parse_float01(s: &str) -> Result<f32> {
         .with_context(|| format!("expected a float, got `{s}`"))?;
     if !(0.0..=1.0).contains(&v) {
         bail!("expected a float in [0, 1], got `{s}`");
+    }
+    Ok(v)
+}
+
+/// Parse a non-negative float. Used for blur radius — negative
+/// kernel scaling is meaningless and most likely a typo.
+fn parse_pos_float(s: &str) -> Result<f32> {
+    let v = s
+        .parse::<f32>()
+        .with_context(|| format!("expected a float, got `{s}`"))?;
+    if v < 0.0 || !v.is_finite() {
+        bail!("expected a non-negative finite float, got `{s}`");
     }
     Ok(v)
 }
