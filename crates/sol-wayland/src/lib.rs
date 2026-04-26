@@ -5,6 +5,7 @@
 //! `sol_backend_drm::DrmPresenter` for real hardware).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -70,6 +71,21 @@ use wayland_protocols::wp::idle_inhibit::zv1::server::{
 };
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
 use xkb::KeymapState;
+
+/// Hand out a fresh, never-recycled key for the DRM presenter's
+/// texture cache. Each `shm::BufferData` and `linux_dmabuf::DmabufBuffer`
+/// pulls one at construction. The previous scheme (`(self as *const _)
+/// as u64`) recycled keys whenever the heap allocator put a new buffer
+/// at a freed buffer's address before the eviction queue drained,
+/// which is exactly what happens during rapid resize churn — moving a
+/// tile across columns repeatedly creates+destroys buffers fast — and
+/// surfaces visually as two windows briefly rendering the same content.
+/// 64 bits is enough headroom that we'll never wrap in any realistic
+/// session lifetime.
+pub(crate) fn next_buffer_cache_key() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 const COMPOSITOR_VERSION: u32 = 6;
 const SHM_VERSION: u32 = 1;
@@ -1367,7 +1383,7 @@ fn scene_from_buffers<'a>(
         if let Some(bd) = buf.data::<shm::BufferData>() {
             let Some(bytes) = bd.bytes() else { continue };
             let Some(format) = bd.pixel_format() else { continue };
-            let key = (bd as *const shm::BufferData) as usize as u64;
+            let key = bd.cache_key;
             let (ux, uy, uw, uh) = compute_uv(*vsrc, bd.width, bd.height);
             scene.elements.push(SceneElement {
                 buffer_key: key,
@@ -1393,7 +1409,7 @@ fn scene_from_buffers<'a>(
             // B10.3: single-plane dmabuf only. Multi-plane (YUV etc.) lands
             // when we care about video, not for alacritty/terminals.
             let Some(p0) = db.planes.first() else { continue };
-            let key = (db as *const linux_dmabuf::DmabufBuffer) as usize as u64;
+            let key = db.cache_key;
             let (ux, uy, uw, uh) = compute_uv(*vsrc, db.width, db.height);
             scene.elements.push(SceneElement {
                 buffer_key: key,

@@ -47,6 +47,15 @@ pub struct BufferData {
     pub height: i32,
     pub stride: i32,
     pub format: Format,
+    /// Stable, globally unique ID for the texture cache. Pulled from
+    /// `crate::next_buffer_cache_key` at construction. We can't key
+    /// the cache by `(self as *const _) as u64` — wayland-server
+    /// boxes BufferData in heap memory that gets reused as soon as
+    /// the resource is dropped, and a new buffer landing at the same
+    /// address before the eviction queue drains aliases to the old
+    /// texture. Symptom of that aliasing: two windows briefly render
+    /// the same content during rapid resize/move churn.
+    pub cache_key: u64,
 }
 
 impl BufferData {
@@ -162,6 +171,7 @@ impl Dispatch<WlShmPool, PoolData> for State {
                     height,
                     stride,
                     format,
+                    cache_key: crate::next_buffer_cache_key(),
                 };
                 let _ = init.init(id, buf);
                 tracing::trace!(width, height, stride, ?format, "wl_shm_pool.create_buffer");
@@ -210,12 +220,10 @@ impl Dispatch<WlBuffer, BufferData> for State {
         _init: &mut DataInit<'_, Self>,
     ) {
         if let wl_buffer::Request::Destroy = request {
-            // Queue the cache entry for eviction on the next render tick.
-            // Buffer_key is the BufferData pointer (same value used at
-            // texture upload time), so the DRM presenter can find and
-            // free the GL texture.
-            let key = (data as *const BufferData) as usize as u64;
-            state.pending_texture_evictions.push(key);
+            // Queue the cache entry for eviction on the next render
+            // tick using the stable counter-based key (see
+            // BufferData::cache_key for why a pointer won't do).
+            state.pending_texture_evictions.push(data.cache_key);
         }
     }
 }

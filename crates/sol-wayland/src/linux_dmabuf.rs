@@ -95,6 +95,10 @@ pub struct DmabufBuffer {
     pub height: i32,
     pub format: u32,
     pub planes: Vec<DmabufPlane>,
+    /// Stable, globally unique cache key. See `shm::BufferData::cache_key`
+    /// for the rationale; same counter, so dmabuf and shm buffers can't
+    /// alias each other either.
+    pub cache_key: u64,
 }
 
 impl GlobalDispatch<ZwpLinuxDmabufV1, ()> for State {
@@ -306,6 +310,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
                         height,
                         format,
                         planes,
+                        cache_key: crate::next_buffer_cache_key(),
                     },
                 );
             }
@@ -340,6 +345,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ParamsData> for State {
                         height,
                         format,
                         planes,
+                        cache_key: crate::next_buffer_cache_key(),
                     },
                 ) {
                     Ok(buffer) => {
@@ -374,12 +380,13 @@ impl Dispatch<WlBuffer, DmabufBuffer> for State {
         _init: &mut DataInit<'_, Self>,
     ) {
         if let wl_buffer::Request::Destroy = request {
-            // Queue for eviction: alacritty creates a new dmabuf on every
-            // tile resize, so without this the EGLImage + GL texture for
-            // each old buffer leak until sol exits.
-            let key = (data as *const DmabufBuffer) as usize as u64;
-            state.pending_texture_evictions.push(key);
-            tracing::debug!(key, "dmabuf wl_buffer destroyed; queued for eviction");
+            // Queue for eviction using the stable counter-based key
+            // (see shm::BufferData::cache_key for the rationale):
+            // alacritty creates a new dmabuf on every tile resize, so
+            // without this the EGLImage + GL texture for each old
+            // buffer leak until sol exits.
+            state.pending_texture_evictions.push(data.cache_key);
+            tracing::debug!(key = data.cache_key, "dmabuf wl_buffer destroyed; queued for eviction");
         }
     }
 }
