@@ -266,14 +266,14 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
 
                 // Mark as mapped once we have a buffer + role.
                 let has_buffer = sd.current.buffer.is_some();
-                let mut just_mapped = false;
+                let mut just_mapped_toplevel = false;
                 let mut layer_needs_configure = false;
                 match &mut sd.role {
                     SurfaceRole::XdgToplevel { mapped } => {
                         if has_buffer {
                             if !*mapped {
                                 *mapped = true;
-                                just_mapped = true;
+                                just_mapped_toplevel = true;
                                 tracing::info!(id = ?surface.id(), "toplevel mapped");
                                 state.mapped_toplevels.push(crate::Window {
                                     surface: surface.downgrade(),
@@ -311,12 +311,21 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                         //    commits with NO buffer.
                         // 2. Server sends configure(serial, w, h).
                         // 3. Client acks + commits WITH a buffer → mapped.
+                        // Note: layer mapping deliberately does NOT set
+                        // just_mapped_toplevel — taking keyboard focus is
+                        // a toplevel concern. waybar / awww-daemon are
+                        // exec-once'd before any toplevel maps, so if
+                        // they grabbed focus on first map, the user's
+                        // first Alt+Enter alacritty would never become
+                        // focused (on_toplevel_mapped only sets focus
+                        // when keyboard_focus is None). Layers with
+                        // KeyboardInteractivity::Exclusive are still
+                        // honoured per-frame by rebalance_keyboard_focus.
                         if !*initial_configure_sent && !has_buffer {
                             layer_needs_configure = true;
                             *initial_configure_sent = true;
                         } else if has_buffer && !*mapped && *initial_configure_sent {
                             *mapped = true;
-                            just_mapped = true;
                             tracing::info!(id = ?surface.id(), "layer surface mapped");
                         } else if !has_buffer && *mapped {
                             // Null buffer unmaps per spec.
@@ -331,7 +340,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     crate::layer_shell::send_initial_configure(state, surface);
                 }
 
-                if just_mapped {
+                if just_mapped_toplevel {
                     // Give this toplevel keyboard focus if no one else has
                     // it yet, so the user can type into it immediately.
                     state.on_toplevel_mapped(surface);
