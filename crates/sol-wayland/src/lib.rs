@@ -35,6 +35,7 @@ mod layer_shell;
 mod linux_dmabuf;
 mod output;
 mod presentation_time;
+mod primary_selection;
 mod render;
 mod seat;
 mod session;
@@ -67,6 +68,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::server::{
     zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
     zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
+use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
 use xkb::KeymapState;
 
 const COMPOSITOR_VERSION: u32 = 6;
@@ -336,6 +338,16 @@ pub struct State {
     /// itself or another client replaces the selection.
     pub selection_source:
         Option<wayland_server::protocol::wl_data_source::WlDataSource>,
+    /// `zwp_primary_selection_device_v1`s clients have bound.
+    /// Counterpart of `data_devices` for the X11-style middle-click
+    /// primary selection.
+    pub primary_devices: Vec<
+        wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+    >,
+    /// Source backing the primary (middle-click) selection.
+    pub primary_selection_source: Option<
+        wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+    >,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -386,6 +398,7 @@ pub struct Globals {
     pub fractional_scale: GlobalId,
     pub ext_workspace: GlobalId,
     pub idle_inhibit: GlobalId,
+    pub primary_selection: GlobalId,
 }
 
 impl State {
@@ -2111,6 +2124,11 @@ fn setup_event_loop(
             idle_inhibit::IDLE_INHIBIT_MANAGER_VERSION,
             (),
         ),
+        primary_selection: dh
+            .create_global::<State, ZwpPrimarySelectionDeviceManagerV1, ()>(
+                primary_selection::PRIMARY_SELECTION_VERSION,
+                (),
+            ),
     };
     tracing::info!(?globals, "advertised globals");
 
@@ -2411,6 +2429,8 @@ fn setup_event_loop(
         session: session.clone(),
         data_devices: Vec::new(),
         selection_source: None,
+        primary_devices: Vec::new(),
+        primary_selection_source: None,
     };
     let mut compositor = Compositor {
         state,
