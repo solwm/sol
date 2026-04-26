@@ -889,6 +889,19 @@ impl DrmPresenter {
         let v = (fb_h - elem.y - dst_h) / fb_h;
         let uw = dst_w / fb_w;
         let uh = dst_h / fb_h;
+        tracing::trace!(
+            elem_x = elem.x,
+            elem_y = elem.y,
+            dst_w,
+            dst_h,
+            fb_w,
+            fb_h,
+            u,
+            v,
+            uw,
+            uh,
+            "backdrop draw"
+        );
         unsafe {
             gl.use_program(Some(self.backdrop.program));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.backdrop.vbo));
