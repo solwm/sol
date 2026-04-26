@@ -88,14 +88,20 @@ pub struct Rect {
 /// assigned to it.
 ///
 /// - `rect`: the target rect — what the layout wants the tile to be,
-///   right now. Updated immediately by `apply_layout` when the layout
-///   changes (tile closed, move/focus command, zoom, etc.).
-/// - `render_rect`: where the tile is actually drawn this frame. Held
-///   back from `rect` until the client has committed a buffer whose
-///   dimensions match `rect`. Without this gate, a layout change
-///   would either stretch the old buffer to the new tile (ugly
-///   distortion for 1–2 frames) or leave the clear color peeking
-///   through the unclaimed area.
+///   right now. Updated by `apply_layout` when the layout changes
+///   (tile closed, move/focus command, zoom, etc.).
+/// - `render_rect`: where the tile is actually drawn this frame.
+///   `tick_animations` interpolates from `from_rect` toward `rect` over
+///   `ANIM_DURATION_MS` using a cubic ease-out, so layout changes read
+///   as motion rather than instant snaps. The buffer is GPU-scaled to
+///   `render_rect` regardless of its intrinsic size — during the tween
+///   it's stretched/squished smoothly, and the eye reads the scaling
+///   as resize motion rather than artifact.
+/// - `from_rect`: snapshot of `render_rect` at the moment the current
+///   tween started. The interpolation origin.
+/// - `anim_started_at`: wall-clock the current tween started, or
+///   `None` when settled. `apply_layout` writes this whenever it
+///   changes `rect`.
 /// - `pending_size` is the (w, h) most recently sent to the client via
 ///   `xdg_toplevel.configure`; layout sends a fresh configure only
 ///   when the target rect differs, so we don't spam configures every
@@ -104,6 +110,8 @@ pub struct Window {
     pub surface: Weak<WlSurface>,
     pub rect: Rect,
     pub render_rect: Rect,
+    pub from_rect: Rect,
+    pub anim_started_at: Option<Instant>,
     pub pending_size: Option<(i32, i32)>,
     /// Which workspace this window belongs to. 1-based. A window
     /// renders and receives input only when its workspace matches
@@ -520,7 +528,7 @@ fn master_stack_layout(n: usize, screen: Rect) -> Vec<Rect> {
 /// (so every tile sits at least that many pixels from the edge) and
 /// `gaps_in` is split half-each-side so adjacent tiles are exactly
 /// `gaps_in` apart.
-fn apply_layout(state: &mut State) {
+fn apply_layout(state: &mut State, now: Instant) {
     let screen = Rect {
         x: 0,
         y: 0,
@@ -548,9 +556,7 @@ fn apply_layout(state: &mut State) {
                 w.workspace == active_ws
                     && w.surface.upgrade().ok().as_ref() == Some(&zs)
             })
-            .map(|w| {
-                w.rect = inner;
-            })
+            .map(|w| set_target_rect(w, inner, now))
             .is_some();
         if zoomed_exists {
             return;
@@ -573,8 +579,25 @@ fn apply_layout(state: &mut State) {
             continue;
         }
         let Some(rect) = rect_iter.next() else { break };
-        win.rect = shrink_interior_edges(rect, inner, gaps_in);
+        let new_rect = shrink_interior_edges(rect, inner, gaps_in);
+        set_target_rect(win, new_rect, now);
     }
+}
+
+/// Update a window's target `rect` and, if it actually changed since
+/// the last call, kick off a fresh tween: snapshot `from_rect` from
+/// the current `render_rect` (so a re-trigger mid-animation feels
+/// natural — it eases from wherever the window is right now, not
+/// from the previous static target) and stamp `anim_started_at` to
+/// drive `tick_animations`. No-op when the rect is unchanged so we
+/// don't restart tweens every render tick.
+fn set_target_rect(win: &mut Window, new_rect: Rect, now: Instant) {
+    if win.rect == new_rect {
+        return;
+    }
+    win.from_rect = win.render_rect;
+    win.anim_started_at = Some(now);
+    win.rect = new_rect;
 }
 
 fn shrink_rect(r: Rect, by: i32) -> Rect {
@@ -699,9 +722,11 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     // 2. Tiled xdg_toplevels. While zoom is active, only the zoomed
     // surface renders — other tiles are effectively hidden even
     // though their mapped_toplevels entries remain untouched.
-    // Position uses `render_rect`, not `rect`: the tile stays at its
-    // pre-transition position/size until the client commits a
-    // matching buffer (see `reconcile_render_rects`).
+    // Position uses `render_rect`, not `rect`: during a layout
+    // transition `tick_animations` is interpolating the former
+    // toward the latter, and the GPU scales the buffer to whatever
+    // intermediate size we ask for — that's what makes the resize
+    // read as motion rather than a snap.
     let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     for win in state.mapped_toplevels.iter() {
         if win.workspace != state.active_ws {
@@ -936,65 +961,81 @@ fn compute_uv(
 /// pointers works; pick something unlikely to collide.
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
-/// Sync each mapped window's `render_rect` to its target `rect`. Two
-/// promotion paths:
+/// Animation duration for layout transitions, in milliseconds. 150 ms
+/// is a sweet-spot: long enough that the eye reads the resize as
+/// motion rather than artifact, short enough that the WM still feels
+/// snappy. Hyprland defaults to ~200 ms; this is a touch quicker so
+/// keyboard-driven users don't notice latency.
+const ANIM_DURATION_MS: u128 = 150;
+const ANIM_DURATION_MS_F: f32 = 150.0;
+
+/// Cubic ease-out: fast start, gentle settle. Matches "thing snapping
+/// into place" intuition — most of the visible motion is in the first
+/// half of the duration, the tail is a smooth slowdown to rest.
+fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
+fn lerp_i32(from: i32, to: i32, t: f32) -> i32 {
+    from + ((to - from) as f32 * t).round() as i32
+}
+
+fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
+    Rect {
+        x: lerp_i32(from.x, to.x, t),
+        y: lerp_i32(from.y, to.y, t),
+        w: lerp_i32(from.w, to.w, t).max(1),
+        h: lerp_i32(from.h, to.h, t).max(1),
+    }
+}
+
+/// Step every animating window's `render_rect` toward its target
+/// `rect`. Returns `true` if any window is still mid-tween, so the
+/// caller can keep `needs_render` set and the loop ticks at vblank
+/// cadence until the animation settles.
 ///
-/// 1. **Eager (extends outward).** If the new rect reaches past the
-///    current `render_rect` on any edge — i.e. the tile is growing
-///    into space that wasn't previously covered by this window — we
-///    promote immediately and let the GPU stretch the existing buffer
-///    until the client commits at the new size. The alternative is a
-///    visible background-color gap between the old render_rect and
-///    the new rect for 1–2 frames; the most obvious case is closing
-///    a tile in the middle of the stack column, where neighbours grow
-///    upward/downward into the vacated slot. A briefly-stretched
-///    buffer is far less perceptible than a flash of wallpaper.
+/// Newly-mapped windows (render_rect zero) snap to their assigned
+/// rect on first sight — there's nothing on screen to interpolate
+/// from, and a "spawn from a point" animation is a polish for later.
 ///
-/// 2. **Held-back (shrinking or repositioning inside old bounds).**
-///    Otherwise we wait until the client has committed a buffer
-///    whose logical size matches the target rect. This preserves the
-///    old layout for 1–2 frames during opens and swaps, where the
-///    new tile's slot is filled either by the new window's first
-///    commit or by an unchanged neighbour — so no gap appears.
-///
-/// A newly-mapped window (render_rect still all zeros) is promoted
-/// on first sight; there is nothing on screen to smooth over.
-fn reconcile_render_rects(state: &mut State) {
+/// `apply_layout` is what triggers a new tween: when it changes a
+/// window's `rect`, it captures `from_rect = render_rect` and
+/// `anim_started_at = now`. This function then drives the
+/// interpolation; once `elapsed >= ANIM_DURATION_MS` we snap to the
+/// target and clear `anim_started_at`.
+fn tick_animations(state: &mut State, now: Instant) -> bool {
+    let mut any_active = false;
     for win in state.mapped_toplevels.iter_mut() {
-        // First-frame case: make the new window visible immediately.
+        // Newly mapped: snap, no animation.
         if win.render_rect.w == 0 || win.render_rect.h == 0 {
             win.render_rect = win.rect;
+            win.from_rect = win.rect;
+            win.anim_started_at = None;
             continue;
         }
-        // Already where the layout wants it.
-        if win.render_rect == win.rect {
-            continue;
-        }
-        // If the target rect extends past the current render_rect on
-        // any edge, the un-covered strip would otherwise show the
-        // clear color until the client catches up. Promote eagerly.
-        let extends_outward = win.rect.x < win.render_rect.x
-            || win.rect.y < win.render_rect.y
-            || win.rect.x + win.rect.w > win.render_rect.x + win.render_rect.w
-            || win.rect.y + win.rect.h > win.render_rect.y + win.render_rect.h;
-        if extends_outward {
-            win.render_rect = win.rect;
-            continue;
-        }
-        let Ok(surface) = win.surface.upgrade() else { continue };
-        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
-            continue;
-        };
-        let logical = {
-            let sd = sd_arc.lock().unwrap();
-            surface_logical_size(&sd)
-        };
-        if let Some((lw, lh)) = logical {
-            if lw == win.rect.w && lh == win.rect.h {
+        let Some(started) = win.anim_started_at else {
+            // No tween in progress. Idempotent guard: keep
+            // render_rect == rect even if some other code path
+            // mutated rect without going through apply_layout.
+            if win.render_rect != win.rect {
                 win.render_rect = win.rect;
             }
+            continue;
+        };
+        let elapsed = now.duration_since(started).as_millis();
+        if elapsed >= ANIM_DURATION_MS {
+            win.render_rect = win.rect;
+            win.anim_started_at = None;
+        } else {
+            let t = elapsed as f32 / ANIM_DURATION_MS_F;
+            let eased = ease_out_cubic(t);
+            win.render_rect = lerp_rect(win.from_rect, win.rect, eased);
+            any_active = true;
         }
     }
+    any_active
 }
 
 /// A surface's logical size per the Wayland protocol layering:
@@ -1193,11 +1234,14 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
     state.zoomed = None;
     ext_workspace::notify_active_changed(state, old, n);
     // Windows coming back into view get the "first-frame" treatment
-    // in reconcile_render_rects, so they snap to the new layout
-    // rather than flashing through their old rect for a frame.
+    // in `tick_animations` — render_rect.w/h == 0 means "snap to the
+    // assigned rect, no interpolation" — so the workspace appears
+    // already laid out instead of animating in from a stale rect.
     for win in state.mapped_toplevels.iter_mut() {
         if win.workspace == n {
             win.render_rect = Rect::default();
+            win.from_rect = Rect::default();
+            win.anim_started_at = None;
         }
     }
     let new_focus = state
@@ -1338,15 +1382,18 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
         .mapped_toplevels
         .retain(|w| w.surface.upgrade().is_ok());
     rebalance_keyboard_focus(&mut comp.state);
-    apply_layout(&mut comp.state);
+    let now = Instant::now();
+    apply_layout(&mut comp.state, now);
     send_pending_configures(&mut comp.state);
-    // Promote each window's render_rect to match its target rect
-    // once the client has caught up (current buffer matches the
-    // target size). This is what actually makes layout transitions
-    // visually atomic: in-flight windows keep rendering at their
-    // old position/size until their next commit, then everyone
-    // snaps to the new layout at once.
-    reconcile_render_rects(&mut comp.state);
+    // Step animations (lerp render_rect toward rect with cubic ease).
+    // If anything is still mid-tween, keep the render loop firing —
+    // page-flip-complete normally drives needs_render in DRM mode, so
+    // this is a belt-and-braces guard for headless and for ticks
+    // where no other event is pending.
+    let animating = tick_animations(&mut comp.state, now);
+    if animating {
+        comp.state.needs_render = true;
+    }
 
     let placed = collect_scene(&comp.state);
     let mut scene = scene_from_buffers(&placed, &comp.state.cursor);

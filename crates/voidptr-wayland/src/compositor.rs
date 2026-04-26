@@ -279,6 +279,8 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                     surface: surface.downgrade(),
                                     rect: crate::Rect::default(),
                                     render_rect: crate::Rect::default(),
+                                    from_rect: crate::Rect::default(),
+                                    anim_started_at: None,
                                     pending_size: None,
                                     workspace: state.active_ws,
                                 });
