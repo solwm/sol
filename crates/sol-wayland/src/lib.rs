@@ -134,7 +134,7 @@ impl RectF {
 ///   (tile closed, move/focus command, zoom, etc.).
 /// - `render_rect`: where the tile is actually drawn this frame.
 ///   `tick_animations` interpolates from `from_rect` toward `rect` over
-///   `ANIM_DURATION_MS` using a cubic ease-out, so layout changes read
+///   `config.animation_duration_ms` using `config.animation_curve`, so layout changes read
 ///   as motion rather than instant snaps. The buffer is GPU-scaled to
 ///   `render_rect` regardless of its intrinsic size — during the tween
 ///   it's stretched/squished smoothly, and the eye reads the scaling
@@ -1172,21 +1172,45 @@ fn compute_uv(
 /// pointers works; pick something unlikely to collide.
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 
-/// Animation duration for layout transitions, in milliseconds. 150 ms
-/// is a sweet-spot: long enough that the eye reads the resize as
-/// motion rather than artifact, short enough that the WM still feels
-/// snappy. Hyprland defaults to ~200 ms; this is a touch quicker so
-/// keyboard-driven users don't notice latency.
-const ANIM_DURATION_MS: u128 = 150;
-const ANIM_DURATION_MS_F: f32 = 150.0;
-
-/// Cubic ease-out: fast start, gentle settle. Matches "thing snapping
-/// into place" intuition — most of the visible motion is in the first
-/// half of the duration, the tail is a smooth slowdown to rest.
-fn ease_out_cubic(t: f32) -> f32 {
+/// Apply the configured easing curve to a raw `[0, 1]` progress value.
+/// Names follow the easings.net taxonomy. `CubicOut` (the default)
+/// front-loads motion and slows to a settle, which reads as "snap
+/// into place" without the harshness of an actual snap.
+fn apply_easing(curve: config::AnimationCurve, t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
-    let inv = 1.0 - t;
-    1.0 - inv * inv * inv
+    match curve {
+        config::AnimationCurve::Linear => t,
+        config::AnimationCurve::CubicOut => {
+            let inv = 1.0 - t;
+            1.0 - inv * inv * inv
+        }
+        config::AnimationCurve::QuartOut => {
+            let inv = 1.0 - t;
+            1.0 - inv * inv * inv * inv
+        }
+        config::AnimationCurve::QuintOut => {
+            let inv = 1.0 - t;
+            1.0 - inv * inv * inv * inv * inv
+        }
+        config::AnimationCurve::ExpoOut => {
+            // Closed-form ease-out exponential, with the t==1 case
+            // pinned to exactly 1.0 (otherwise 2^-10 leaves a tiny
+            // residual ~0.001 that would make the snap visible).
+            if t >= 1.0 {
+                1.0
+            } else {
+                1.0 - 2f32.powf(-10.0 * t)
+            }
+        }
+        config::AnimationCurve::InOutCubic => {
+            if t < 0.5 {
+                4.0 * t * t * t
+            } else {
+                let a = -2.0 * t + 2.0;
+                1.0 - a * a * a / 2.0
+            }
+        }
+    }
 }
 
 fn lerp_f32(from: f32, to: f32, t: f32) -> f32 {
@@ -1207,16 +1231,19 @@ fn lerp_rectf(from: RectF, to: RectF, t: f32) -> RectF {
 /// caller can keep `needs_render` set and the loop ticks at vblank
 /// cadence until the animation settles.
 ///
+/// Duration and curve come from `state.config`; saving the conf with
+/// new values applies on the *next* tick — including in-flight tweens
+/// (a shrunk duration just snaps any tween whose elapsed already
+/// exceeds the new total). `animation_duration_ms = 0` disables
+/// tweening entirely and snaps to target on the same frame the rect
+/// changes.
+///
 /// Newly-mapped windows (render_rect zero) snap to their assigned
 /// rect on first sight — there's nothing on screen to interpolate
 /// from, and a "spawn from a point" animation is a polish for later.
-///
-/// `apply_layout` is what triggers a new tween: when it changes a
-/// window's `rect`, it captures `from_rect = render_rect` and
-/// `anim_started_at = now`. This function then drives the
-/// interpolation; once `elapsed >= ANIM_DURATION_MS` we snap to the
-/// target and clear `anim_started_at`.
 fn tick_animations(state: &mut State, now: Instant) -> bool {
+    let duration_ms = state.config.animation_duration_ms as u128;
+    let curve = state.config.animation_curve;
     let mut any_active = false;
     for win in state.mapped_toplevels.iter_mut() {
         let target: RectF = win.rect.into();
@@ -1224,6 +1251,13 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         if win.render_rect.w == 0.0 || win.render_rect.h == 0.0 {
             win.render_rect = target;
             win.from_rect = target;
+            win.anim_started_at = None;
+            continue;
+        }
+        // Tweening disabled (or already settled): keep render_rect
+        // pinned to the target and never report active.
+        if duration_ms == 0 {
+            win.render_rect = target;
             win.anim_started_at = None;
             continue;
         }
@@ -1237,12 +1271,12 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
             continue;
         };
         let elapsed = now.duration_since(started).as_millis();
-        if elapsed >= ANIM_DURATION_MS {
+        if elapsed >= duration_ms {
             win.render_rect = target;
             win.anim_started_at = None;
         } else {
-            let t = elapsed as f32 / ANIM_DURATION_MS_F;
-            let eased = ease_out_cubic(t);
+            let t = elapsed as f32 / duration_ms as f32;
+            let eased = apply_easing(curve, t);
             win.render_rect = lerp_rectf(win.from_rect, target, eased);
             any_active = true;
         }
