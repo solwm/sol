@@ -305,6 +305,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                     from_rect: crate::RectF::default(),
                                     anim_started_at: None,
                                     pending_size: None,
+                                    pending_layout: false,
                                     workspace: state.active_ws,
                                 });
                             }
@@ -370,6 +371,16 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     SurfaceRole::None | SurfaceRole::Subsurface => {}
                 }
                 drop(sd);
+
+                // For an already-mapped toplevel, this commit may be
+                // the one that lands a buffer at the size we just
+                // configured. If so, kick off the resize tween now —
+                // see `settle_pending_layout` for the rationale.
+                // Skipped for newly mapped toplevels: tick_animations
+                // snaps them on the first frame anyway.
+                if has_buffer && !just_mapped_toplevel {
+                    crate::settle_pending_layout(state, surface);
+                }
 
                 if layer_needs_configure {
                     crate::layer_shell::send_initial_configure(state, surface);

@@ -157,6 +157,19 @@ pub struct Window {
     pub from_rect: RectF,
     pub anim_started_at: Option<Instant>,
     pub pending_size: Option<(i32, i32)>,
+    /// True after `apply_layout` changed `rect` but before the client
+    /// committed a buffer at the new configured size. While set,
+    /// `tick_animations` holds `render_rect` at its previous value
+    /// (no snap, no tween) so we keep drawing the existing buffer at
+    /// its actual size — the alternative is scaling an old-size
+    /// buffer up to a growing rect and then popping in the new buffer
+    /// mid-tween, which is the visible glitch on close-then-expand.
+    /// Cleared in the commit handler the moment the buffer dims
+    /// match `pending_size`; that's also where the tween is kicked
+    /// off if `render_rect != rect`. Effectively makes the layout
+    /// transition follow the protocol's configure → ack → buffer
+    /// handshake instead of front-running it.
+    pub pending_layout: bool,
     /// Which workspace this window belongs to. 1-based. A window
     /// renders and receives input only when its workspace matches
     /// `State.active_ws`; otherwise it stays mapped but hidden.
@@ -874,23 +887,16 @@ fn apply_layout(state: &mut State, now: Instant) {
     }
 }
 
-/// Update a window's target `rect` and, if it actually changed since
-/// the last call, kick off a fresh tween: snapshot `from_rect` from
-/// the current `render_rect` (so a re-trigger mid-animation feels
-/// natural — it eases from wherever the window is right now, not
-/// from the previous static target) and stamp `anim_started_at` to
-/// drive `tick_animations`. No-op when the rect is unchanged so we
-/// don't restart tweens every render tick.
-fn set_target_rect(win: &mut Window, new_rect: Rect, now: Instant) {
+/// Update a window's target `rect`. Marks `pending_layout` so the
+/// resize tween only kicks off when the client commits a buffer at
+/// the size we're about to configure (see `settle_pending_layout`).
+/// No-op when the rect is unchanged so we don't re-arm the wait.
+fn set_target_rect(win: &mut Window, new_rect: Rect, _now: Instant) {
     if win.rect == new_rect {
         return;
     }
-    // Capture the live render_rect (in float) as the tween origin so
-    // a re-trigger mid-animation eases from where the window is right
-    // now, not from the previous static target.
-    win.from_rect = win.render_rect;
-    win.anim_started_at = Some(now);
     win.rect = new_rect;
+    win.pending_layout = true;
 }
 
 fn shrink_rect(r: Rect, by: i32) -> Rect {
@@ -1551,11 +1557,14 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
     let mut any_active = false;
     for win in state.mapped_toplevels.iter_mut() {
         let target: RectF = win.rect.into();
-        // Newly mapped: snap, no animation.
+        // Newly mapped: snap, no animation. Clearing pending_layout
+        // here is fine — there's nothing to interpolate from, and the
+        // commit-driven kickoff would have nothing useful to do.
         if win.render_rect.w == 0.0 || win.render_rect.h == 0.0 {
             win.render_rect = target;
             win.from_rect = target;
             win.anim_started_at = None;
+            win.pending_layout = false;
             continue;
         }
         // Tweening disabled (or already settled): keep render_rect
@@ -1563,12 +1572,21 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         if duration_ms == 0 {
             win.render_rect = target;
             win.anim_started_at = None;
+            win.pending_layout = false;
             continue;
         }
         let Some(started) = win.anim_started_at else {
-            // No tween in progress. Idempotent guard: keep
-            // render_rect == rect even if some other code path
-            // mutated rect without going through apply_layout.
+            // No tween in progress. If we're waiting for the client
+            // to commit at the newly-configured size, hold render_rect
+            // where it is — `settle_pending_layout` (commit handler)
+            // is what kicks the tween off, so the buffer matches the
+            // rect we're animating toward.
+            if win.pending_layout {
+                continue;
+            }
+            // Idempotent guard: keep render_rect == rect even if some
+            // other code path mutated rect without going through
+            // apply_layout.
             if win.render_rect != target {
                 win.render_rect = target;
             }
@@ -1697,6 +1715,53 @@ fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
                 .map(|m| (m.rect.x as f32, m.rect.y as f32))
         }
         _ => None,
+    }
+}
+
+/// Called from the wl_surface commit handler whenever a mapped
+/// toplevel attaches a buffer. If the toplevel has a pending layout
+/// change AND the buffer's logical size matches the pending
+/// configure, mark the change as settled and kick off the resize
+/// tween from the current `render_rect` to the new target. Until
+/// this runs the window keeps drawing at its old rect with its old
+/// buffer — the protocol-correct "client owns its size" behaviour.
+pub(crate) fn settle_pending_layout(state: &mut State, surface: &WlSurface) {
+    // Pull logical size out of the surface's SurfaceData while we
+    // already have a Mutex guard available; cheap and read-only.
+    let logical = surface
+        .data::<Arc<Mutex<compositor::SurfaceData>>>()
+        .and_then(|arc| arc.lock().ok().and_then(|sd| surface_logical_size(&sd)));
+
+    let now = Instant::now();
+    let mut kicked = false;
+    for win in state.mapped_toplevels.iter_mut() {
+        if win.surface.upgrade().ok().as_ref() != Some(surface) {
+            continue;
+        }
+        if !win.pending_layout {
+            return;
+        }
+        // Only settle when the client's buffer is at the size we
+        // configured. If they're still on the old size — e.g. they
+        // committed before processing our configure — keep waiting.
+        let matches = match (logical, win.pending_size) {
+            (Some(buf), Some(cfg)) => buf == cfg,
+            _ => false,
+        };
+        if !matches {
+            return;
+        }
+        win.pending_layout = false;
+        let target: RectF = win.rect.into();
+        if win.render_rect != target && win.anim_started_at.is_none() {
+            win.from_rect = win.render_rect;
+            win.anim_started_at = Some(now);
+            kicked = true;
+        }
+        break;
+    }
+    if kicked {
+        state.needs_render = true;
     }
 }
 
