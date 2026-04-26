@@ -348,6 +348,21 @@ pub struct State {
     pub primary_selection_source: Option<
         wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
     >,
+    /// Mapped xdg_popups in creation order (topmost last). Each entry
+    /// is a weak ref to the popup's wl_surface; per-popup data
+    /// (parent, offset, size) lives on `SurfaceData`. Dead weaks are
+    /// pruned on render tick. Drawn after toplevels and after
+    /// Top/Overlay layers so context menus reliably appear over
+    /// every other surface.
+    pub mapped_popups: Vec<Weak<WlSurface>>,
+    /// The most recently grabbing xdg_popup, if any. A click outside
+    /// this popup's chain dismisses it (and every popup above it on
+    /// the parent stack) by sending `popup_done`. Set by
+    /// `xdg_popup.grab`, cleared when the grabbing popup is
+    /// destroyed.
+    pub popup_grab: Option<
+        Weak<wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup>,
+    >,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -1151,6 +1166,49 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
         emit_for_ws(&mut out, active_ws, 1.0);
     }
 
+    // 2b. Mapped xdg_popups. Stacked over toplevels in creation
+    // order so a submenu opened from a context menu sits over its
+    // parent. Each popup's screen origin is its parent's render
+    // origin plus the popup's surface-local offset (computed from
+    // xdg_positioner at GetPopup time). Subsurface trees beneath a
+    // popup recurse the same way as toplevels.
+    for popup in &state.mapped_popups {
+        let Ok(surface) = popup.upgrade() else { continue };
+        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
+        let (offset, size, buf, vsrc) = {
+            let sd = sd_arc.lock().unwrap();
+            match sd.role {
+                SurfaceRole::XdgPopup { mapped: true, offset, size } => (
+                    offset,
+                    size,
+                    sd.current.buffer.clone(),
+                    sd.viewport_src,
+                ),
+                _ => continue,
+            }
+        };
+        let Some((origin_x, origin_y)) = popup_screen_origin(state, &surface) else {
+            continue;
+        };
+        let popup_x = origin_x + offset.0 as f32;
+        let popup_y = origin_y + offset.1 as f32;
+        if let Some(buf) = buf {
+            out.push(Placed::Buffer {
+                buf,
+                rect: RectF {
+                    x: popup_x,
+                    y: popup_y,
+                    w: size.0 as f32,
+                    h: size.1 as f32,
+                },
+                vsrc,
+                alpha: 1.0,
+                corner_radius: 0.0,
+            });
+        }
+        emit_subsurface_tree(&mut out, &surface, popup_x, popup_y, 1.0);
+    }
+
     // 3. Top + Overlay layer surfaces.
     for ml in &layers {
         if matches!(ml.layer, Layer::Top | Layer::Overlay) {
@@ -1604,6 +1662,44 @@ fn has_active_animation(state: &State) -> bool {
 /// raw buffer dims to the target rect, Chrome's resize would never
 /// look "caught up" and `render_rect` would get stuck at the old
 /// position, which is exactly the ~1-second hang we were debugging.
+/// Resolve a popup surface's screen origin by walking its parent
+/// chain to the toplevel (or layer surface) that anchors the chain.
+/// Returns the parent-of-popup's render origin in screen coords;
+/// callers add the popup's surface-local offset and pixel-snap at
+/// the end. Returns `None` if the chain leads to a non-mapped root
+/// or terminates without one.
+fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
+    let sd_arc = popup.data::<Arc<Mutex<SurfaceData>>>()?;
+    let parent = sd_arc.lock().ok()?.xdg_popup_parent.clone()?.upgrade().ok()?;
+    let parent_sd = parent.data::<Arc<Mutex<SurfaceData>>>()?;
+    let role = parent_sd.lock().ok()?.role.clone();
+    match role {
+        SurfaceRole::XdgToplevel { mapped: true } => state
+            .mapped_toplevels
+            .iter()
+            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&parent))
+            .map(|w| (w.render_rect.x, w.render_rect.y)),
+        SurfaceRole::XdgPopup { mapped: true, offset, .. } => {
+            let (gx, gy) = popup_screen_origin(state, &parent)?;
+            Some((gx + offset.0 as f32, gy + offset.1 as f32))
+        }
+        SurfaceRole::LayerSurface { mapped: true, .. } => {
+            let screen = Rect {
+                x: 0,
+                y: 0,
+                w: state.screen_width as i32,
+                h: state.screen_height as i32,
+            };
+            let layers = layer_shell::mapped_layers(state, screen);
+            layers
+                .iter()
+                .find(|m| m.surface == parent)
+                .map(|m| (m.rect.x as f32, m.rect.y as f32))
+        }
+        _ => None,
+    }
+}
+
 fn surface_logical_size(sd: &compositor::SurfaceData) -> Option<(i32, i32)> {
     if let Some((w, h)) = sd.viewport_dst {
         return Some((w, h));
@@ -1960,6 +2056,9 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     comp.state
         .mapped_toplevels
         .retain(|w| w.surface.upgrade().is_ok());
+    comp.state
+        .mapped_popups
+        .retain(|w| w.upgrade().is_ok());
     rebalance_keyboard_focus(&mut comp.state);
     let now = Instant::now();
     apply_layout(&mut comp.state, now);
@@ -2431,6 +2530,8 @@ fn setup_event_loop(
         selection_source: None,
         primary_devices: Vec::new(),
         primary_selection_source: None,
+        mapped_popups: Vec::new(),
+        popup_grab: None,
     };
     let mut compositor = Compositor {
         state,
@@ -2886,6 +2987,29 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
 
     let layers = layer_shell::mapped_layers(state, screen);
 
+    // Pass 0: xdg_popups, topmost first. Popups draw on top of
+    // toplevels and over Top/Overlay layers, so click resolution
+    // must check them before anything else — otherwise right-click
+    // on an open context menu lands on the toplevel underneath.
+    for popup in state.mapped_popups.iter().rev() {
+        let Ok(surface) = popup.upgrade() else { continue };
+        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
+        let (offset, size) = match sd_arc.lock().ok().map(|sd| sd.role.clone()) {
+            Some(SurfaceRole::XdgPopup { mapped: true, offset, size }) => (offset, size),
+            _ => continue,
+        };
+        let Some((ox, oy)) = popup_screen_origin(state, &surface) else { continue };
+        let popup_rect = Rect {
+            x: (ox + offset.0 as f32).round() as i32,
+            y: (oy + offset.1 as f32).round() as i32,
+            w: size.0,
+            h: size.1,
+        };
+        if let Some((lx, ly)) = hit_rect(popup_rect) {
+            return Some(resolve_hit(surface, lx, ly));
+        }
+    }
+
     // Pass 1: Overlay > Top. Iterate overlay-first (descending priority).
     for ml in layers
         .iter()
@@ -3143,7 +3267,72 @@ fn send_pointer_axis(
     }
 }
 
+/// True if the cursor's current focus surface is one of our mapped
+/// popups or a subsurface descendant of one. Used to decide whether
+/// a button press dismisses an active popup grab.
+fn pointer_focus_in_popup_chain(state: &State) -> bool {
+    let Some(focus) = state.pointer_focus.as_ref() else { return false };
+    for popup in &state.mapped_popups {
+        let Ok(p) = popup.upgrade() else { continue };
+        if &p == focus || surface_in_subtree(&p, focus) {
+            return true;
+        }
+    }
+    false
+}
+
+fn surface_in_subtree(root: &WlSurface, target: &WlSurface) -> bool {
+    let Some(sd_arc) = root.data::<Arc<Mutex<SurfaceData>>>() else { return false };
+    let children: Vec<WlSurface> = match sd_arc.lock() {
+        Ok(sd) => sd.subsurface_children.iter().filter_map(|w| w.upgrade().ok()).collect(),
+        Err(_) => return false,
+    };
+    for child in children {
+        if &child == target {
+            return true;
+        }
+        if surface_in_subtree(&child, target) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Send `popup_done` to every currently-mapped popup so the client
+/// tears the chain down. Safer than only dismissing the explicit
+/// grabbing popup: if a client somehow grabbed nested popups
+/// non-monotonically, this still leaves no orphans on screen. The
+/// xdg_popup destroy dispatch prunes `mapped_popups` and the grab
+/// slot — we don't need to mutate them here.
+fn dismiss_popup_grab(state: &mut State) {
+    let popups: Vec<WlSurface> = state
+        .mapped_popups
+        .iter()
+        .filter_map(|w| w.upgrade().ok())
+        .collect();
+    for surface in popups {
+        let popup = match surface.data::<Arc<Mutex<SurfaceData>>>() {
+            Some(arc) => arc.lock().ok().and_then(|sd| sd.xdg_popup.clone()),
+            None => None,
+        };
+        if let Some(weak) = popup {
+            if let Ok(p) = weak.upgrade() {
+                p.popup_done();
+            }
+        }
+    }
+    state.popup_grab = None;
+}
+
 fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
+    // If a popup is currently grabbing and the press landed outside
+    // its surface tree, dismiss it before forwarding the click. The
+    // client tears the popup chain down in response to `popup_done`,
+    // and the click still propagates to whatever surface was hit so
+    // the user doesn't lose a "click somewhere else" gesture.
+    if pressed && state.popup_grab.is_some() && !pointer_focus_in_popup_chain(state) {
+        dismiss_popup_grab(state);
+    }
     let Some(focus) = state.pointer_focus.clone() else { return };
     if !focus.is_alive() {
         return;

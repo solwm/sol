@@ -1,19 +1,23 @@
-//! Minimal xdg-shell: xdg_wm_base, xdg_surface, xdg_toplevel. Just enough for
-//! a client to create a toplevel, receive a configure, ack it, and commit a
-//! first buffer.
+//! Minimal xdg-shell: xdg_wm_base, xdg_surface, xdg_toplevel, xdg_popup.
+//!
+//! Toplevels get a tile-sized initial configure and join the layout on
+//! their first buffered commit. Popups (right-click context menus,
+//! dropdowns, tooltips) get an xdg_positioner-derived placement
+//! relative to their parent and render as a separate top-of-z-order
+//! pass so they appear over toplevels and overlay layer surfaces.
 
 use std::sync::{Arc, Mutex};
 
 use wayland_protocols::xdg::shell::server::{
     xdg_popup::{self, XdgPopup},
-    xdg_positioner::{self, XdgPositioner},
+    xdg_positioner::{self, Anchor, Gravity, XdgPositioner},
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
     xdg_wm_base::{self, XdgWmBase},
 };
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
-    protocol::wl_surface::WlSurface,
+    WEnum, protocol::wl_surface::WlSurface,
 };
 
 use crate::{State, compositor::SurfaceData};
@@ -55,6 +59,47 @@ pub struct XdgSurfaceData {
     pub surface_data: Arc<Mutex<SurfaceData>>,
 }
 
+/// Per-`xdg_positioner` mutable state. The protocol is incremental:
+/// the client sets fields one request at a time and `xdg_surface.get_popup`
+/// snapshots them. Wrapped in a Mutex so the `Dispatch::request` impl
+/// (which holds `&PositionerData`) can mutate.
+#[derive(Default)]
+pub struct PositionerData {
+    pub state: Mutex<PositionerState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PositionerState {
+    /// Logical size the popup wants to be (`set_size`).
+    pub size: (i32, i32),
+    /// Anchor rect in parent-local coords (`set_anchor_rect`).
+    pub anchor_rect: (i32, i32, i32, i32),
+    /// Which edge of the anchor rect the popup attaches to.
+    pub anchor: Anchor,
+    /// Direction the popup grows from the anchor point.
+    pub gravity: Gravity,
+    /// Extra translation applied after anchor + gravity (`set_offset`).
+    pub offset: (i32, i32),
+}
+
+impl Default for PositionerState {
+    fn default() -> Self {
+        Self {
+            size: (0, 0),
+            anchor_rect: (0, 0, 0, 0),
+            anchor: Anchor::None,
+            gravity: Gravity::None,
+            offset: (0, 0),
+        }
+    }
+}
+
+/// User-data on each `XdgPopup`: lets `popup_done` dispatch find the
+/// surface to clean up without re-walking the toplevel/popup tree.
+pub struct XdgPopupData {
+    pub wl_surface: WlSurface,
+}
+
 impl GlobalDispatch<XdgWmBase, ()> for State {
     fn bind(
         _state: &mut Self,
@@ -73,7 +118,7 @@ impl Dispatch<XdgWmBase, ()> for State {
     fn request(
         _state: &mut Self,
         _client: &Client,
-        wm: &XdgWmBase,
+        _wm: &XdgWmBase,
         request: xdg_wm_base::Request,
         _data: &(),
         _dh: &DisplayHandle,
@@ -93,13 +138,11 @@ impl Dispatch<XdgWmBase, ()> for State {
                 );
             }
             xdg_wm_base::Request::CreatePositioner { id } => {
-                let _ = init.init(id, ());
+                let _ = init.init(id, PositionerData::default());
             }
             xdg_wm_base::Request::Pong { serial: _ } => {}
             xdg_wm_base::Request::Destroy => {}
-            _ => {
-                wm.post_error(xdg_wm_base::Error::InvalidPopupParent, "unsupported");
-            }
+            _ => {}
         }
     }
 }
@@ -135,9 +178,54 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                 xs.configure(serial);
                 tracing::debug!(width = sw, height = sh, "initial xdg_toplevel.configure");
             }
-            xdg_surface::Request::GetPopup { id, .. } => {
-                let _ = init.init(id, ());
-                tracing::warn!("xdg popup not implemented at B2");
+            xdg_surface::Request::GetPopup {
+                id,
+                parent,
+                positioner,
+            } => {
+                let parent_surface = parent
+                    .as_ref()
+                    .and_then(|xp| xp.data::<XdgSurfaceData>().map(|d| d.wl_surface.clone()));
+                let pos_state = positioner
+                    .data::<PositionerData>()
+                    .and_then(|d| d.state.lock().ok().map(|s| *s))
+                    .unwrap_or_default();
+
+                let popup = init.init(
+                    id,
+                    XdgPopupData {
+                        wl_surface: data.wl_surface.clone(),
+                    },
+                );
+
+                let (px, py) = compute_popup_position(&pos_state);
+                let (pw, ph) = pos_state.size;
+
+                {
+                    let mut sd = data.surface_data.lock().unwrap();
+                    sd.role = crate::compositor::SurfaceRole::XdgPopup {
+                        mapped: false,
+                        offset: (px, py),
+                        size: (pw, ph),
+                    };
+                    sd.xdg_surface = Some(xs.downgrade());
+                    sd.xdg_popup = Some(popup.downgrade());
+                    sd.xdg_popup_parent = parent_surface.as_ref().map(|s| s.downgrade());
+                }
+
+                // Initial configure: position + size, then xdg_surface
+                // serial. The client acks and commits its first buffer.
+                popup.configure(px, py, pw.max(1), ph.max(1));
+                let serial = state.next_serial();
+                xs.configure(serial);
+                tracing::debug!(
+                    x = px,
+                    y = py,
+                    w = pw,
+                    h = ph,
+                    has_parent = parent_surface.is_some(),
+                    "xdg_popup configured"
+                );
             }
             xdg_surface::Request::AckConfigure { serial } => {
                 tracing::debug!(serial, "client ack_configure");
@@ -177,28 +265,148 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
     }
 }
 
-impl Dispatch<XdgPositioner, ()> for State {
+impl Dispatch<XdgPositioner, PositionerData> for State {
     fn request(
         _state: &mut Self,
         _client: &Client,
         _resource: &XdgPositioner,
-        _request: xdg_positioner::Request,
-        _data: &(),
+        request: xdg_positioner::Request,
+        data: &PositionerData,
         _dh: &DisplayHandle,
         _init: &mut DataInit<'_, Self>,
     ) {
+        let mut s = match data.state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match request {
+            xdg_positioner::Request::SetSize { width, height } => {
+                s.size = (width, height);
+            }
+            xdg_positioner::Request::SetAnchorRect { x, y, width, height } => {
+                s.anchor_rect = (x, y, width, height);
+            }
+            xdg_positioner::Request::SetAnchor { anchor } => {
+                if let WEnum::Value(a) = anchor {
+                    s.anchor = a;
+                }
+            }
+            xdg_positioner::Request::SetGravity { gravity } => {
+                if let WEnum::Value(g) = gravity {
+                    s.gravity = g;
+                }
+            }
+            xdg_positioner::Request::SetOffset { x, y } => {
+                s.offset = (x, y);
+            }
+            // ConstraintAdjustment, SetReactive, SetParentSize,
+            // SetParentConfigure: best-effort ignored. Without
+            // reactive constraint solving popups can land off-screen
+            // for some apps; clients that care provide a sane
+            // anchor rect anyway.
+            _ => {}
+        }
     }
 }
 
-impl Dispatch<XdgPopup, ()> for State {
+impl Dispatch<XdgPopup, XdgPopupData> for State {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &XdgPopup,
-        _request: xdg_popup::Request,
-        _data: &(),
+        resource: &XdgPopup,
+        request: xdg_popup::Request,
+        data: &XdgPopupData,
         _dh: &DisplayHandle,
         _init: &mut DataInit<'_, Self>,
     ) {
+        match request {
+            xdg_popup::Request::Grab { seat: _, serial: _ } => {
+                // Track this popup as the current grabbing popup so a
+                // click outside its tree dismisses it via `popup_done`.
+                state.popup_grab = Some(resource.downgrade());
+            }
+            xdg_popup::Request::Reposition { positioner, token } => {
+                let pos_state = positioner
+                    .data::<PositionerData>()
+                    .and_then(|d| d.state.lock().ok().map(|s| *s))
+                    .unwrap_or_default();
+                let (px, py) = compute_popup_position(&pos_state);
+                let (pw, ph) = pos_state.size;
+                if let Some(sd_arc) = data.wl_surface.data::<Arc<Mutex<SurfaceData>>>() {
+                    let mut sd = sd_arc.lock().unwrap();
+                    sd.role = crate::compositor::SurfaceRole::XdgPopup {
+                        mapped: matches!(
+                            sd.role,
+                            crate::compositor::SurfaceRole::XdgPopup { mapped: true, .. }
+                        ),
+                        offset: (px, py),
+                        size: (pw, ph),
+                    };
+                }
+                resource.repositioned(token);
+                resource.configure(px, py, pw.max(1), ph.max(1));
+            }
+            xdg_popup::Request::Destroy => {
+                state.mapped_popups.retain(|w| {
+                    w.upgrade().ok().as_ref() != Some(&data.wl_surface)
+                });
+                if state
+                    .popup_grab
+                    .as_ref()
+                    .and_then(|w| w.upgrade().ok())
+                    .map(|p| p.id() == resource.id())
+                    .unwrap_or(false)
+                {
+                    state.popup_grab = None;
+                }
+                state.needs_render = true;
+            }
+            _ => {}
+        }
     }
+}
+
+/// Translate xdg_positioner state into a popup top-left in the
+/// parent's surface-local coordinate frame.
+///
+/// `anchor` picks a point on `anchor_rect`; `gravity` picks which
+/// corner of the popup sits on that anchor point. `offset` is added
+/// at the end. We don't apply constraint adjustment — popups that
+/// would land off-screen for one reason or another stay where the
+/// client asked. Clients that want safety provide a generous anchor
+/// rect / try multiple positioners on reposition.
+pub fn compute_popup_position(p: &PositionerState) -> (i32, i32) {
+    let (rx, ry, rw, rh) = p.anchor_rect;
+    let cx = rx + rw / 2;
+    let cy = ry + rh / 2;
+    // Anchor point on the rect.
+    let (ax, ay) = match p.anchor {
+        Anchor::Top => (cx, ry),
+        Anchor::Bottom => (cx, ry + rh),
+        Anchor::Left => (rx, cy),
+        Anchor::Right => (rx + rw, cy),
+        Anchor::TopLeft => (rx, ry),
+        Anchor::BottomLeft => (rx, ry + rh),
+        Anchor::TopRight => (rx + rw, ry),
+        Anchor::BottomRight => (rx + rw, ry + rh),
+        // None / Center / unknown
+        _ => (cx, cy),
+    };
+    let (pw, ph) = p.size;
+    // Gravity is the direction the popup grows from the anchor point.
+    // A "Bottom" gravity puts the anchor at the popup's top edge, so
+    // popup top-left x = ax - pw/2, y = ay.
+    let (gx, gy) = match p.gravity {
+        Gravity::Top => (ax - pw / 2, ay - ph),
+        Gravity::Bottom => (ax - pw / 2, ay),
+        Gravity::Left => (ax - pw, ay - ph / 2),
+        Gravity::Right => (ax, ay - ph / 2),
+        Gravity::TopLeft => (ax - pw, ay - ph),
+        Gravity::BottomLeft => (ax - pw, ay),
+        Gravity::TopRight => (ax, ay - ph),
+        Gravity::BottomRight => (ax, ay),
+        // None / Center / unknown: popup centered on the anchor point.
+        _ => (ax - pw / 2, ay - ph / 2),
+    };
+    (gx + p.offset.0, gy + p.offset.1)
 }

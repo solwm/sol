@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use wayland_protocols::xdg::shell::server::{
-    xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel,
+    xdg_popup::XdgPopup, xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel,
 };
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 use wayland_server::{
@@ -49,6 +49,18 @@ pub enum SurfaceRole {
     /// walker recurses through SurfaceData.subsurface_children when
     /// rendering any mapped root (xdg_toplevel or layer_surface).
     Subsurface,
+    /// `xdg_popup` role: a transient surface anchored to a parent
+    /// (toplevel or another popup) used for context menus, dropdowns,
+    /// tooltips. `offset` is the popup's top-left in the parent's
+    /// surface-local coords (computed from xdg_positioner when the
+    /// popup is created). `size` is what we configured the client to
+    /// draw at. Both stay constant across the popup's lifetime —
+    /// reposition is handled by sending a fresh configure.
+    XdgPopup {
+        mapped: bool,
+        offset: (i32, i32),
+        size: (i32, i32),
+    },
 }
 
 #[derive(Default)]
@@ -93,6 +105,17 @@ pub struct SurfaceData {
     /// as the xdg handles above, but for layer surfaces so apply_layout
     /// can configure the bar/launcher/wallpaper.
     pub zwlr_layer_surface: Option<Weak<ZwlrLayerSurfaceV1>>,
+    /// Populated by xdg_surface.get_popup. Lets the compositor send
+    /// `popup_done` to dismiss the popup (e.g. when the user clicks
+    /// outside a grabbing popup) without threading the resource handle
+    /// through every code path.
+    pub xdg_popup: Option<Weak<XdgPopup>>,
+    /// For surfaces with role=XdgPopup: weak ref to the parent surface
+    /// the popup is anchored to (a toplevel or another popup). Used to
+    /// compute the popup's screen-space origin (parent's render origin
+    /// + popup_offset) and to walk up the chain when dismissing
+    /// nested popup grabs.
+    pub xdg_popup_parent: Option<Weak<WlSurface>>,
     /// For surfaces with role=Subsurface: weak ref to the parent the
     /// child hangs off of. The scene walker follows this in reverse
     /// (parent → children) but carries the parent link so cleanup on
@@ -330,6 +353,18 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                         } else if !has_buffer && *mapped {
                             // Null buffer unmaps per spec.
                             *mapped = false;
+                        }
+                    }
+                    SurfaceRole::XdgPopup { mapped, .. } => {
+                        if has_buffer && !*mapped {
+                            *mapped = true;
+                            tracing::info!(id = ?surface.id(), "xdg_popup mapped");
+                            state.mapped_popups.push(surface.downgrade());
+                        } else if !has_buffer && *mapped {
+                            *mapped = false;
+                            state
+                                .mapped_popups
+                                .retain(|w| w.upgrade().ok().as_ref() != Some(surface));
                         }
                     }
                     SurfaceRole::None | SurfaceRole::Subsurface => {}
