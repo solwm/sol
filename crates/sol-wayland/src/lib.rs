@@ -326,6 +326,16 @@ pub struct State {
     /// its own 30-second wallpaper-cycle tick. After ~7 restarts
     /// that shows up as "transitions every few seconds."
     pub exec_once_pgids: Vec<libc::pid_t>,
+    /// Every live `wl_data_device` clients have bound. Selection
+    /// changes broadcast to all of them. Cleaned of dead resources
+    /// each time `set_selection` runs.
+    pub data_devices: Vec<wayland_server::protocol::wl_data_device::WlDataDevice>,
+    /// Source backing the current clipboard selection (Ctrl+C). The
+    /// owning client streams paste contents on demand via
+    /// `wl_data_source.send`. Cleared when the source destroys
+    /// itself or another client replaces the selection.
+    pub selection_source:
+        Option<wayland_server::protocol::wl_data_source::WlDataSource>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -2399,6 +2409,8 @@ fn setup_event_loop(
         pending_texture_evictions: Vec::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
+        data_devices: Vec::new(),
+        selection_source: None,
     };
     let mut compositor = Compositor {
         state,
