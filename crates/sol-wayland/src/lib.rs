@@ -164,7 +164,8 @@ pub struct Window {
 /// In-flight workspace crossfade. While set, both the outgoing and
 /// the (already-promoted) incoming workspace render simultaneously,
 /// with alpha derived from `now - started_at` against
-/// `config.animation_duration_ms` and the configured easing curve.
+/// `config.workspace_animation_duration_ms` and the configured
+/// easing curve.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceAnim {
     /// The workspace we're leaving. Its windows render on top during
@@ -283,9 +284,9 @@ pub struct State {
     /// In-flight workspace-switch animation state. While `Some`, the
     /// outgoing workspace is rendered on top of the incoming one with
     /// per-window alpha computed from the elapsed fraction of
-    /// `config.animation_duration_ms`. When the animation finishes
-    /// `tick_workspace_animation` clears this back to `None` and only
-    /// the active workspace renders again.
+    /// `config.workspace_animation_duration_ms`. When the animation
+    /// finishes `tick_workspace_animation` clears this back to `None`
+    /// and only the active workspace renders again.
     pub workspace_anim: Option<WorkspaceAnim>,
     /// All `wl_output` resources that clients have bound. Tracked so
     /// the `ext_workspace_v1` manager can emit `output_enter` on the
@@ -1359,7 +1360,7 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
 /// active workspace at full alpha as usual.
 fn workspace_anim_alphas(state: &State, now: Instant) -> Option<(f32, f32)> {
     let anim = state.workspace_anim?;
-    let duration = state.config.animation_duration_ms as u128;
+    let duration = state.config.workspace_animation_duration_ms as u128;
     if duration == 0 {
         return None;
     }
@@ -1381,7 +1382,7 @@ fn tick_workspace_animation(state: &mut State, now: Instant) -> bool {
     let Some(anim) = state.workspace_anim else {
         return false;
     };
-    let duration = state.config.animation_duration_ms as u128;
+    let duration = state.config.workspace_animation_duration_ms as u128;
     if duration == 0 {
         state.workspace_anim = None;
         return false;
@@ -1607,7 +1608,7 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
     // the instant path.
     state.workspace_anim = match state.config.workspace_animation {
         config::WorkspaceAnimation::Crossfade
-            if state.config.animation_duration_ms > 0 =>
+            if state.config.workspace_animation_duration_ms > 0 =>
         {
             Some(WorkspaceAnim {
                 from_ws: old,

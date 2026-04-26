@@ -32,6 +32,7 @@
 //! animation_duration_ms = 150              # layout-tween duration, 0 = snap
 //! animation_curve       = cubic_out        # linear|cubic_out|quart_out|quint_out|expo_out|in_out_cubic
 //! workspace_animation   = crossfade        # none|crossfade
+//! workspace_animation_duration_ms = 250    # crossfade duration, separate from animation_duration_ms
 //! ```
 //!
 //! The file is watched at runtime (inotify on its parent dir): saves
@@ -130,9 +131,16 @@ pub struct Config {
     pub animation_curve: AnimationCurve,
     /// Visual transition for `workspace, N` switches. Default
     /// `Crossfade` — the leaving workspace fades out while the
-    /// arriving one fades in over `animation_duration_ms` using
-    /// `animation_curve`. `None` is an instant cut.
+    /// arriving one fades in. `None` is an instant cut.
     pub workspace_animation: WorkspaceAnimation,
+    /// Duration of the workspace transition (`workspace_animation`),
+    /// in milliseconds. Independent of `animation_duration_ms` —
+    /// workspace switches usually feel right a touch slower than
+    /// layout tweens because a workspace switch is a bigger context
+    /// shift than a tile resize. Default 250 ms. The shared
+    /// `animation_curve` still applies. `0` falls back to an
+    /// instant cut just like `workspace_animation = none`.
+    pub workspace_animation_duration_ms: u32,
 }
 
 /// Easing functions exposed to the config. All map `t ∈ [0, 1]`
@@ -183,6 +191,7 @@ impl Default for Config {
             animation_duration_ms: 150,
             animation_curve: AnimationCurve::CubicOut,
             workspace_animation: WorkspaceAnimation::Crossfade,
+            workspace_animation_duration_ms: 250,
         }
     }
 }
@@ -396,6 +405,7 @@ enum Entry {
     AnimationDurationMs(u32),
     AnimationCurve(AnimationCurve),
     WorkspaceAnimation(WorkspaceAnimation),
+    WorkspaceAnimationDurationMs(u32),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -428,6 +438,9 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::AnimationDurationMs(v))) => cfg.animation_duration_ms = v,
             Ok(Some(Entry::AnimationCurve(c))) => cfg.animation_curve = c,
             Ok(Some(Entry::WorkspaceAnimation(w))) => cfg.workspace_animation = w,
+            Ok(Some(Entry::WorkspaceAnimationDurationMs(v))) => {
+                cfg.workspace_animation_duration_ms = v
+            }
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -469,6 +482,9 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "animation_curve" => Ok(Some(Entry::AnimationCurve(parse_animation_curve(rhs)?))),
         "workspace_animation" => {
             Ok(Some(Entry::WorkspaceAnimation(parse_workspace_animation(rhs)?)))
+        }
+        "workspace_animation_duration_ms" => {
+            Ok(Some(Entry::WorkspaceAnimationDurationMs(parse_uint(rhs)?)))
         }
         other => bail!("unknown directive `{other}`"),
     }
