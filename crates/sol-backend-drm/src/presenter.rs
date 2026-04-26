@@ -879,16 +879,26 @@ impl DrmPresenter {
         let rw = dst_w / fb_w * 2.0;
         let rh = dst_h / fb_h * 2.0;
         // UV sub-rect on the blur texture corresponds to the same
-        // screen position. The vertex shader's flip (`(1 - a_pos.y)
-        // * uv.h`) handles GL's bottom-up texture origin: the FBO
-        // was drawn into with viewport (0,0)→(w,h), so y=0 in the
-        // texture is the bottom of the screen. To sample pixel
-        // (sx, sy) at output (sx, sy), the v range is
-        // (h - sy - dh) / h up to (h - sy) / h.
+        // screen position. Two conventions collide here:
+        //   - GL textures are bottom-up: blur tex y=0 is the bottom
+        //     of the screen content, y=1 is the top.
+        //   - The shared vertex shader applies a *flip* to v
+        //     (`(1 - a_pos.y) * uv.h`) so a Wayland-style buffer
+        //     (which is stored top-row-first → GL row 0 = wallpaper
+        //     top) samples right-side-up.
+        // For our GL-native blur tex that flip would invert the
+        // sampling. We compensate by passing the v range *backwards*:
+        // `v` is the top edge of the window's region in texture
+        // coords (high v) and `uh` is *negative* so v + (1-a_pos.y)*uh
+        // walks downward to the bottom edge. Net result: a_pos.y=1
+        // (output top) samples texture top of window region, a_pos.y=0
+        // (output bottom) samples texture bottom of window region.
+        // GL does not care about negative interpolation widths — it
+        // just runs the vertex linear-interp the other direction.
         let u = elem.x / fb_w;
-        let v = (fb_h - elem.y - dst_h) / fb_h;
+        let v = (fb_h - elem.y) / fb_h;
         let uw = dst_w / fb_w;
-        let uh = dst_h / fb_h;
+        let uh = -dst_h / fb_h;
         tracing::trace!(
             elem_x = elem.x,
             elem_y = elem.y,
