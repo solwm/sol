@@ -387,12 +387,34 @@ impl State {
         self.next_serial
     }
 
-    /// Give this surface keyboard focus if no other surface currently has it.
-    /// Used when a toplevel first maps.
+    /// Grab keyboard focus on first map of a toplevel — the window
+    /// the user just spawned (or that just popped up via Alt+Enter
+    /// while another terminal had focus) is what they want to type
+    /// into next, not the previous one.
+    ///
+    /// Exception: an Exclusive-keyboard layer surface (rofi while
+    /// it's open, a lockscreen) keeps focus. Stealing focus from
+    /// rofi while it's actively waiting for the user to pick a
+    /// command would defeat the point of running rofi.
     pub fn on_toplevel_mapped(&mut self, surface: &WlSurface) {
-        if self.keyboard_focus.is_none() {
-            self.set_keyboard_focus(Some(surface.clone()));
+        use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
+        use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::KeyboardInteractivity;
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: self.screen_width as i32,
+            h: self.screen_height as i32,
+        };
+        let layers = layer_shell::mapped_layers(self, screen);
+        let exclusive_layer_focused = layers.iter().any(|m| {
+            matches!(m.layer, Layer::Top | Layer::Overlay)
+                && m.keyboard_interactivity
+                    == KeyboardInteractivity::Exclusive as u32
+        });
+        if exclusive_layer_focused {
+            return;
         }
+        self.set_keyboard_focus(Some(surface.clone()));
     }
 
     pub fn set_keyboard_focus(&mut self, new: Option<WlSurface>) {
