@@ -290,6 +290,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 // Mark as mapped once we have a buffer + role.
                 let has_buffer = sd.current.buffer.is_some();
                 let mut just_mapped_toplevel = false;
+                let mut should_unmap_toplevel = false;
                 let mut layer_needs_configure = false;
                 match &mut sd.role {
                     SurfaceRole::XdgToplevel { mapped } => {
@@ -318,12 +319,13 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                             // apply_layout keeps its tile rect reserved
                             // while collect_scene's mapped-filter skips
                             // drawing it — wallpaper bleeds through
-                            // until destroy lands.
+                            // until destroy lands. The cleanup itself
+                            // happens after we drop the SurfaceData
+                            // lock below — `unmap_toplevel` picks the
+                            // next-down-stack tile to focus and we
+                            // can't re-enter the guard.
                             *mapped = false;
-                            state
-                                .mapped_toplevels
-                                .retain(|w| w.surface.upgrade().ok().as_ref() != Some(surface));
-                            state.needs_render = true;
+                            should_unmap_toplevel = true;
                         }
                     }
                     SurfaceRole::LayerSurface {
@@ -371,6 +373,10 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     SurfaceRole::None | SurfaceRole::Subsurface => {}
                 }
                 drop(sd);
+
+                if should_unmap_toplevel {
+                    crate::unmap_toplevel(state, surface);
+                }
 
                 // For an already-mapped toplevel, this commit may be
                 // the one that lands a buffer at the size we just

@@ -392,6 +392,12 @@ pub struct State {
     pub popup_grab: Option<
         Weak<wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup>,
     >,
+    /// Per-workspace last-focused toplevel. Saved when leaving a
+    /// workspace via `switch_workspace`, consulted on return so the
+    /// user lands back on the same window they were on. Pruned in
+    /// `unmap_toplevel` and on workspace move so dead/relocated
+    /// surfaces don't sit around as ghosts in this map.
+    pub last_focus_per_workspace: std::collections::HashMap<u32, Weak<WlSurface>>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -583,6 +589,47 @@ pub struct Compositor {
     pub state: State,
     pub display: Display<State>,
     pub backend: BackendState,
+}
+
+/// Remove a toplevel from `mapped_toplevels`, and — if it was the
+/// keyboard-focused one — pick the next-down-the-stack tile on the
+/// same workspace as the new focus. `mapped_toplevels` is ordered
+/// master-first then stack top → stack bottom, so the entry that
+/// shifts up into the closed tile's index after removal is exactly
+/// the one that was visually below it. We try that first, then walk
+/// upward as a fallback when the closed tile sat at the bottom of
+/// its workspace's slice. Also clears the closed surface from any
+/// per-workspace focus memory.
+pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
+    let was_focused = surface_eq(state.keyboard_focus.as_ref(), Some(surface));
+    let active_ws = state.active_ws;
+
+    let removed_idx = state
+        .mapped_toplevels
+        .iter()
+        .position(|w| w.surface.upgrade().ok().as_ref() == Some(surface));
+
+    state
+        .last_focus_per_workspace
+        .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
+
+    state
+        .mapped_toplevels
+        .retain(|w| w.surface.upgrade().ok().as_ref() != Some(surface));
+    state.needs_render = true;
+
+    if !was_focused {
+        return;
+    }
+    let Some(idx) = removed_idx else { return };
+    let mt = &state.mapped_toplevels;
+    let next = mt
+        .iter()
+        .skip(idx)
+        .find(|w| w.workspace == active_ws)
+        .or_else(|| mt.iter().take(idx).rev().find(|w| w.workspace == active_ws))
+        .and_then(|w| w.surface.upgrade().ok());
+    state.set_keyboard_focus(next);
 }
 
 /// If keyboard focus is missing or points at a dead surface (e.g. the
@@ -1987,6 +2034,22 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
         return;
     }
     let old = state.active_ws;
+
+    // Remember the focused tile on the workspace we're leaving so a
+    // round-trip back lands on the same window. Only stash if focus
+    // is on a tiled toplevel that actually belongs to `old` — layer
+    // surfaces and popups don't belong to a workspace in the same
+    // sense, and a focus that's on a tile from a different
+    // workspace (corner case during rapid switches) shouldn't mask
+    // the real history of `old`.
+    if let Some(focus) = state.keyboard_focus.clone() {
+        if state.mapped_toplevels.iter().any(|w| {
+            w.workspace == old && w.surface.upgrade().ok().as_ref() == Some(&focus)
+        }) {
+            state.last_focus_per_workspace.insert(old, focus.downgrade());
+        }
+    }
+
     tracing::info!(from = old, to = n, "workspace switch");
     state.active_ws = n;
     state.zoomed = None;
@@ -2019,12 +2082,26 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
         }
         _ => None,
     };
-    let new_focus = state
-        .mapped_toplevels
-        .iter()
-        .rev()
-        .filter(|w| w.workspace == n)
-        .find_map(|w| w.surface.upgrade().ok());
+    // Prefer the per-workspace remembered focus; fall back to the
+    // topmost tile on the workspace if it's gone (closed since the
+    // last time we were here, or never set on a fresh workspace).
+    let saved = state
+        .last_focus_per_workspace
+        .get(&n)
+        .and_then(|w| w.upgrade().ok())
+        .filter(|s| {
+            state.mapped_toplevels.iter().any(|w| {
+                w.workspace == n && w.surface.upgrade().ok().as_ref() == Some(s)
+            })
+        });
+    let new_focus = saved.or_else(|| {
+        state
+            .mapped_toplevels
+            .iter()
+            .rev()
+            .filter(|w| w.workspace == n)
+            .find_map(|w| w.surface.upgrade().ok())
+    });
     state.set_keyboard_focus(new_focus);
     state.needs_render = true;
     update_pointer_focus_and_motion(state);
@@ -2056,6 +2133,12 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
             w.anim_started_at = None;
         })
         .is_some();
+    if moved {
+        // Mark the moved window as the remembered focus on its new
+        // home, so a later switch to `n` lands on it instead of
+        // whatever happened to be remembered there before.
+        state.last_focus_per_workspace.insert(n, focus.downgrade());
+    }
     if !moved {
         // Focus is on a layer surface or popup, not a tiled
         // toplevel — nothing to move.
@@ -2640,6 +2723,7 @@ fn setup_event_loop(
         primary_selection_source: None,
         mapped_popups: Vec::new(),
         popup_grab: None,
+        last_focus_per_workspace: std::collections::HashMap::new(),
     };
     let mut compositor = Compositor {
         state,

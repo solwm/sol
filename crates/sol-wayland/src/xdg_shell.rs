@@ -255,10 +255,7 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
                 tracing::info!(id = ?surface.id(), %app_id, "toplevel app_id");
             }
             xdg_toplevel::Request::Destroy => {
-                state
-                    .mapped_toplevels
-                    .retain(|w| w.surface.upgrade().ok().as_ref() != Some(surface));
-                state.needs_render = true;
+                crate::unmap_toplevel(state, surface);
             }
             _ => {}
         }
