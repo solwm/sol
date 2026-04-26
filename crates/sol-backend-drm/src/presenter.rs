@@ -58,6 +58,27 @@ pub struct DrmPresenter {
     quad_external: QuadProgram,
     /// Flat-color shader for border rects, debug overlays, etc.
     solid: SolidProgram,
+    /// 5×5 box-blur ping-pong program. Used to soften the wallpaper
+    /// behind inactive toplevels.
+    blur: crate::quad::BlurProgram,
+    /// Shader for the final blurred-backdrop draw onto the screen
+    /// FBO at a window's rect.
+    backdrop: crate::quad::BackdropProgram,
+    /// FBOs + colour textures used for the inactive-window blur path.
+    /// Three full-resolution FBOs are pre-allocated at presenter-init
+    /// (mode change requires a rebuild — TODO when live mode-set
+    /// lands): one to receive the captured screen contents, two to
+    /// ping-pong the blur passes between. Full-res is overkill on
+    /// paper but a 4K box-blur on a discrete GPU is well under a
+    /// frame's worth of budget, and the UV math stays trivial. If
+    /// this ever shows up in a profile, switch capture_tex to full
+    /// res with ping/pong at half and have the first blur pass do
+    /// the downsample.
+    blur_fbos: Option<BlurFbos>,
+    /// Per-frame flag set by `prepare_blur_backdrop` so we only blur
+    /// once even if multiple inactive-window backdrop elements appear
+    /// in the same scene. Reset at the top of every `render_scene`.
+    blur_ready_this_frame: bool,
     /// GPU textures keyed by Scene::buffer_key. Kept across frames so
     /// uploads are glTexSubImage2D after the first sight.
     textures: HashMap<u64, TextureEntry>,
@@ -69,6 +90,107 @@ pub struct DrmPresenter {
     /// connector properties) and reused for every subsequent call,
     /// so blank/unblank transitions are a single ioctl.
     dpms_prop: Option<property::Handle>,
+}
+
+/// Three FBOs at half output resolution used by the inactive-window
+/// frosted-backdrop pipeline. `capture` receives a copy of the screen
+/// just after the wallpaper / lower layers have been drawn; `ping`
+/// and `pong` are ping-ponged between blur passes. Each FBO has one
+/// `GL_RGBA8` colour attachment, no depth/stencil — we don't need
+/// either for a 2D scene.
+struct BlurFbos {
+    width: i32,
+    height: i32,
+    /// Texture that receives a 1:1 copy of the default framebuffer
+    /// via `glCopyTexSubImage2D`. No FBO attached — we never render
+    /// into it directly, only `glCopyTexSubImage2D` and then sample
+    /// it from the first blur pass.
+    capture_tex: glow::NativeTexture,
+    ping_fbo: glow::NativeFramebuffer,
+    ping_tex: glow::NativeTexture,
+    pong_fbo: glow::NativeFramebuffer,
+    pong_tex: glow::NativeTexture,
+}
+
+impl BlurFbos {
+    fn new(gl: &glow::Context, width: i32, height: i32) -> Result<Self> {
+        unsafe {
+            let alloc_tex = |gl: &glow::Context| -> Result<glow::NativeTexture> {
+                let tex = gl
+                    .create_texture()
+                    .map_err(|e| anyhow!("create blur texture: {e}"))?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::LINEAR as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::LINEAR as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_S,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_T,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA as i32,
+                    width,
+                    height,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    None,
+                );
+                Ok(tex)
+            };
+            let attach_fbo = |gl: &glow::Context, tex: glow::NativeTexture| -> Result<glow::NativeFramebuffer> {
+                let fbo = gl
+                    .create_framebuffer()
+                    .map_err(|e| anyhow!("create blur fbo: {e}"))?;
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(tex),
+                    0,
+                );
+                let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+                if status != glow::FRAMEBUFFER_COMPLETE {
+                    return Err(anyhow!("blur fbo incomplete: 0x{status:x}"));
+                }
+                Ok(fbo)
+            };
+            // capture_tex is only ever a glCopyTexSubImage2D destination
+            // and a sampling source — it doesn't need an FBO.
+            let capture_tex = alloc_tex(gl)?;
+            let ping_tex = alloc_tex(gl)?;
+            let ping_fbo = attach_fbo(gl, ping_tex)?;
+            let pong_tex = alloc_tex(gl)?;
+            let pong_fbo = attach_fbo(gl, pong_tex)?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            Ok(Self {
+                width,
+                height,
+                capture_tex,
+                ping_fbo,
+                ping_tex,
+                pong_fbo,
+                pong_tex,
+            })
+        }
+    }
 }
 
 struct TextureEntry {
@@ -127,6 +249,19 @@ impl DrmPresenter {
         let quad = crate::quad::build(&gl_stack.gl)?;
         let quad_external = crate::quad::build_external(&gl_stack.gl)?;
         let solid = crate::quad::build_solid(&gl_stack.gl)?;
+        let blur = crate::quad::build_blur(&gl_stack.gl)?;
+        let backdrop = crate::quad::build_backdrop(&gl_stack.gl)?;
+        // Half-resolution FBOs for the blur pipeline. Failure is
+        // non-fatal — log and disable blur for this session, the
+        // compositor still renders without the frosted-glass effect.
+        let blur_fbos =
+            match BlurFbos::new(&gl_stack.gl, width as i32, height as i32) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(error = %e, "blur FBO allocation failed; inactive-window blur disabled");
+                    None
+                }
+            };
 
         let mut presenter = Self {
             card,
@@ -139,6 +274,10 @@ impl DrmPresenter {
             quad,
             quad_external,
             solid,
+            blur,
+            backdrop,
+            blur_fbos,
+            blur_ready_this_frame: false,
             textures: HashMap::new(),
             width,
             height,
@@ -305,6 +444,11 @@ impl DrmPresenter {
         }
         let w = self.width as i32;
         let h = self.height as i32;
+        // Blur is captured-on-demand at most once per frame. Even if
+        // multiple inactive windows ask for a backdrop, they all
+        // share a single capture+blur and just sample different
+        // sub-rects of the result.
+        self.blur_ready_this_frame = false;
 
         // Pass 1: make sure every scene element has an up-to-date texture.
         // SHM elements blit pixels via glTex{Sub,}Image2D; dmabuf elements
@@ -320,6 +464,10 @@ impl DrmPresenter {
                 SceneContent::Dmabuf { .. } => {
                     import_dmabuf_texture(&self.gl_stack, &mut self.textures, elem)
                 }
+                // Backdrops have no client-side buffer; they sample
+                // from a presenter-owned FBO instead. Nothing to
+                // upload.
+                SceneContent::BlurredBackdrop { .. } => Ok(()),
             };
             if let Err(e) = res {
                 tracing::warn!(error = %e, "scene element skipped");
@@ -328,8 +476,8 @@ impl DrmPresenter {
 
         // Pass 2: draw. SHM and dmabuf elements use different shader
         // programs + texture targets; switch between them per element.
-        let gl = &self.gl_stack.gl;
         unsafe {
+            let gl = &self.gl_stack.gl;
             gl.viewport(0, 0, w, h);
             gl.clear_color(0.02, 0.02, 0.04, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
@@ -341,9 +489,22 @@ impl DrmPresenter {
 
         let mut active_program: Option<u32> = None;
         for elem in &scene.elements {
+            // Frosted backdrop: capture-and-blur the screen-so-far
+            // (lazily, once per frame) and draw the blurred FBO
+            // sampled at this element's screen rect. Different
+            // shader pipeline from the textured quad path, so
+            // active_program is forced to refresh next iteration.
+            if let SceneContent::BlurredBackdrop { passes } = &elem.content {
+                if let Err(e) = self.draw_blurred_backdrop(elem, *passes) {
+                    tracing::warn!(error = %e, "backdrop draw skipped");
+                }
+                active_program = None;
+                continue;
+            }
             let Some(entry) = self.textures.get(&elem.buffer_key) else {
                 continue;
             };
+            let gl = &self.gl_stack.gl;
             // Pick the shader + VBO set matching this element's target.
             let prog = if entry.target == GL_TEXTURE_EXTERNAL_OES {
                 &self.quad_external
@@ -403,6 +564,10 @@ impl DrmPresenter {
                 SceneContent::Dmabuf { fourcc, .. } => {
                     if (*fourcc & 0xFF) as u8 == b'X' { 1.0 } else { 0.0 }
                 }
+                // The BlurredBackdrop branch up the loop already
+                // `continue`d past this point; this arm is just to
+                // satisfy exhaustiveness.
+                SceneContent::BlurredBackdrop { .. } => unreachable!(),
             };
             unsafe {
                 gl.bind_texture(entry.target, Some(entry.tex));
@@ -430,6 +595,7 @@ impl DrmPresenter {
         // element). Separate shader program because u_tex / u_opaque
         // aren't meaningful here.
         if !scene.borders.is_empty() {
+            let gl = &self.gl_stack.gl;
             unsafe {
                 gl.use_program(Some(self.solid.program));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.solid.vbo));
@@ -453,6 +619,7 @@ impl DrmPresenter {
         }
 
         unsafe {
+            let gl = &self.gl_stack.gl;
             gl.disable_vertex_attrib_array(0);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.use_program(None);
@@ -460,6 +627,172 @@ impl DrmPresenter {
         }
 
         self.submit_flip()
+    }
+
+    /// Capture the default framebuffer (which has the wallpaper / lower
+    /// layers drawn but no toplevels yet, since collect_scene emits in
+    /// back-to-front order and inactive backdrops are emitted before
+    /// their windows) into `capture_tex`, then ping-pong `passes` rounds
+    /// of 5×5 box blur between the ping/pong FBOs. Leaves the final
+    /// blurred result in `ping_tex` (or `pong_tex`, depending on parity
+    /// — caller asks `final_blur_tex`).
+    ///
+    /// Idempotent within a frame: `blur_ready_this_frame` short-circuits
+    /// re-runs so multiple inactive windows share one blur.
+    fn prepare_blur_backdrop(&mut self, passes: u32) -> Result<()> {
+        if self.blur_ready_this_frame {
+            return Ok(());
+        }
+        let Some(fbos) = self.blur_fbos.as_ref() else {
+            anyhow::bail!("blur FBOs unavailable");
+        };
+        let gl = &self.gl_stack.gl;
+        unsafe {
+            // Capture: copy the default-FBO contents (read FB) into
+            // capture_tex (1:1, no scaling). glCopyTexSubImage2D works
+            // on GLES2; glBlitFramebuffer is GLES3 only.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, Some(fbos.capture_tex));
+            gl.copy_tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                0,
+                0,
+                fbos.width,
+                fbos.height,
+            );
+
+            // Set up blur draw state. Same VBO + attrib layout as the
+            // textured quad, so we can switch programs with minimal
+            // setup.
+            gl.use_program(Some(self.blur.program));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.blur.vbo));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&self.blur.u_tex), 0);
+            // Blur is solid-source over solid-source — no need to
+            // blend with whatever was in the destination FBO.
+            gl.disable(glow::BLEND);
+
+            // Each pass renders a fullscreen quad; rect = full NDC
+            // clip space, uv = full texture.
+            gl.uniform_4_f32(Some(&self.blur.u_rect), -1.0, -1.0, 2.0, 2.0);
+            gl.uniform_4_f32(Some(&self.blur.u_uv), 0.0, 0.0, 1.0, 1.0);
+            gl.uniform_2_f32(
+                Some(&self.blur.u_texel),
+                1.0 / fbos.width as f32,
+                1.0 / fbos.height as f32,
+            );
+
+            // Ping-pong N times. Source = capture_tex on the first
+            // pass, then swaps each iteration. Destination alternates
+            // ping ↔ pong. With at least one pass, we always end up
+            // with the final result in either ping_tex or pong_tex
+            // — `final_blur_tex` reports which.
+            let total = passes.max(1);
+            for i in 0..total {
+                let src_tex = if i == 0 {
+                    fbos.capture_tex
+                } else if i % 2 == 1 {
+                    fbos.ping_tex
+                } else {
+                    fbos.pong_tex
+                };
+                let dst_fbo = if i % 2 == 0 {
+                    fbos.ping_fbo
+                } else {
+                    fbos.pong_fbo
+                };
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dst_fbo));
+                gl.viewport(0, 0, fbos.width, fbos.height);
+                gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
+
+            // Restore default framebuffer for the rest of the scene.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.viewport(0, 0, self.width as i32, self.height as i32);
+            gl.enable(glow::BLEND);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
+
+        self.blur_ready_this_frame = true;
+        Ok(())
+    }
+
+    /// Which of `ping_tex` / `pong_tex` holds the final blurred result
+    /// after `passes` ping-pong rounds. Pass 1 ends in ping, pass 2 in
+    /// pong, etc.
+    fn final_blur_tex(&self, passes: u32) -> Option<glow::NativeTexture> {
+        let fbos = self.blur_fbos.as_ref()?;
+        let total = passes.max(1);
+        Some(if total % 2 == 1 { fbos.ping_tex } else { fbos.pong_tex })
+    }
+
+    /// Draw the prepared blurred-backdrop texture sampled at this
+    /// element's screen rect. Backdrop has no associated client
+    /// buffer; UVs are derived from the screen position so the
+    /// rendered patch shows whatever was beneath the window after
+    /// blur. Multiplied by `elem.alpha` so the caller can fade it
+    /// in/out (e.g. during workspace crossfade).
+    fn draw_blurred_backdrop(
+        &mut self,
+        elem: &sol_core::SceneElement<'_>,
+        passes: u32,
+    ) -> Result<()> {
+        self.prepare_blur_backdrop(passes)?;
+        let Some(blur_tex) = self.final_blur_tex(passes) else {
+            anyhow::bail!("blur tex unavailable");
+        };
+        let gl = &self.gl_stack.gl;
+        let fb_w = self.width as f32;
+        let fb_h = self.height as f32;
+        let dst_w = if elem.dst_width > 0.0 {
+            elem.dst_width
+        } else {
+            elem.width as f32
+        };
+        let dst_h = if elem.dst_height > 0.0 {
+            elem.dst_height
+        } else {
+            elem.height as f32
+        };
+        // NDC rect (same math as the textured-quad path).
+        let x0 = (elem.x / fb_w) * 2.0 - 1.0;
+        let y0 = 1.0 - ((elem.y + dst_h) / fb_h) * 2.0;
+        let rw = dst_w / fb_w * 2.0;
+        let rh = dst_h / fb_h * 2.0;
+        // UV sub-rect on the blur texture corresponds to the same
+        // screen position. The vertex shader's flip (`(1 - a_pos.y)
+        // * uv.h`) handles GL's bottom-up texture origin: the FBO
+        // was drawn into with viewport (0,0)→(w,h), so y=0 in the
+        // texture is the bottom of the screen. To sample pixel
+        // (sx, sy) at output (sx, sy), the v range is
+        // (h - sy - dh) / h up to (h - sy) / h.
+        let u = elem.x / fb_w;
+        let v = (fb_h - elem.y - dst_h) / fb_h;
+        let uw = dst_w / fb_w;
+        let uh = dst_h / fb_h;
+        unsafe {
+            gl.use_program(Some(self.backdrop.program));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.backdrop.vbo));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+            gl.uniform_1_i32(Some(&self.backdrop.u_tex), 0);
+            gl.uniform_4_f32(Some(&self.backdrop.u_rect), x0, y0, rw, rh);
+            gl.uniform_4_f32(Some(&self.backdrop.u_uv), u, v, uw, uh);
+            gl.uniform_1_f32(
+                Some(&self.backdrop.u_alpha),
+                elem.alpha.clamp(0.0, 1.0),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        Ok(())
     }
 
     /// Swap EGL front/back, lock the resulting GBM buffer, register a
@@ -586,6 +919,9 @@ fn upload_shm_texture(
         SceneContent::Dmabuf { .. } => {
             unreachable!("upload_shm_texture called with dmabuf content")
         }
+        SceneContent::BlurredBackdrop { .. } => {
+            unreachable!("upload_shm_texture called with backdrop content")
+        }
     };
     let expected_bytes = (stride as usize).saturating_mul(elem.height as usize);
     if pixels_in.len() < expected_bytes {
@@ -704,6 +1040,9 @@ fn import_dmabuf_texture(
         } => (*fd, *fourcc, *modifier, *offset, *stride),
         SceneContent::Shm { .. } => {
             unreachable!("import_dmabuf_texture called with SHM content")
+        }
+        SceneContent::BlurredBackdrop { .. } => {
+            unreachable!("import_dmabuf_texture called with backdrop content")
         }
     };
 

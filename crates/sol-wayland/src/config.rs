@@ -33,6 +33,9 @@
 //! animation_curve       = cubic_out        # linear|cubic_out|quart_out|quint_out|expo_out|in_out_cubic
 //! workspace_animation   = crossfade        # none|crossfade
 //! workspace_animation_duration_ms = 250    # crossfade duration, separate from animation_duration_ms
+//! inactive_alpha        = 0.85             # alpha for non-focused toplevels (1.0 = no effect)
+//! inactive_blur         = on               # frosted-glass blur behind inactive toplevels
+//! inactive_blur_passes  = 4                # blur intensity (more passes = blurrier, costs a bit more GPU)
 //! ```
 //!
 //! The file is watched at runtime (inotify on its parent dir): saves
@@ -141,6 +144,25 @@ pub struct Config {
     /// `animation_curve` still applies. `0` falls back to an
     /// instant cut just like `workspace_animation = none`.
     pub workspace_animation_duration_ms: u32,
+    /// Alpha multiplier applied to any tiled toplevel that doesn't
+    /// own keyboard focus. `1.0` disables the effect (inactive looks
+    /// identical to active); `0.85` is a subtle tint; lower values
+    /// reveal more of the wallpaper / blurred backdrop behind. The
+    /// active window always renders at full opacity.
+    pub inactive_alpha: f32,
+    /// When `true`, the wallpaper / lower layers are blurred under
+    /// each inactive toplevel before the toplevel is drawn on top
+    /// at `inactive_alpha`. Frosted-glass effect. When `false` the
+    /// inactive window's transparency just reveals the un-blurred
+    /// wallpaper. Has no visible effect if `inactive_alpha == 1.0`
+    /// (window covers the backdrop entirely either way).
+    pub inactive_blur: bool,
+    /// Number of dual-Kawase blur passes applied to the inactive
+    /// backdrop. More passes = blurrier and more expensive. 4 is a
+    /// good default for "frosted glass"; 1 is barely-blurred; 8+
+    /// is heavily blurred. Each pass is a downsample-then-upsample
+    /// pair on a half-resolution FBO, so the cost scales mildly.
+    pub inactive_blur_passes: u32,
 }
 
 /// Easing functions exposed to the config. All map `t ∈ [0, 1]`
@@ -192,6 +214,9 @@ impl Default for Config {
             animation_curve: AnimationCurve::CubicOut,
             workspace_animation: WorkspaceAnimation::Crossfade,
             workspace_animation_duration_ms: 250,
+            inactive_alpha: 0.85,
+            inactive_blur: true,
+            inactive_blur_passes: 4,
         }
     }
 }
@@ -406,6 +431,9 @@ enum Entry {
     AnimationCurve(AnimationCurve),
     WorkspaceAnimation(WorkspaceAnimation),
     WorkspaceAnimationDurationMs(u32),
+    InactiveAlpha(f32),
+    InactiveBlur(bool),
+    InactiveBlurPasses(u32),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -441,6 +469,9 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::WorkspaceAnimationDurationMs(v))) => {
                 cfg.workspace_animation_duration_ms = v
             }
+            Ok(Some(Entry::InactiveAlpha(v))) => cfg.inactive_alpha = v,
+            Ok(Some(Entry::InactiveBlur(v))) => cfg.inactive_blur = v,
+            Ok(Some(Entry::InactiveBlurPasses(v))) => cfg.inactive_blur_passes = v,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -486,6 +517,9 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "workspace_animation_duration_ms" => {
             Ok(Some(Entry::WorkspaceAnimationDurationMs(parse_uint(rhs)?)))
         }
+        "inactive_alpha" => Ok(Some(Entry::InactiveAlpha(parse_float01(rhs)?))),
+        "inactive_blur" => Ok(Some(Entry::InactiveBlur(parse_bool(rhs)?))),
+        "inactive_blur_passes" => Ok(Some(Entry::InactiveBlurPasses(parse_uint(rhs)?))),
         other => bail!("unknown directive `{other}`"),
     }
 }
@@ -498,6 +532,28 @@ fn parse_int(s: &str) -> Result<i32> {
 fn parse_uint(s: &str) -> Result<u32> {
     s.parse::<u32>()
         .with_context(|| format!("expected a non-negative integer, got `{s}`"))
+}
+
+/// Parse a float in `[0, 1]`. Used for alpha-style knobs where values
+/// outside the unit range are nonsense (negative alpha, >1.0 alpha
+/// would saturate the same as 1.0). Strict so a typo like `8.5`
+/// instead of `0.85` fails loud.
+fn parse_float01(s: &str) -> Result<f32> {
+    let v = s
+        .parse::<f32>()
+        .with_context(|| format!("expected a float, got `{s}`"))?;
+    if !(0.0..=1.0).contains(&v) {
+        bail!("expected a float in [0, 1], got `{s}`");
+    }
+    Ok(v)
+}
+
+fn parse_bool(s: &str) -> Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
+        other => bail!("expected a boolean (on/off/true/false), got `{other}`"),
+    }
 }
 
 fn parse_color(s: &str) -> Result<[f32; 4]> {

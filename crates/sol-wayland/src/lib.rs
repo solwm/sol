@@ -925,20 +925,36 @@ fn send_pending_configures(state: &mut State) {
 /// crop rect in buffer coordinates (x, y, w, h). When the source rect
 /// is Some, the presenter samples only that sub-rect of the buffer;
 /// otherwise the full texture is used.
-/// 4-tuple ABI passed from `collect_scene` to `scene_from_buffers`:
-/// the buffer to draw, the on-screen rect, an optional
-/// `wp_viewport.set_source` crop in buffer coords, and a per-element
-/// alpha in `[0, 1]` (1.0 = opaque, anything less = blended over the
-/// framebuffer per the configured blend func).
-type PlacedBuffer = (
-    wayland_server::protocol::wl_buffer::WlBuffer,
-    RectF,
-    Option<(f64, f64, f64, f64)>,
-    f32,
-);
+/// What `collect_scene` hands to `scene_from_buffers`. Two flavours:
+///
+/// - `Buffer` — a textured surface. Carries the `wl_buffer` to sample
+///   from, the on-screen rect to draw it in, an optional
+///   `wp_viewport.set_source` crop in buffer coords, and an alpha
+///   multiplier in `[0, 1]`.
+/// - `Backdrop` — a frosted-glass element. No client buffer; the
+///   presenter samples its own blur FBO at the screen rect. Carries
+///   the rect, the alpha multiplier (used to fade the backdrop
+///   in/out during workspace crossfade), and the blur-pass count
+///   the user asked for.
+///
+/// Order in the `Vec<Placed>` is back-to-front; the presenter
+/// renders straight through it.
+enum Placed {
+    Buffer {
+        buf: wayland_server::protocol::wl_buffer::WlBuffer,
+        rect: RectF,
+        vsrc: Option<(f64, f64, f64, f64)>,
+        alpha: f32,
+    },
+    Backdrop {
+        rect: RectF,
+        alpha: f32,
+        passes: u32,
+    },
+}
 
-fn collect_scene(state: &State, now: Instant) -> Vec<PlacedBuffer> {
-    let mut out: Vec<PlacedBuffer> = Vec::new();
+fn collect_scene(state: &State, now: Instant) -> Vec<Placed> {
+    let mut out: Vec<Placed> = Vec::new();
     let screen = Rect {
         x: 0,
         y: 0,
@@ -956,7 +972,12 @@ fn collect_scene(state: &State, now: Instant) -> Vec<PlacedBuffer> {
         if matches!(ml.layer, Layer::Background | Layer::Bottom) {
             let vsrc = surface_viewport_src(&ml.surface);
             let r: RectF = ml.rect.into();
-            out.push((ml.buffer.clone(), r, vsrc, 1.0));
+            out.push(Placed::Buffer {
+                buf: ml.buffer.clone(),
+                rect: r,
+                vsrc,
+                alpha: 1.0,
+            });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
@@ -978,8 +999,12 @@ fn collect_scene(state: &State, now: Instant) -> Vec<PlacedBuffer> {
     let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     let crossfade = workspace_anim_alphas(state, now);
     let active_ws = state.active_ws;
+    let focused = state.keyboard_focus.clone();
+    let inactive_alpha = state.config.inactive_alpha;
+    let inactive_blur = state.config.inactive_blur && state.config.inactive_alpha < 1.0;
+    let inactive_blur_passes = state.config.inactive_blur_passes;
 
-    let emit_for_ws = |out: &mut Vec<PlacedBuffer>, ws: u32, alpha: f32| {
+    let emit_for_ws = |out: &mut Vec<Placed>, ws: u32, ws_alpha: f32| {
         for win in state.mapped_toplevels.iter() {
             if win.workspace != ws {
                 continue;
@@ -1005,15 +1030,48 @@ fn collect_scene(state: &State, now: Instant) -> Vec<PlacedBuffer> {
                 )
             };
             let _ = vdst;
+            // Active = the surface owning keyboard focus. Active windows
+            // render at full opacity (× workspace alpha); inactive get
+            // multiplied by config.inactive_alpha and optionally
+            // preceded by a frosted-glass backdrop. Zoomed surfaces
+            // are treated as active for alpha purposes — zoom is the
+            // "spotlight" gesture, looks weird if the zoomed window
+            // is dimmed.
+            let is_active = focused
+                .as_ref()
+                .map(|f| *f == surface)
+                .unwrap_or(false)
+                || zoomed.is_some();
+            let win_alpha = ws_alpha
+                * if is_active { 1.0 } else { inactive_alpha };
+
+            if !is_active && inactive_blur {
+                // Backdrop emitted with ws_alpha (not win_alpha) so
+                // it covers the wallpaper fully outside crossfade,
+                // and fades together with its window during one.
+                // Subsurface contents don't get a separate backdrop —
+                // only the toplevel rect itself.
+                out.push(Placed::Backdrop {
+                    rect: win.render_rect,
+                    alpha: ws_alpha,
+                    passes: inactive_blur_passes,
+                });
+            }
+
             if let Some(buf) = buf_opt {
-                out.push((buf, win.render_rect, vsrc, alpha));
+                out.push(Placed::Buffer {
+                    buf,
+                    rect: win.render_rect,
+                    vsrc,
+                    alpha: win_alpha,
+                });
             }
             emit_subsurface_tree(
                 out,
                 &surface,
                 win.render_rect.x,
                 win.render_rect.y,
-                alpha,
+                win_alpha,
             );
         }
     };
@@ -1033,7 +1091,12 @@ fn collect_scene(state: &State, now: Instant) -> Vec<PlacedBuffer> {
         if matches!(ml.layer, Layer::Top | Layer::Overlay) {
             let vsrc = surface_viewport_src(&ml.surface);
             let r: RectF = ml.rect.into();
-            out.push((ml.buffer.clone(), r, vsrc, 1.0));
+            out.push(Placed::Buffer {
+                buf: ml.buffer.clone(),
+                rect: r,
+                vsrc,
+                alpha: 1.0,
+            });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
@@ -1055,7 +1118,7 @@ fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
 /// Stacking follows registration order in `subsurface_children`;
 /// `place_above` / `place_below` aren't implemented.
 fn emit_subsurface_tree(
-    out: &mut Vec<PlacedBuffer>,
+    out: &mut Vec<Placed>,
     parent: &WlSurface,
     parent_x: f32,
     parent_y: f32,
@@ -1105,9 +1168,9 @@ fn emit_subsurface_tree(
             // this also covers `set_destination` and the legacy
             // no-viewport path.
             let (w, h) = logical.unwrap_or((0, 0));
-            out.push((
+            out.push(Placed::Buffer {
                 buf,
-                RectF {
+                rect: RectF {
                     x: child_x,
                     y: child_y,
                     w: w as f32,
@@ -1115,18 +1178,44 @@ fn emit_subsurface_tree(
                 },
                 vsrc,
                 alpha,
-            ));
+            });
         }
         emit_subsurface_tree(out, &child, child_x, child_y, alpha);
     }
 }
 
 fn scene_from_buffers<'a>(
-    placed: &'a [PlacedBuffer],
+    placed: &'a [Placed],
     cursor: &'a Cursor,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
-    for (buf, rect, vsrc, alpha) in placed {
+    for p in placed {
+        let (buf, rect, vsrc, alpha) = match p {
+            Placed::Buffer { buf, rect, vsrc, alpha } => (buf, rect, vsrc, alpha),
+            Placed::Backdrop { rect, alpha, passes } => {
+                // Frosted backdrop: no client buffer, no UV crop.
+                // Use a sentinel buffer_key so the presenter's
+                // texture map never matches; the BlurredBackdrop
+                // arm in the draw loop short-circuits before any
+                // texture lookup happens anyway.
+                scene.elements.push(SceneElement {
+                    buffer_key: BACKDROP_SCENE_KEY,
+                    width: 0,
+                    height: 0,
+                    dst_width: rect.w,
+                    dst_height: rect.h,
+                    x: rect.x,
+                    y: rect.y,
+                    uv_x: 0.0,
+                    uv_y: 0.0,
+                    uv_w: 1.0,
+                    uv_h: 1.0,
+                    alpha: *alpha,
+                    content: SceneContent::BlurredBackdrop { passes: *passes },
+                });
+                continue;
+            }
+        };
         if let Some(bd) = buf.data::<shm::BufferData>() {
             let Some(bytes) = bd.bytes() else { continue };
             let Some(format) = bd.pixel_format() else { continue };
@@ -1235,6 +1324,12 @@ fn compute_uv(
 /// sprite every frame. Anything outside the range of real BufferData
 /// pointers works; pick something unlikely to collide.
 const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
+/// Sentinel buffer_key for `BlurredBackdrop` scene elements. The
+/// backdrop branch in the presenter's draw loop returns before any
+/// texture lookup happens, but a value is required by the struct
+/// shape — pick something else that can't collide with a real
+/// BufferData / DmabufBuffer pointer.
+const BACKDROP_SCENE_KEY: u64 = 0xB10B1B_DEADBEEF;
 
 /// Apply the configured easing curve to a raw `[0, 1]` progress value.
 /// Names follow the easings.net taxonomy. `CubicOut` (the default)
@@ -1803,6 +1898,13 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
                         // Headless backend has no EGL context, can't sample
                         // the dmabuf. Skip — dmabuf clients are a DRM-backend
                         // feature.
+                    }
+                    SceneContent::BlurredBackdrop { .. } => {
+                        // Headless has no GL context, no FBO, no blur path.
+                        // Inactive-window frosted glass is a DRM-backend
+                        // feature; the headless PNG dump just shows
+                        // un-blurred wallpaper behind the inactive
+                        // window's transparency.
                     }
                 }
             }

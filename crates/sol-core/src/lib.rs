@@ -30,6 +30,13 @@ pub enum SceneContent<'a> {
         offset: u32,
         stride: u32,
     },
+    /// Frosted-glass backdrop: the presenter samples the already-rendered
+    /// framebuffer at this element's screen rect, runs `passes` rounds of
+    /// blur, and draws the blurred result back. Used to put a softened
+    /// version of the wallpaper / lower layers behind partially-transparent
+    /// inactive toplevels. Has no associated wl_buffer; sampling is
+    /// driven entirely by screen position.
+    BlurredBackdrop { passes: u32 },
 }
 
 /// One thing to draw on screen: a rectangle of pixels at a position. Produced

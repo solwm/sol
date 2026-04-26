@@ -75,6 +75,47 @@ uniform vec4 u_color;
 void main() { gl_FragColor = u_color; }
 "#;
 
+/// Box-blur fragment shader. Samples a 5×5 neighbourhood (25 taps)
+/// around `v_uv`, weighted equally, and writes the average. Cheaper
+/// than a Gaussian, looks identical to the eye after a couple of
+/// passes (each pass is mathematically a convolution; box ⊛ box ⊛
+/// ... approaches Gaussian by the central limit theorem).
+///
+/// `u_texel` is the 1-texel offset in UV space (1.0 / texture_size).
+/// Caller computes it once based on the FBO's actual dimensions.
+const FS_BLUR: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_tex;
+uniform vec2 u_texel;
+varying vec2 v_uv;
+void main() {
+    vec4 sum = vec4(0.0);
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            vec2 off = vec2(float(dx), float(dy)) * u_texel;
+            sum += texture2D(u_tex, v_uv + off);
+        }
+    }
+    gl_FragColor = sum * (1.0 / 25.0);
+}
+"#;
+
+/// Backdrop fragment shader: draws a sub-rect of the
+/// already-blurred FBO texture into the current viewport. No
+/// channel swizzle (we wrote into the FBO with GL's native ordering),
+/// alpha multiplied by `u_alpha` so the caller can fade the
+/// backdrop in/out (e.g. during a workspace crossfade).
+const FS_BACKDROP: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_tex;
+uniform float u_alpha;
+varying vec2 v_uv;
+void main() {
+    vec4 t = texture2D(u_tex, v_uv);
+    gl_FragColor = vec4(t.rgb * u_alpha, u_alpha);
+}
+"#;
+
 pub struct QuadProgram {
     pub program: NativeProgram,
     pub vbo: NativeBuffer,
@@ -96,6 +137,29 @@ pub struct SolidProgram {
     pub u_color: NativeUniformLocation,
 }
 
+/// 5×5 box-blur ping-pong program. Operates on FBO-attached colour
+/// textures.
+pub struct BlurProgram {
+    pub program: NativeProgram,
+    pub vbo: NativeBuffer,
+    pub u_rect: NativeUniformLocation,
+    pub u_uv: NativeUniformLocation,
+    pub u_tex: NativeUniformLocation,
+    pub u_texel: NativeUniformLocation,
+}
+
+/// Frosted-backdrop draw program. Same vertex pipeline as `QuadProgram`
+/// but the fragment shader just samples + alpha-multiplies; no opaque
+/// fallback or channel swizzle (the FBO is GL-native).
+pub struct BackdropProgram {
+    pub program: NativeProgram,
+    pub vbo: NativeBuffer,
+    pub u_rect: NativeUniformLocation,
+    pub u_uv: NativeUniformLocation,
+    pub u_tex: NativeUniformLocation,
+    pub u_alpha: NativeUniformLocation,
+}
+
 pub fn build(gl: &glow::Context) -> Result<QuadProgram> {
     build_with_fs(gl, FS)
 }
@@ -104,6 +168,114 @@ pub fn build(gl: &glow::Context) -> Result<QuadProgram> {
 /// shader for dmabuf-imported textures bound to `GL_TEXTURE_EXTERNAL_OES`.
 pub fn build_external(gl: &glow::Context) -> Result<QuadProgram> {
     build_with_fs(gl, FS_EXTERNAL)
+}
+
+pub fn build_blur(gl: &glow::Context) -> Result<BlurProgram> {
+    unsafe {
+        let vs = compile(gl, glow::VERTEX_SHADER, VS)?;
+        let fs = compile(gl, glow::FRAGMENT_SHADER, FS_BLUR)?;
+        let program = gl
+            .create_program()
+            .map_err(|e| anyhow!("create_program: {e}"))?;
+        gl.attach_shader(program, vs);
+        gl.attach_shader(program, fs);
+        gl.bind_attrib_location(program, 0, "a_pos");
+        gl.link_program(program);
+        if !gl.get_program_link_status(program) {
+            let log = gl.get_program_info_log(program);
+            return Err(anyhow!("blur link: {log}"));
+        }
+        gl.delete_shader(vs);
+        gl.delete_shader(fs);
+
+        let u_rect = gl
+            .get_uniform_location(program, "u_rect")
+            .ok_or_else(|| anyhow!("u_rect missing"))?;
+        let u_uv = gl
+            .get_uniform_location(program, "u_uv")
+            .ok_or_else(|| anyhow!("u_uv missing"))?;
+        let u_tex = gl
+            .get_uniform_location(program, "u_tex")
+            .ok_or_else(|| anyhow!("u_tex missing"))?;
+        let u_texel = gl
+            .get_uniform_location(program, "u_texel")
+            .ok_or_else(|| anyhow!("u_texel missing"))?;
+
+        let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("create_buffer: {e}"))?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(
+            glow::ARRAY_BUFFER,
+            bytes_of_f32(&verts),
+            glow::STATIC_DRAW,
+        );
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
+        Ok(BlurProgram {
+            program,
+            vbo,
+            u_rect,
+            u_uv,
+            u_tex,
+            u_texel,
+        })
+    }
+}
+
+pub fn build_backdrop(gl: &glow::Context) -> Result<BackdropProgram> {
+    unsafe {
+        let vs = compile(gl, glow::VERTEX_SHADER, VS)?;
+        let fs = compile(gl, glow::FRAGMENT_SHADER, FS_BACKDROP)?;
+        let program = gl
+            .create_program()
+            .map_err(|e| anyhow!("create_program: {e}"))?;
+        gl.attach_shader(program, vs);
+        gl.attach_shader(program, fs);
+        gl.bind_attrib_location(program, 0, "a_pos");
+        gl.link_program(program);
+        if !gl.get_program_link_status(program) {
+            let log = gl.get_program_info_log(program);
+            return Err(anyhow!("backdrop link: {log}"));
+        }
+        gl.delete_shader(vs);
+        gl.delete_shader(fs);
+
+        let u_rect = gl
+            .get_uniform_location(program, "u_rect")
+            .ok_or_else(|| anyhow!("u_rect missing"))?;
+        let u_uv = gl
+            .get_uniform_location(program, "u_uv")
+            .ok_or_else(|| anyhow!("u_uv missing"))?;
+        let u_tex = gl
+            .get_uniform_location(program, "u_tex")
+            .ok_or_else(|| anyhow!("u_tex missing"))?;
+        let u_alpha = gl
+            .get_uniform_location(program, "u_alpha")
+            .ok_or_else(|| anyhow!("u_alpha missing"))?;
+
+        let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("create_buffer: {e}"))?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(
+            glow::ARRAY_BUFFER,
+            bytes_of_f32(&verts),
+            glow::STATIC_DRAW,
+        );
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
+        Ok(BackdropProgram {
+            program,
+            vbo,
+            u_rect,
+            u_uv,
+            u_tex,
+            u_alpha,
+        })
+    }
 }
 
 pub fn build_solid(gl: &glow::Context) -> Result<SolidProgram> {
