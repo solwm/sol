@@ -106,6 +106,14 @@ pub struct SceneBorder {
 pub struct Scene<'a> {
     pub elements: Vec<SceneElement<'a>>,
     pub borders: Vec<SceneBorder>,
+    /// Number of leading entries in `elements` that are background
+    /// (Background + Bottom layer surfaces and their subsurfaces).
+    /// The DRM presenter renders these into its capture FBO first,
+    /// then blits the result onto the screen — that gives the blur
+    /// pipeline a clean, sampler-friendly source independent of how
+    /// the default framebuffer is laid out by GBM/EGL. Everything
+    /// from `elements[background_count..]` draws normally on top.
+    pub background_count: usize,
 }
 
 impl<'a> Scene<'a> {
@@ -113,6 +121,7 @@ impl<'a> Scene<'a> {
         Self {
             elements: Vec::new(),
             borders: Vec::new(),
+            background_count: 0,
         }
     }
 }

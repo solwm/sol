@@ -975,7 +975,7 @@ enum Placed {
     },
 }
 
-fn collect_scene(state: &State, now: Instant) -> Vec<Placed> {
+fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
     let mut out: Vec<Placed> = Vec::new();
     let screen = Rect {
         x: 0,
@@ -1003,6 +1003,11 @@ fn collect_scene(state: &State, now: Instant) -> Vec<Placed> {
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
+    // Mark the boundary: everything pushed so far (bg + bottom layers
+    // and their subsurfaces) is the "background" the blur pipeline
+    // captures and blurs. Toplevels and top-layer surfaces draw on
+    // top of that, on the default framebuffer.
+    let background_count = out.len();
 
     // 2. Tiled xdg_toplevels.
     //
@@ -1122,8 +1127,7 @@ fn collect_scene(state: &State, now: Instant) -> Vec<Placed> {
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
-
-    out
+    (out, background_count)
 }
 
 fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
@@ -1208,9 +1212,11 @@ fn emit_subsurface_tree(
 
 fn scene_from_buffers<'a>(
     placed: &'a [Placed],
+    background_count: usize,
     cursor: &'a Cursor,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
+    scene.background_count = background_count;
     for p in placed {
         let (buf, rect, vsrc, alpha) = match p {
             Placed::Buffer { buf, rect, vsrc, alpha } => (buf, rect, vsrc, alpha),
@@ -1891,8 +1897,8 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
         comp.state.needs_render = true;
     }
 
-    let placed = collect_scene(&comp.state, now);
-    let mut scene = scene_from_buffers(&placed, &comp.state.cursor);
+    let (placed, background_count) = collect_scene(&comp.state, now);
+    let mut scene = scene_from_buffers(&placed, background_count, &comp.state.cursor);
     scene.borders.extend(focus_border(&comp.state));
     let drawn = scene.elements.len();
 

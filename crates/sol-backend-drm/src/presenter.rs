@@ -101,10 +101,15 @@ pub struct DrmPresenter {
 struct BlurFbos {
     width: i32,
     height: i32,
-    /// Texture that receives a 1:1 copy of the default framebuffer
-    /// via `glCopyTexSubImage2D`. No FBO attached — we never render
-    /// into it directly, only `glCopyTexSubImage2D` and then sample
-    /// it from the first blur pass.
+    /// Render target for the background pass. The presenter draws the
+    /// `Scene::background_count` leading elements (wallpaper + bottom
+    /// layer-shell surfaces) into here instead of the default FBO,
+    /// then blits this onto the screen via a fullscreen quad. That
+    /// way the capture is *guaranteed* to have valid contents we can
+    /// sample — going through `glCopyTexSubImage2D` from the
+    /// GBM-backed default framebuffer was producing zero-RGB on at
+    /// least one Mesa configuration the user reported.
+    capture_fbo: glow::NativeFramebuffer,
     capture_tex: glow::NativeTexture,
     ping_fbo: glow::NativeFramebuffer,
     ping_tex: glow::NativeTexture,
@@ -171,9 +176,8 @@ impl BlurFbos {
                 }
                 Ok(fbo)
             };
-            // capture_tex is only ever a glCopyTexSubImage2D destination
-            // and a sampling source — it doesn't need an FBO.
             let capture_tex = alloc_tex(gl)?;
+            let capture_fbo = attach_fbo(gl, capture_tex)?;
             let ping_tex = alloc_tex(gl)?;
             let ping_fbo = attach_fbo(gl, ping_tex)?;
             let pong_tex = alloc_tex(gl)?;
@@ -183,6 +187,7 @@ impl BlurFbos {
             Ok(Self {
                 width,
                 height,
+                capture_fbo,
                 capture_tex,
                 ping_fbo,
                 ping_tex,
@@ -474,6 +479,43 @@ impl DrmPresenter {
             }
         }
 
+        // Pre-pass: render the background slice (wallpaper + bottom
+        // layer-shell + their subsurfaces) into the blur capture FBO
+        // first, so the blur pipeline samples a render target we
+        // *wrote into* — not one we copy from the GBM-backed default
+        // framebuffer (which has produced zero-RGB output on at least
+        // one Mesa configuration). The same elements get drawn again
+        // into the default FBO by the main loop below; the cost is
+        // small (a handful of fullscreen quads) and the correctness
+        // win is large.
+        if let Some(fbos) = self.blur_fbos.as_ref() {
+            if scene.background_count > 0 {
+                unsafe {
+                    let gl = &self.gl_stack.gl;
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbos.capture_fbo));
+                    gl.viewport(0, 0, fbos.width, fbos.height);
+                    gl.clear_color(0.02, 0.02, 0.04, 1.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                    gl.enable(glow::BLEND);
+                    gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                    gl.active_texture(glow::TEXTURE0);
+                }
+                let mut bg_active_program: Option<u32> = None;
+                for elem in &scene.elements[..scene.background_count] {
+                    self.draw_textured_element(
+                        elem,
+                        fbos.width as f32,
+                        fbos.height as f32,
+                        &mut bg_active_program,
+                    );
+                }
+                unsafe {
+                    let gl = &self.gl_stack.gl;
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                }
+            }
+        }
+
         // Pass 2: draw. SHM and dmabuf elements use different shader
         // programs + texture targets; switch between them per element.
         unsafe {
@@ -629,6 +671,88 @@ impl DrmPresenter {
         self.submit_flip()
     }
 
+    /// Draw one textured-quad scene element into the currently-bound
+    /// framebuffer, using `fb_w` / `fb_h` to compute NDC coordinates.
+    /// `active_program` is the caller's tracking variable for which
+    /// shader is currently bound — this method updates it lazily so
+    /// consecutive elements with the same target reuse the binding.
+    /// Backdrops, missing textures, and elements whose buffer hasn't
+    /// uploaded yet are silently skipped.
+    fn draw_textured_element(
+        &self,
+        elem: &sol_core::SceneElement<'_>,
+        fb_w: f32,
+        fb_h: f32,
+        active_program: &mut Option<u32>,
+    ) {
+        if matches!(elem.content, SceneContent::BlurredBackdrop { .. }) {
+            return;
+        }
+        let Some(entry) = self.textures.get(&elem.buffer_key) else {
+            return;
+        };
+        let gl = &self.gl_stack.gl;
+        let prog = if entry.target == GL_TEXTURE_EXTERNAL_OES {
+            &self.quad_external
+        } else {
+            &self.quad
+        };
+        let prog_id = prog.program.0.get();
+        if *active_program != Some(prog_id) {
+            unsafe {
+                gl.use_program(Some(prog.program));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(prog.vbo));
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+                gl.uniform_1_i32(Some(&prog.u_tex), 0);
+            }
+            *active_program = Some(prog_id);
+        }
+        let dst_w = if elem.dst_width > 0.0 {
+            elem.dst_width
+        } else {
+            elem.width as f32
+        };
+        let dst_h = if elem.dst_height > 0.0 {
+            elem.dst_height
+        } else {
+            elem.height as f32
+        };
+        let x0 = (elem.x / fb_w) * 2.0 - 1.0;
+        let y0 = 1.0 - ((elem.y + dst_h) / fb_h) * 2.0;
+        let rw = dst_w / fb_w * 2.0;
+        let rh = dst_h / fb_h * 2.0;
+        let opaque = match &elem.content {
+            SceneContent::Shm {
+                format: PixelFormat::Argb8888,
+                ..
+            } => 0.0,
+            SceneContent::Shm {
+                format: PixelFormat::Xrgb8888,
+                ..
+            } => 1.0,
+            SceneContent::Dmabuf { fourcc, .. } => {
+                if (*fourcc & 0xFF) as u8 == b'X' { 1.0 } else { 0.0 }
+            }
+            SceneContent::BlurredBackdrop { .. } => unreachable!(),
+        };
+        unsafe {
+            gl.bind_texture(entry.target, Some(entry.tex));
+            gl.uniform_4_f32(Some(&prog.u_rect), x0, y0, rw, rh);
+            gl.uniform_4_f32(
+                Some(&prog.u_uv),
+                elem.uv_x,
+                elem.uv_y,
+                elem.uv_w,
+                elem.uv_h,
+            );
+            gl.uniform_1_f32(Some(&prog.u_opaque), opaque);
+            gl.uniform_1_f32(Some(&prog.u_alpha), elem.alpha.clamp(0.0, 1.0));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_texture(entry.target, None);
+        }
+    }
+
     /// Capture the default framebuffer (which has the wallpaper / lower
     /// layers drawn but no toplevels yet, since collect_scene emits in
     /// back-to-front order and inactive backdrops are emitted before
@@ -648,22 +772,11 @@ impl DrmPresenter {
         };
         let gl = &self.gl_stack.gl;
         unsafe {
-            // Capture: copy the default-FBO contents (read FB) into
-            // capture_tex (1:1, no scaling). glCopyTexSubImage2D works
-            // on GLES2; glBlitFramebuffer is GLES3 only.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.bind_texture(glow::TEXTURE_2D, Some(fbos.capture_tex));
-            gl.copy_tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                0,
-                0,
-                fbos.width,
-                fbos.height,
-            );
-
+            // capture_tex is already populated by the bg pre-pass at
+            // the top of render_scene — no copy from the default
+            // framebuffer needed here. Just run the blur passes
+            // ping-pong style.
+            //
             // Set up blur draw state. Same VBO + attrib layout as the
             // textured quad, so we can switch programs with minimal
             // setup.
