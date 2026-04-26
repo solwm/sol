@@ -87,6 +87,15 @@ pub struct SceneElement<'a> {
     /// 0.0 invisible. Used today for crossfade during workspace
     /// switches; available to any future caller that wants a fade.
     pub alpha: f32,
+    /// Corner radius in pixels for rounded-rect masking. `0.0` =
+    /// rectangular (the default — layer surfaces, cursor). Toplevels
+    /// and their inactive-window backdrops set this to the
+    /// configured value so windows render with rounded corners.
+    /// Implemented in the fragment shader as an SDF-based alpha
+    /// mask, which keeps the rounded edges anti-aliased (1-pixel
+    /// transition) and preserves correct blending against whatever
+    /// is behind the window.
+    pub corner_radius: f32,
     pub content: SceneContent<'a>,
 }
 

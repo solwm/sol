@@ -967,12 +967,20 @@ enum Placed {
         rect: RectF,
         vsrc: Option<(f64, f64, f64, f64)>,
         alpha: f32,
+        /// Corner-radius in pixels. `0.0` for layer surfaces, cursor,
+        /// subsurfaces; `config.corner_radius` for the toplevel's own
+        /// quad. Subsurfaces stay rectangular and rely on being
+        /// inset from the toplevel's corners — clipping a subsurface
+        /// to the parent's rounded shape would require a stencil
+        /// pass we don't have yet.
+        corner_radius: f32,
     },
     Backdrop {
         rect: RectF,
         alpha: f32,
         passes: u32,
         radius: f32,
+        corner_radius: f32,
     },
 }
 
@@ -1000,6 +1008,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                 rect: r,
                 vsrc,
                 alpha: 1.0,
+                corner_radius: 0.0,
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -1032,6 +1041,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
     let inactive_blur = state.config.inactive_blur && state.config.inactive_alpha < 1.0;
     let inactive_blur_passes = state.config.inactive_blur_passes;
     let inactive_blur_radius = state.config.inactive_blur_radius;
+    let corner_radius = state.config.corner_radius as f32;
 
     let emit_for_ws = |out: &mut Vec<Placed>, ws: u32, ws_alpha: f32| {
         for win in state.mapped_toplevels.iter() {
@@ -1085,6 +1095,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                     alpha: ws_alpha,
                     passes: inactive_blur_passes,
                     radius: inactive_blur_radius,
+                    corner_radius,
                 });
             }
 
@@ -1094,6 +1105,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                     rect: win.render_rect,
                     vsrc,
                     alpha: win_alpha,
+                    corner_radius,
                 });
             }
             emit_subsurface_tree(
@@ -1126,6 +1138,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                 rect: r,
                 vsrc,
                 alpha: 1.0,
+                corner_radius: 0.0,
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -1207,6 +1220,11 @@ fn emit_subsurface_tree(
                 },
                 vsrc,
                 alpha,
+                // Subsurfaces stay rectangular within their parent
+                // toplevel — see Placed::Buffer doc-comment for the
+                // reasoning. Rounded clipping inside the parent
+                // would need a stencil pass.
+                corner_radius: 0.0,
             });
         }
         emit_subsurface_tree(out, &child, child_x, child_y, alpha);
@@ -1221,9 +1239,17 @@ fn scene_from_buffers<'a>(
     let mut scene = Scene::new();
     scene.background_count = background_count;
     for p in placed {
-        let (buf, rect, vsrc, alpha) = match p {
-            Placed::Buffer { buf, rect, vsrc, alpha } => (buf, rect, vsrc, alpha),
-            Placed::Backdrop { rect, alpha, passes, radius } => {
+        let (buf, rect, vsrc, alpha, corner_radius) = match p {
+            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius } => {
+                (buf, rect, vsrc, alpha, corner_radius)
+            }
+            Placed::Backdrop {
+                rect,
+                alpha,
+                passes,
+                radius,
+                corner_radius,
+            } => {
                 // Frosted backdrop: no client buffer, no UV crop.
                 // Use a sentinel buffer_key so the presenter's
                 // texture map never matches; the BlurredBackdrop
@@ -1242,6 +1268,7 @@ fn scene_from_buffers<'a>(
                     uv_w: 1.0,
                     uv_h: 1.0,
                     alpha: *alpha,
+                    corner_radius: *corner_radius,
                     content: SceneContent::BlurredBackdrop {
                         passes: *passes,
                         radius: *radius,
@@ -1268,6 +1295,7 @@ fn scene_from_buffers<'a>(
                 uv_w: uw,
                 uv_h: uh,
                 alpha: *alpha,
+                corner_radius: *corner_radius,
                 content: SceneContent::Shm {
                     pixels: bytes,
                     stride: bd.stride,
@@ -1293,6 +1321,7 @@ fn scene_from_buffers<'a>(
                 uv_w: uw,
                 uv_h: uh,
                 alpha: *alpha,
+                corner_radius: *corner_radius,
                 content: SceneContent::Dmabuf {
                     fd: p0.fd.as_raw_fd(),
                     fourcc: db.format,
@@ -1319,6 +1348,7 @@ fn scene_from_buffers<'a>(
             uv_w: 1.0,
             uv_h: 1.0,
             alpha: 1.0,
+            corner_radius: 0.0,
             content: SceneContent::Shm {
                 pixels: &cursor.pixels,
                 stride: cursor.width * 4,

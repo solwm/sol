@@ -626,6 +626,11 @@ impl DrmPresenter {
                 );
                 gl.uniform_1_f32(Some(&prog.u_opaque), opaque);
                 gl.uniform_1_f32(Some(&prog.u_alpha), elem.alpha.clamp(0.0, 1.0));
+                gl.uniform_2_f32(Some(&prog.u_size), dst_w, dst_h);
+                gl.uniform_1_f32(
+                    Some(&prog.u_radius),
+                    elem.corner_radius.max(0.0),
+                );
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_texture(entry.target, None);
             }
@@ -748,6 +753,11 @@ impl DrmPresenter {
             );
             gl.uniform_1_f32(Some(&prog.u_opaque), opaque);
             gl.uniform_1_f32(Some(&prog.u_alpha), elem.alpha.clamp(0.0, 1.0));
+            gl.uniform_2_f32(Some(&prog.u_size), dst_w, dst_h);
+            gl.uniform_1_f32(
+                Some(&prog.u_radius),
+                elem.corner_radius.max(0.0),
+            );
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             gl.bind_texture(entry.target, None);
         }
@@ -930,6 +940,11 @@ impl DrmPresenter {
             gl.uniform_1_f32(
                 Some(&self.backdrop.u_alpha),
                 elem.alpha.clamp(0.0, 1.0),
+            );
+            gl.uniform_2_f32(Some(&self.backdrop.u_size), dst_w, dst_h);
+            gl.uniform_1_f32(
+                Some(&self.backdrop.u_radius),
+                elem.corner_radius.max(0.0),
             );
             gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex));
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);

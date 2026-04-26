@@ -37,6 +37,7 @@
 //! inactive_blur         = on               # frosted-glass blur behind inactive toplevels
 //! inactive_blur_passes  = 4                # blur intensity (more passes = blurrier, costs a bit more GPU)
 //! inactive_blur_radius  = 1.0              # per-pass kernel reach in texels (1.0 = default 2-texel reach, 2.0 = 4-texel reach)
+//! corner_radius         = 12               # rounded-window corner radius, px (0 = rectangular)
 //! ```
 //!
 //! The file is watched at runtime (inotify on its parent dir): saves
@@ -173,6 +174,15 @@ pub struct Config {
     /// strongest payoff from raising `inactive_blur_passes` first
     /// and only nudging this when they want something dramatic.
     pub inactive_blur_radius: f32,
+    /// Corner radius applied to xdg toplevels (and their inactive
+    /// frosted backdrops), in pixels. `0` keeps windows rectangular.
+    /// The fragment shader masks alpha to zero outside the
+    /// rounded-rect SDF, so corners are properly transparent (and
+    /// blend with the wallpaper / blurred backdrop). Note: the
+    /// focused-window border is still drawn rectangular at the
+    /// corners — a follow-up will replace the four-rect border
+    /// with a single rounded-ring draw to fully match.
+    pub corner_radius: i32,
 }
 
 /// Easing functions exposed to the config. All map `t ∈ [0, 1]`
@@ -228,6 +238,7 @@ impl Default for Config {
             inactive_blur: true,
             inactive_blur_passes: 4,
             inactive_blur_radius: 1.0,
+            corner_radius: 0,
         }
     }
 }
@@ -446,6 +457,7 @@ enum Entry {
     InactiveBlur(bool),
     InactiveBlurPasses(u32),
     InactiveBlurRadius(f32),
+    CornerRadius(i32),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -485,6 +497,7 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::InactiveBlur(v))) => cfg.inactive_blur = v,
             Ok(Some(Entry::InactiveBlurPasses(v))) => cfg.inactive_blur_passes = v,
             Ok(Some(Entry::InactiveBlurRadius(v))) => cfg.inactive_blur_radius = v,
+            Ok(Some(Entry::CornerRadius(v))) => cfg.corner_radius = v,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -534,6 +547,7 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "inactive_blur" => Ok(Some(Entry::InactiveBlur(parse_bool(rhs)?))),
         "inactive_blur_passes" => Ok(Some(Entry::InactiveBlurPasses(parse_uint(rhs)?))),
         "inactive_blur_radius" => Ok(Some(Entry::InactiveBlurRadius(parse_pos_float(rhs)?))),
+        "corner_radius" => Ok(Some(Entry::CornerRadius(parse_int(rhs)?))),
         other => bail!("unknown directive `{other}`"),
     }
 }

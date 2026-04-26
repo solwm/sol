@@ -18,6 +18,9 @@ attribute vec2 a_pos;
 uniform vec4 u_rect;
 uniform vec4 u_uv;    // (x, y, w, h) in normalized [0,1] texture coords
 varying vec2 v_uv;
+varying vec2 v_pos;   // a_pos passthrough so fragments know their
+                      // location within the output quad ([0,1]^2)
+                      // for the rounded-rect SDF in FS / FS_BACKDROP.
 void main() {
     vec2 p = u_rect.xy + a_pos * u_rect.zw;
     gl_Position = vec4(p, 0.0, 1.0);
@@ -30,10 +33,36 @@ void main() {
         u_uv.x + a_pos.x * u_uv.z,
         u_uv.y + (1.0 - a_pos.y) * u_uv.w
     );
+    v_pos = a_pos;
 }
 "#;
 
-const FS: &str = r#"#version 100
+/// Rounded-rect SDF helper macro inserted into every textured fragment
+/// shader that needs corner masking. Returns an alpha multiplier in
+/// `[0, 1]`: 1.0 inside the rounded shape, 0.0 outside, with a one-pixel
+/// linear ramp for anti-aliasing along the curve. When `u_radius == 0`
+/// the SDF reduces to inside-the-rect (always 1) so rectangular elements
+/// pay only a few extra arithmetic ops.
+const FS_ROUNDED_PRELUDE: &str = r#"
+uniform vec2 u_size;     // output rect size in pixels
+uniform float u_radius;  // corner radius in pixels (0 = rectangular)
+varying vec2 v_pos;      // a_pos passthrough, [0,1] across the quad
+float rounded_alpha() {
+    vec2 pos = v_pos * u_size;
+    vec2 half_size = u_size * 0.5;
+    vec2 q = abs(pos - half_size) - (half_size - vec2(u_radius));
+    float d = length(max(q, vec2(0.0)))
+            + min(max(q.x, q.y), 0.0)
+            - u_radius;
+    return clamp(0.5 - d, 0.0, 1.0);
+}
+"#;
+
+// Note: FS / FS_EXTERNAL / FS_BACKDROP all glue FS_ROUNDED_PRELUDE
+// in front of their `#version 100` line via build_with_fs(); see
+// `assemble_fs` below.
+
+const FS: &str = r#"
 precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_opaque;
@@ -41,7 +70,7 @@ uniform float u_alpha;
 varying vec2 v_uv;
 void main() {
     vec4 t = texture2D(u_tex, v_uv);
-    float a = mix(t.a, 1.0, u_opaque) * u_alpha;
+    float a = mix(t.a, 1.0, u_opaque) * u_alpha * rounded_alpha();
     // Non-premultiplied alpha: pair with `glBlendFunc(SRC_ALPHA,
     // ONE_MINUS_SRC_ALPHA)`. Multiplying the rgb by u_alpha here
     // would double-fade — the blend already weights src by
@@ -53,8 +82,10 @@ void main() {
 }
 "#;
 
-const FS_EXTERNAL: &str = r#"#version 100
-#extension GL_OES_EGL_image_external : require
+const FS_EXTERNAL_EXTENSIONS: &str =
+    "#extension GL_OES_EGL_image_external : require\n";
+
+const FS_EXTERNAL: &str = r#"
 precision mediump float;
 uniform samplerExternalOES u_tex;
 uniform float u_opaque;
@@ -62,7 +93,7 @@ uniform float u_alpha;
 varying vec2 v_uv;
 void main() {
     vec4 t = texture2D(u_tex, v_uv);
-    float a = mix(t.a, 1.0, u_opaque) * u_alpha;
+    float a = mix(t.a, 1.0, u_opaque) * u_alpha * rounded_alpha();
     // Driver returns (R, G, B, A) in fourcc order for external images,
     // so no channel swizzle needed here (unlike the SHM path).
     // Non-premultiplied — see FS above for the blend-function
@@ -110,7 +141,7 @@ void main() {
 /// channel swizzle (we wrote into the FBO with GL's native ordering),
 /// alpha multiplied by `u_alpha` so the caller can fade the
 /// backdrop in/out (e.g. during a workspace crossfade).
-const FS_BACKDROP: &str = r#"#version 100
+const FS_BACKDROP: &str = r#"
 precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_alpha;
@@ -118,7 +149,8 @@ varying vec2 v_uv;
 void main() {
     // Non-premultiplied — same convention as the textured-quad
     // path so the blend function pairs correctly.
-    gl_FragColor = vec4(texture2D(u_tex, v_uv).rgb, u_alpha);
+    float a = u_alpha * rounded_alpha();
+    gl_FragColor = vec4(texture2D(u_tex, v_uv).rgb, a);
 }
 "#;
 
@@ -130,6 +162,8 @@ pub struct QuadProgram {
     pub u_tex: NativeUniformLocation,
     pub u_opaque: NativeUniformLocation,
     pub u_alpha: NativeUniformLocation,
+    pub u_size: NativeUniformLocation,
+    pub u_radius: NativeUniformLocation,
 }
 
 /// Border / solid-color rect program. Same vertex pipeline and VBO
@@ -164,16 +198,18 @@ pub struct BackdropProgram {
     pub u_uv: NativeUniformLocation,
     pub u_tex: NativeUniformLocation,
     pub u_alpha: NativeUniformLocation,
+    pub u_size: NativeUniformLocation,
+    pub u_radius: NativeUniformLocation,
 }
 
 pub fn build(gl: &glow::Context) -> Result<QuadProgram> {
-    build_with_fs(gl, FS)
+    build_with_fs(gl, "", FS)
 }
 
 /// Companion to [`build`] that uses the `samplerExternalOES` fragment
 /// shader for dmabuf-imported textures bound to `GL_TEXTURE_EXTERNAL_OES`.
 pub fn build_external(gl: &glow::Context) -> Result<QuadProgram> {
-    build_with_fs(gl, FS_EXTERNAL)
+    build_with_fs(gl, FS_EXTERNAL_EXTENSIONS, FS_EXTERNAL)
 }
 
 pub fn build_blur(gl: &glow::Context) -> Result<BlurProgram> {
@@ -231,9 +267,10 @@ pub fn build_blur(gl: &glow::Context) -> Result<BlurProgram> {
 }
 
 pub fn build_backdrop(gl: &glow::Context) -> Result<BackdropProgram> {
+    let fs_src = assemble_rounded_fs("", FS_BACKDROP);
     unsafe {
         let vs = compile(gl, glow::VERTEX_SHADER, VS)?;
-        let fs = compile(gl, glow::FRAGMENT_SHADER, FS_BACKDROP)?;
+        let fs = compile(gl, glow::FRAGMENT_SHADER, &fs_src)?;
         let program = gl
             .create_program()
             .map_err(|e| anyhow!("create_program: {e}"))?;
@@ -260,6 +297,12 @@ pub fn build_backdrop(gl: &glow::Context) -> Result<BackdropProgram> {
         let u_alpha = gl
             .get_uniform_location(program, "u_alpha")
             .ok_or_else(|| anyhow!("u_alpha missing"))?;
+        let u_size = gl
+            .get_uniform_location(program, "u_size")
+            .ok_or_else(|| anyhow!("u_size missing"))?;
+        let u_radius = gl
+            .get_uniform_location(program, "u_radius")
+            .ok_or_else(|| anyhow!("u_radius missing"))?;
 
         let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let vbo = gl
@@ -280,8 +323,29 @@ pub fn build_backdrop(gl: &glow::Context) -> Result<BackdropProgram> {
             u_uv,
             u_tex,
             u_alpha,
+            u_size,
+            u_radius,
         })
     }
+}
+
+/// Concatenate `#version 100`, any required `#extension` directives,
+/// the rounded-rect SDF prelude, and a fragment-shader body. The body
+/// strings (FS, FS_EXTERNAL, FS_BACKDROP) deliberately omit both
+/// `#version 100` and `#extension` so the assembler can place them
+/// in the spec-required order: extensions must come right after the
+/// version directive, before any code (uniform declarations
+/// included). Returns an owned String — the GL driver wants a single
+/// contiguous source.
+fn assemble_rounded_fs(extensions: &str, body: &str) -> String {
+    let mut s = String::with_capacity(
+        13 + extensions.len() + FS_ROUNDED_PRELUDE.len() + body.len(),
+    );
+    s.push_str("#version 100\n");
+    s.push_str(extensions);
+    s.push_str(FS_ROUNDED_PRELUDE);
+    s.push_str(body);
+    s
 }
 
 pub fn build_solid(gl: &glow::Context) -> Result<SolidProgram> {
@@ -330,10 +394,15 @@ pub fn build_solid(gl: &glow::Context) -> Result<SolidProgram> {
     }
 }
 
-fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
+fn build_with_fs(
+    gl: &glow::Context,
+    extensions: &str,
+    fs_body: &str,
+) -> Result<QuadProgram> {
+    let fs_src = assemble_rounded_fs(extensions, fs_body);
     unsafe {
         let vs = compile(gl, glow::VERTEX_SHADER, VS)?;
-        let fs = compile(gl, glow::FRAGMENT_SHADER, fs_src)?;
+        let fs = compile(gl, glow::FRAGMENT_SHADER, &fs_src)?;
         let program = gl
             .create_program()
             .map_err(|e| anyhow!("create_program: {e}"))?;
@@ -363,6 +432,12 @@ fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
         let u_alpha = gl
             .get_uniform_location(program, "u_alpha")
             .ok_or_else(|| anyhow!("u_alpha missing"))?;
+        let u_size = gl
+            .get_uniform_location(program, "u_size")
+            .ok_or_else(|| anyhow!("u_size missing"))?;
+        let u_radius = gl
+            .get_uniform_location(program, "u_radius")
+            .ok_or_else(|| anyhow!("u_radius missing"))?;
 
         let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let vbo = gl
@@ -384,6 +459,8 @@ fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
             u_tex,
             u_opaque,
             u_alpha,
+            u_size,
+            u_radius,
         })
     }
 }
