@@ -366,20 +366,22 @@ impl DrmPresenter {
             // client declared via wp_viewport.set_source, so the
             // output quad can be bigger, smaller, or cropped
             // relative to the actual buffer.
-            let dst_w = if elem.dst_width > 0 {
+            let dst_w = if elem.dst_width > 0.0 {
                 elem.dst_width
             } else {
-                elem.width
+                elem.width as f32
             };
-            let dst_h = if elem.dst_height > 0 {
+            let dst_h = if elem.dst_height > 0.0 {
                 elem.dst_height
             } else {
-                elem.height
+                elem.height as f32
             };
-            let x0 = (elem.x as f32 / w as f32) * 2.0 - 1.0;
-            let y0 = 1.0 - ((elem.y + dst_h) as f32 / h as f32) * 2.0;
-            let rw = dst_w as f32 / w as f32 * 2.0;
-            let rh = dst_h as f32 / h as f32 * 2.0;
+            let fb_w = w as f32;
+            let fb_h = h as f32;
+            let x0 = (elem.x / fb_w) * 2.0 - 1.0;
+            let y0 = 1.0 - ((elem.y + dst_h) / fb_h) * 2.0;
+            let rw = dst_w / fb_w * 2.0;
+            let rh = dst_h / fb_h * 2.0;
             let opaque = match &elem.content {
                 SceneContent::Shm {
                     format: PixelFormat::Argb8888,

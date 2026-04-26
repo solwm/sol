@@ -278,8 +278,8 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                 state.mapped_toplevels.push(crate::Window {
                                     surface: surface.downgrade(),
                                     rect: crate::Rect::default(),
-                                    render_rect: crate::Rect::default(),
-                                    from_rect: crate::Rect::default(),
+                                    render_rect: crate::RectF::default(),
+                                    from_rect: crate::RectF::default(),
                                     anim_started_at: None,
                                     pending_size: None,
                                     workspace: state.active_ws,

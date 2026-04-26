@@ -50,19 +50,24 @@ pub struct SceneElement<'a> {
     pub buffer_key: u64,
     pub width: i32,
     pub height: i32,
-    /// Top-left in screen coordinates.
-    pub x: i32,
-    pub y: i32,
+    /// Top-left in screen coordinates. Sub-pixel precision (f32)
+    /// because layout-change animations interpolate continuously and
+    /// rounding to int per frame produces visible micro-judder near
+    /// the curve's tail. The presenter feeds these directly into
+    /// the NDC transform; the GPU's bilinear filter absorbs the
+    /// fractional offset.
+    pub x: f32,
+    pub y: f32,
     /// Output rect size (the compositor's chosen on-screen dimensions).
-    /// When `0`, fall back to `width`/`height` (source) — the
+    /// When `<= 0.0`, fall back to `width`/`height` (source) — the
     /// sentinel for subsurfaces / cursor that always render 1:1
     /// at buffer size. Toplevels and layer-shell surfaces pass
     /// the tile / anchor rect so a buffer larger or smaller than
     /// the output rect (common when `wp_viewport.set_source` is
     /// used to crop a buffer down to a sub-rect) gets stretched
     /// or cropped via UV into the intended quad.
-    pub dst_width: i32,
-    pub dst_height: i32,
+    pub dst_width: f32,
+    pub dst_height: f32,
     pub uv_x: f32,
     pub uv_y: f32,
     pub uv_w: f32,

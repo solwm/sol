@@ -84,6 +84,48 @@ pub struct Rect {
     pub h: i32,
 }
 
+/// Sub-pixel-precision counterpart of [`Rect`], used everywhere the
+/// value will be drawn to the GPU and could land between integer
+/// pixels: animation interpolation (`render_rect`, `from_rect`) and
+/// scene transport (`PlacedBuffer`, `SceneElement`).
+///
+/// Layout math, focus borders, and hit-testing keep using integer
+/// `Rect` — those care about whole pixels — but interpolation needs
+/// the float so a 36-frame ease-out (150 ms at 240 Hz) doesn't round
+/// to 0-pixel-then-1-pixel steps near the curve's tail. Conversion
+/// goes through `From`/`Into` and `RectF::round`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RectF {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl From<Rect> for RectF {
+    fn from(r: Rect) -> Self {
+        RectF {
+            x: r.x as f32,
+            y: r.y as f32,
+            w: r.w as f32,
+            h: r.h as f32,
+        }
+    }
+}
+
+impl RectF {
+    /// Round to the nearest whole pixel. Used by the few consumers
+    /// (focus border, hit-test) that need integer rects.
+    pub fn round(self) -> Rect {
+        Rect {
+            x: self.x.round() as i32,
+            y: self.y.round() as i32,
+            w: self.w.round() as i32,
+            h: self.h.round() as i32,
+        }
+    }
+}
+
 /// A mapped xdg_toplevel together with the screen-space rect the layout
 /// assigned to it.
 ///
@@ -109,8 +151,8 @@ pub struct Rect {
 pub struct Window {
     pub surface: Weak<WlSurface>,
     pub rect: Rect,
-    pub render_rect: Rect,
-    pub from_rect: Rect,
+    pub render_rect: RectF,
+    pub from_rect: RectF,
     pub anim_started_at: Option<Instant>,
     pub pending_size: Option<(i32, i32)>,
     /// Which workspace this window belongs to. 1-based. A window
@@ -595,6 +637,9 @@ fn set_target_rect(win: &mut Window, new_rect: Rect, now: Instant) {
     if win.rect == new_rect {
         return;
     }
+    // Capture the live render_rect (in float) as the tween origin so
+    // a re-trigger mid-animation eases from where the window is right
+    // now, not from the previous static target.
     win.from_rect = win.render_rect;
     win.anim_started_at = Some(now);
     win.rect = new_rect;
@@ -694,7 +739,7 @@ fn send_pending_configures(state: &mut State) {
 /// otherwise the full texture is used.
 type PlacedBuffer = (
     wayland_server::protocol::wl_buffer::WlBuffer,
-    Rect,
+    RectF,
     Option<(f64, f64, f64, f64)>,
 );
 
@@ -714,8 +759,9 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     for ml in &layers {
         if matches!(ml.layer, Layer::Background | Layer::Bottom) {
             let vsrc = surface_viewport_src(&ml.surface);
-            out.push((ml.buffer.clone(), ml.rect, vsrc));
-            emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
+            let r: RectF = ml.rect.into();
+            out.push((ml.buffer.clone(), r, vsrc));
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y);
         }
     }
 
@@ -763,8 +809,9 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     for ml in &layers {
         if matches!(ml.layer, Layer::Top | Layer::Overlay) {
             let vsrc = surface_viewport_src(&ml.surface);
-            out.push((ml.buffer.clone(), ml.rect, vsrc));
-            emit_subsurface_tree(&mut out, &ml.surface, ml.rect.x, ml.rect.y);
+            let r: RectF = ml.rect.into();
+            out.push((ml.buffer.clone(), r, vsrc));
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y);
         }
     }
 
@@ -787,8 +834,8 @@ fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
 fn emit_subsurface_tree(
     out: &mut Vec<PlacedBuffer>,
     parent: &WlSurface,
-    parent_x: i32,
-    parent_y: i32,
+    parent_x: f32,
+    parent_y: f32,
 ) {
     let Some(sd_arc) = parent.data::<Arc<Mutex<SurfaceData>>>() else {
         return;
@@ -813,8 +860,8 @@ fn emit_subsurface_tree(
             let buf = sd.current.buffer.clone();
             (
                 buf,
-                parent_x + ox,
-                parent_y + oy,
+                parent_x + ox as f32,
+                parent_y + oy as f32,
                 sd.viewport_src,
                 surface_logical_size(&sd),
             )
@@ -836,11 +883,11 @@ fn emit_subsurface_tree(
             let (w, h) = logical.unwrap_or((0, 0));
             out.push((
                 buf,
-                Rect {
+                RectF {
                     x: child_x,
                     y: child_y,
-                    w,
-                    h,
+                    w: w as f32,
+                    h: h as f32,
                 },
                 vsrc,
             ));
@@ -906,17 +953,17 @@ fn scene_from_buffers<'a>(
             });
         }
     }
-    // Cursor last so it always draws on top. dst_* = 0 forces the
+    // Cursor last so it always draws on top. dst_* = 0.0 forces the
     // presenter to render at the sprite's intrinsic size.
     if cursor.visible {
         scene.elements.push(SceneElement {
             buffer_key: CURSOR_SCENE_KEY,
             width: cursor.width,
             height: cursor.height,
-            dst_width: 0,
-            dst_height: 0,
-            x: cursor.pos_x as i32 - cursor.hot_x,
-            y: cursor.pos_y as i32 - cursor.hot_y,
+            dst_width: 0.0,
+            dst_height: 0.0,
+            x: cursor.pos_x as f32 - cursor.hot_x as f32,
+            y: cursor.pos_y as f32 - cursor.hot_y as f32,
             uv_x: 0.0,
             uv_y: 0.0,
             uv_w: 1.0,
@@ -978,16 +1025,16 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - inv * inv * inv
 }
 
-fn lerp_i32(from: i32, to: i32, t: f32) -> i32 {
-    from + ((to - from) as f32 * t).round() as i32
+fn lerp_f32(from: f32, to: f32, t: f32) -> f32 {
+    from + (to - from) * t
 }
 
-fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
-    Rect {
-        x: lerp_i32(from.x, to.x, t),
-        y: lerp_i32(from.y, to.y, t),
-        w: lerp_i32(from.w, to.w, t).max(1),
-        h: lerp_i32(from.h, to.h, t).max(1),
+fn lerp_rectf(from: RectF, to: RectF, t: f32) -> RectF {
+    RectF {
+        x: lerp_f32(from.x, to.x, t),
+        y: lerp_f32(from.y, to.y, t),
+        w: lerp_f32(from.w, to.w, t).max(1.0),
+        h: lerp_f32(from.h, to.h, t).max(1.0),
     }
 }
 
@@ -1008,10 +1055,11 @@ fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
 fn tick_animations(state: &mut State, now: Instant) -> bool {
     let mut any_active = false;
     for win in state.mapped_toplevels.iter_mut() {
+        let target: RectF = win.rect.into();
         // Newly mapped: snap, no animation.
-        if win.render_rect.w == 0 || win.render_rect.h == 0 {
-            win.render_rect = win.rect;
-            win.from_rect = win.rect;
+        if win.render_rect.w == 0.0 || win.render_rect.h == 0.0 {
+            win.render_rect = target;
+            win.from_rect = target;
             win.anim_started_at = None;
             continue;
         }
@@ -1019,19 +1067,19 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
             // No tween in progress. Idempotent guard: keep
             // render_rect == rect even if some other code path
             // mutated rect without going through apply_layout.
-            if win.render_rect != win.rect {
-                win.render_rect = win.rect;
+            if win.render_rect != target {
+                win.render_rect = target;
             }
             continue;
         };
         let elapsed = now.duration_since(started).as_millis();
         if elapsed >= ANIM_DURATION_MS {
-            win.render_rect = win.rect;
+            win.render_rect = target;
             win.anim_started_at = None;
         } else {
             let t = elapsed as f32 / ANIM_DURATION_MS_F;
             let eased = ease_out_cubic(t);
-            win.render_rect = lerp_rect(win.from_rect, win.rect, eased);
+            win.render_rect = lerp_rectf(win.from_rect, target, eased);
             any_active = true;
         }
     }
@@ -1239,8 +1287,8 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
     // already laid out instead of animating in from a stale rect.
     for win in state.mapped_toplevels.iter_mut() {
         if win.workspace == n {
-            win.render_rect = Rect::default();
-            win.from_rect = Rect::default();
+            win.render_rect = RectF::default();
+            win.from_rect = RectF::default();
             win.anim_started_at = None;
         }
     }
@@ -1276,7 +1324,9 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
             w.workspace = n;
             // Clear render_rect so the window gets first-frame
             // treatment when the user switches to `n`.
-            w.render_rect = Rect::default();
+            w.render_rect = RectF::default();
+            w.from_rect = RectF::default();
+            w.anim_started_at = None;
         })
         .is_some();
     if !moved {
@@ -1335,7 +1385,9 @@ fn focus_border(state: &State) -> Vec<voidptr_core::SceneBorder> {
     };
     // Border tracks what's actually on screen, so it uses render_rect
     // and stays visually glued to the tile during resize transitions.
-    let r = win.render_rect;
+    // Round to int — borders only need whole-pixel placement; the
+    // sub-pixel render_rect is for the texture scale, not the border.
+    let r = win.render_rect.round();
     let c = state.config.border_color;
     // Top / bottom span the full width including corners; left / right
     // are insets so the four rects don't double-draw at the corners.
@@ -1411,7 +1463,13 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
                         format,
                     } => {
                         canvas.blit_argb(
-                            e.x, e.y, pixels, e.width, e.height, *stride, *format,
+                            e.x.round() as i32,
+                            e.y.round() as i32,
+                            pixels,
+                            e.width,
+                            e.height,
+                            *stride,
+                            *format,
                         );
                     }
                     SceneContent::Dmabuf { .. } => {
@@ -2286,7 +2344,7 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         // Hit test against what the user can actually see (render_rect)
         // — clicking on the visible tile should hit, regardless of
         // whether the layout target has moved past it already.
-        if let Some((lx, ly)) = hit_rect(win.render_rect) {
+        if let Some((lx, ly)) = hit_rect(win.render_rect.round()) {
             return Some(resolve_hit(surface, lx, ly));
         }
     }
