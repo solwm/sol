@@ -11,7 +11,7 @@
 //! Legacy `format`/`modifier` events are still emitted for v1-v3 binds.
 //! Plane info collected via `create_params → add → create_immed` becomes
 //! a `DmabufBuffer` attached to the new `wl_buffer` as user-data. Import
-//! into GL textures happens in `voidptr_backend_drm::presenter`.
+//! into GL textures happens in `sol_backend_drm::presenter`.
 
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
@@ -200,7 +200,7 @@ fn send_feedback(
         table.extend_from_slice(&0u32.to_ne_bytes());
         table.extend_from_slice(&modifier.to_ne_bytes());
     }
-    let fd = memfd_create("voidptr-dmabuf-format-table", MemfdFlags::CLOEXEC)
+    let fd = memfd_create("sol-dmabuf-format-table", MemfdFlags::CLOEXEC)
         .context("memfd_create")?;
     ftruncate(&fd, table.len() as u64).context("ftruncate format table")?;
     {
@@ -376,7 +376,7 @@ impl Dispatch<WlBuffer, DmabufBuffer> for State {
         if let wl_buffer::Request::Destroy = request {
             // Queue for eviction: alacritty creates a new dmabuf on every
             // tile resize, so without this the EGLImage + GL texture for
-            // each old buffer leak until voidptr exits.
+            // each old buffer leak until sol exits.
             let key = (data as *const DmabufBuffer) as usize as u64;
             state.pending_texture_evictions.push(key);
             tracing::debug!(key, "dmabuf wl_buffer destroyed; queued for eviction");

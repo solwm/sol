@@ -1,8 +1,8 @@
-//! Wayland server for voidptr.
+//! Wayland server for sol.
 //!
 //! Handles protocol traffic in all backends; rendering is delegated to a
 //! `BackendState` value (software canvas -> PNG for headless, or a
-//! `voidptr_backend_drm::DrmPresenter` for real hardware).
+//! `sol_backend_drm::DrmPresenter` for real hardware).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,9 +10,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
-use voidptr_backend_drm::DrmPresenter;
+use sol_backend_drm::DrmPresenter;
 use std::os::fd::AsRawFd;
-use voidptr_core::{Scene, SceneContent, SceneElement};
+use sol_core::{Scene, SceneContent, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
@@ -297,7 +297,7 @@ pub struct State {
     /// Process-group IDs of `exec-once` children. Each is spawned
     /// in its own group (via `setsid` in a pre_exec hook) so we
     /// can `killpg` the whole subtree on shutdown — otherwise
-    /// wrapper-shell loops like `wp-cycle.sh` outlive voidptr,
+    /// wrapper-shell loops like `wp-cycle.sh` outlive sol,
     /// accumulate across restarts, and each orphan keeps firing
     /// its own 30-second wallpaper-cycle tick. After ~7 restarts
     /// that shows up as "transitions every few seconds."
@@ -971,7 +971,7 @@ fn scene_from_buffers<'a>(
             content: SceneContent::Shm {
                 pixels: &cursor.pixels,
                 stride: cursor.width * 4,
-                format: voidptr_core::PixelFormat::Argb8888,
+                format: sol_core::PixelFormat::Argb8888,
             },
         });
     }
@@ -1365,7 +1365,7 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
 /// (`border_width = 0`), or if the focused surface isn't a mapped
 /// toplevel (popup focus, layer-surface focus, etc. — those don't
 /// get a tile border).
-fn focus_border(state: &State) -> Vec<voidptr_core::SceneBorder> {
+fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
     let w = state.config.border_width;
     if w <= 0 {
         return Vec::new();
@@ -1392,10 +1392,10 @@ fn focus_border(state: &State) -> Vec<voidptr_core::SceneBorder> {
     // Top / bottom span the full width including corners; left / right
     // are insets so the four rects don't double-draw at the corners.
     vec![
-        voidptr_core::SceneBorder { x: r.x, y: r.y, w: r.w, h: w, rgba: c },
-        voidptr_core::SceneBorder { x: r.x, y: r.y + r.h - w, w: r.w, h: w, rgba: c },
-        voidptr_core::SceneBorder { x: r.x, y: r.y + w, w, h: r.h - 2 * w, rgba: c },
-        voidptr_core::SceneBorder {
+        sol_core::SceneBorder { x: r.x, y: r.y, w: r.w, h: w, rgba: c },
+        sol_core::SceneBorder { x: r.x, y: r.y + r.h - w, w: r.w, h: w, rgba: c },
+        sol_core::SceneBorder { x: r.x, y: r.y + w, w, h: r.h - 2 * w, rgba: c },
+        sol_core::SceneBorder {
             x: r.x + r.w - w,
             y: r.y + w,
             w,
@@ -1913,7 +1913,7 @@ fn setup_event_loop(
         spawn_exec_once(&mut compositor.state, &cmd.program, &argrefs);
     }
 
-    // External stop signals (SIGTERM, SIGHUP — the ones `killall voidptr`
+    // External stop signals (SIGTERM, SIGHUP — the ones `killall sol`
     // and `kill <pid>` send) trigger a clean shutdown: calloop returns
     // from `run`, Compositor drops, DrmPresenter's Drop restores the
     // saved CRTC. If the first stop can't make progress (e.g. the
@@ -1941,7 +1941,7 @@ fn setup_event_loop(
         tracing::info!("shutdown signal received; stopping event loop");
         loop_signal.stop();
     }) {
-        tracing::warn!(error = %e, "ctrlc handler install failed; `killall voidptr` won't cleanly restore the TTY");
+        tracing::warn!(error = %e, "ctrlc handler install failed; `killall sol` won't cleanly restore the TTY");
     }
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
@@ -1960,7 +1960,7 @@ fn setup_event_loop(
         .context("event loop errored")?;
 
     // SIGTERM every exec-once pgroup so wallpaper daemons / cycler
-    // shells don't linger as orphans across voidptr restarts.
+    // shells don't linger as orphans across sol restarts.
     terminate_exec_once(&compositor.state);
 
     Ok(())
@@ -2009,7 +2009,7 @@ fn handle_session_event(comp: &mut Compositor, ev: libseat::SeatEvent) {
                     tracing::warn!("libinput resume failed — input may be dead");
                 }
             }
-            // A VT switch back to voidptr should land on a lit
+            // A VT switch back to sol should land on a lit
             // screen regardless of where the idle state was when
             // we left. Reset idle + reset the input clock so the
             // user doesn't immediately re-blank on resume.
@@ -2170,18 +2170,18 @@ const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 
 /// Fork/exec a Wayland client connected to our own socket. Env is
-/// inherited wholesale from voidptr's process, which was normalised at
-/// startup (XDG_SESSION_TYPE=wayland, XDG_CURRENT_DESKTOP=voidptr,
+/// inherited wholesale from sol's process, which was normalised at
+/// startup (XDG_SESSION_TYPE=wayland, XDG_CURRENT_DESKTOP=sol,
 /// DISPLAY/XAUTHORITY unset, WAYLAND_DISPLAY set). Child handle is
 /// intentionally dropped — no reap, no wait; kernel cleans up on
-/// voidptr exit.
+/// sol exit.
 /// Spawn an `exec-once` child in its own session / process group
 /// and record the pgid on `State` for shutdown cleanup. Using
 /// `setsid` (via `pre_exec`) puts the child and any grandchildren
 /// (e.g. `sleep` / `find` spawned by a wrapper shell like
 /// `wp-cycle.sh`) in a fresh pgroup that we can blanket-kill with
-/// `killpg(pgid, SIGTERM)` when voidptr exits. Without this, those
-/// wrapper scripts outlive every voidptr restart, accumulate as
+/// `killpg(pgid, SIGTERM)` when sol exits. Without this, those
+/// wrapper scripts outlive every sol restart, accumulate as
 /// orphans, and each runs its own independent wallpaper-cycle
 /// timer — which surfaces as "transitions every few seconds"
 /// after a handful of compositor restarts.
@@ -2198,7 +2198,7 @@ fn spawn_exec_once(state: &mut State, program: &str, args: &[&str]) {
             // New session → new process group with the child as
             // leader. Safe in the forked child; returns -1 with
             // EPERM only if we're already a session leader, which
-            // we aren't (we just forked from voidptr).
+            // we aren't (we just forked from sol).
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -2217,7 +2217,7 @@ fn spawn_exec_once(state: &mut State, program: &str, args: &[&str]) {
             );
             // Drop the Child handle — we don't want to wait on it,
             // we'll signal the pgroup directly at shutdown. The
-            // kernel reaps the zombie once voidptr exits (our own
+            // kernel reaps the zombie once sol exits (our own
             // process parent will reap us; our children left around
             // get re-parented to init which reaps them).
             std::mem::forget(child);
@@ -2230,7 +2230,7 @@ fn spawn_exec_once(state: &mut State, program: &str, args: &[&str]) {
 
 /// Send SIGTERM to every pgroup we spawned via `exec-once`. Called
 /// after the event loop returns so wrapper-shell loops and
-/// wallpaper daemons don't linger as orphans after voidptr exits.
+/// wallpaper daemons don't linger as orphans after sol exits.
 fn terminate_exec_once(state: &State) {
     for &pgid in &state.exec_once_pgids {
         // kill(-pgid, SIGTERM) addresses the whole process group.
@@ -2684,7 +2684,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
             if remaining <= 0 {
                 anyhow::bail!(
                     "libseat: no Enable event within 5s — the daemon hasn't \
-                     handed us the seat. Make sure voidptr was launched from \
+                     handed us the seat. Make sure sol was launched from \
                      an active logind session (check `loginctl show-session \
                      $XDG_SESSION_ID` from the TTY where you're running it)."
                 );
@@ -2707,7 +2707,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
         .borrow_mut()
         .open_device_keep_fd(device)
         .context("libseat: open DRM device")?;
-    let card = voidptr_backend_drm::Card::from_fd(drm_fd);
+    let card = sol_backend_drm::Card::from_fd(drm_fd);
     let presenter =
         DrmPresenter::from_card(card).context("initialise DrmPresenter")?;
     let (w, h) = presenter.size();
@@ -2735,8 +2735,8 @@ pub fn run_drm(device: &Path) -> Result<()> {
 
 /// Back-compat entry: default to headless with the old PNG path.
 pub fn run() -> Result<()> {
-    let png_path = std::env::var_os("VOIDPTR_PNG_PATH")
+    let png_path = std::env::var_os("SOL_PNG_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/voidptr-headless.png"));
+        .unwrap_or_else(|| PathBuf::from("/tmp/sol-headless.png"));
     run_headless(png_path, 1920, 1080)
 }

@@ -1,13 +1,13 @@
-//! voidptr — the voidptr compositor binary.
+//! sol — the sol compositor binary.
 //!
 //! Usage:
-//!   voidptr                       # default (headless) backend
-//!   voidptr --backend=headless    # explicit
-//!   voidptr --backend=drm         # real DRM+GBM+GLES, from a free VT
+//!   sol                       # default (headless) backend
+//!   sol --backend=headless    # explicit
+//!   sol --backend=drm         # real DRM+GBM+GLES, from a free VT
 //!
 //! Extra env knobs:
-//!   VOIDPTR_PNG_PATH    (headless) where to dump the frame PNG
-//!   VOIDPTR_DRM_DEVICE  (drm) path to /dev/dri/cardN, default /dev/dri/card2
+//!   SOL_PNG_PATH    (headless) where to dump the frame PNG
+//!   SOL_DRM_DEVICE  (drm) path to /dev/dri/cardN, default /dev/dri/card2
 
 use std::path::PathBuf;
 
@@ -34,11 +34,11 @@ fn main() -> Result<()> {
         }
     }
     // Env var wins over arg so `just` recipes can override easily.
-    if let Ok(b) = std::env::var("VOIDPTR_BACKEND") {
+    if let Ok(b) = std::env::var("SOL_BACKEND") {
         backend = b;
     }
 
-    tracing::info!(%backend, "voidptr starting");
+    tracing::info!(%backend, "sol starting");
 
     // Normalise the environment before the backend (and therefore every
     // spawned client) inherits it. Children pick up our env via
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         // Firefox via MOZ_ENABLE_WAYLAND auto-detect, Chromium's
         // Ozone) check this to decide their display backend.
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
-        std::env::set_var("XDG_CURRENT_DESKTOP", "voidptr");
+        std::env::set_var("XDG_CURRENT_DESKTOP", "sol");
         // No X server here. Strip DISPLAY / XAUTHORITY so clients that
         // auto-detect either-or don't try an X path that'll never
         // work (and waste seconds failing at it — e.g. mplayer's
@@ -71,16 +71,16 @@ fn main() -> Result<()> {
 
     match backend.as_str() {
         "headless" => {
-            let png_path = std::env::var_os("VOIDPTR_PNG_PATH")
+            let png_path = std::env::var_os("SOL_PNG_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp/voidptr-headless.png"));
-            voidptr_wayland::run_headless(png_path, 1920, 1080)
+                .unwrap_or_else(|| PathBuf::from("/tmp/sol-headless.png"));
+            sol_wayland::run_headless(png_path, 1920, 1080)
         }
         "drm" => {
-            let device = std::env::var_os("VOIDPTR_DRM_DEVICE")
+            let device = std::env::var_os("SOL_DRM_DEVICE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/dev/dri/card2"));
-            voidptr_wayland::run_drm(&device).context("run_drm")
+            sol_wayland::run_drm(&device).context("run_drm")
         }
         other => bail!("unknown backend: {other}"),
     }
@@ -88,11 +88,11 @@ fn main() -> Result<()> {
 
 fn print_help() {
     println!(
-        "voidptr [--backend=headless|drm]\n\
+        "sol [--backend=headless|drm]\n\
          \n\
          Env:\n\
-           VOIDPTR_BACKEND     overrides --backend\n\
-           VOIDPTR_PNG_PATH    (headless) PNG dump path\n\
-           VOIDPTR_DRM_DEVICE  (drm) path to /dev/dri/cardN"
+           SOL_BACKEND     overrides --backend\n\
+           SOL_PNG_PATH    (headless) PNG dump path\n\
+           SOL_DRM_DEVICE  (drm) path to /dev/dri/cardN"
     );
 }

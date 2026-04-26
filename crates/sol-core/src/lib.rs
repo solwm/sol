@@ -1,7 +1,7 @@
-//! Shared types used across voidptr crates. Kept dependency-free so any
+//! Shared types used across sol crates. Kept dependency-free so any
 //! other crate can pull this in without dragging Wayland or DRM deps along.
 
-pub const NAME: &str = "voidptr";
+pub const NAME: &str = "sol";
 
 /// Wayland SHM pixel formats we know how to sample. Both store 32-bit little
 /// endian words; the difference is whether the alpha byte is meaningful.

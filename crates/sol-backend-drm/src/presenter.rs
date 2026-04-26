@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, framebuffer, property};
 use glow::HasContext;
 use khronos_egl as egl;
-use voidptr_core::{PixelFormat, Scene, SceneContent};
+use sol_core::{PixelFormat, Scene, SceneContent};
 
 use crate::{
     Card, GlStack, OutputSelection, dmabuf_egl, get_or_add_fb, pick_output,
@@ -86,7 +86,7 @@ struct TextureEntry {
 }
 
 impl DrmPresenter {
-    /// Construct from a `Card` already wrapping a DRM fd. voidptr's main
+    /// Construct from a `Card` already wrapping a DRM fd. sol's main
     /// binary uses this path — libseat hands us the fd; we wrap it via
     /// `Card::from_fd` before calling here.
     ///
@@ -489,7 +489,7 @@ impl DrmPresenter {
     /// `flip_complete`. Returns true if at least one PageFlip event
     /// was processed, so the caller (the calloop source on the DRM
     /// fd) knows it should fire the frame callbacks queued for this
-    /// frame. Kept as a single method so voidptr-wayland doesn't
+    /// frame. Kept as a single method so sol-wayland doesn't
     /// need to depend on drm-rs directly.
     pub fn drain_events(&mut self) -> Result<bool> {
         let mut saw_flip = false;
@@ -547,7 +547,7 @@ impl Drop for DrmPresenter {
         //
         // NOTE: on DisplayPort at high refresh (e.g. 4K@240), the synchronous
         // set_crtc back to fbcon's mode can take 10–15s because the HW does
-        // a full DP link re-training. That's normal, not a voidptr bug.
+        // a full DP link re-training. That's normal, not a sol bug.
         let Some(saved) = self.saved_crtc.take() else {
             return;
         };
@@ -575,7 +575,7 @@ impl Drop for DrmPresenter {
 fn upload_shm_texture(
     gl: &glow::Context,
     textures: &mut HashMap<u64, TextureEntry>,
-    elem: &voidptr_core::SceneElement<'_>,
+    elem: &sol_core::SceneElement<'_>,
 ) -> Result<()> {
     let (pixels_in, stride) = match &elem.content {
         SceneContent::Shm { pixels, stride, .. } => (*pixels, *stride),
@@ -688,7 +688,7 @@ fn upload_shm_texture(
 fn import_dmabuf_texture(
     gl_stack: &GlStack,
     textures: &mut HashMap<u64, TextureEntry>,
-    elem: &voidptr_core::SceneElement<'_>,
+    elem: &sol_core::SceneElement<'_>,
 ) -> Result<()> {
     let (fd, fourcc, modifier, offset, stride) = match &elem.content {
         SceneContent::Dmabuf {

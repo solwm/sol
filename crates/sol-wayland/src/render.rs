@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-pub use voidptr_core::PixelFormat;
+pub use sol_core::PixelFormat;
 
 pub struct Canvas {
     pub width: u32,

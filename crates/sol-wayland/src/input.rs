@@ -5,7 +5,7 @@
 //! events into a simple `InputEvent` enum the render loop can consume.
 //!
 //! Device opens are routed through libseat via a shared `Session`, so
-//! voidptr runs as an ordinary user (no `input` group, no sudo). libseat
+//! sol runs as an ordinary user (no `input` group, no sudo). libseat
 //! also revokes these fds when our VT isn't active, which is what fixes
 //! the cross-VT input leak we saw pre-B11.
 
@@ -127,7 +127,7 @@ impl InputState {
             anyhow!(
                 "libinput udev_assign_seat({seat_name:?}) failed. \
                  The libseat session probably isn't owned by us yet — make \
-                 sure voidptr was launched from an active user session."
+                 sure sol was launched from an active user session."
             )
         })?;
         let raw: RawFd = li.as_raw_fd();

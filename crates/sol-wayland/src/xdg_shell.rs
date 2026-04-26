@@ -18,7 +18,7 @@ use wayland_server::{
 
 use crate::{State, compositor::SurfaceData};
 
-/// Canonical `states` payload for every configure voidptr sends. Includes
+/// Canonical `states` payload for every configure sol sends. Includes
 /// MAXIMIZED (tells the client "obey this size, per the xdg-shell spec")
 /// plus TILED_* on all four edges (tells tiling-aware clients that they
 /// border other tiles/the screen so they shouldn't draw external shadows

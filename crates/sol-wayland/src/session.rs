@@ -4,7 +4,7 @@
 //! a privileged system daemon — either systemd-logind on systemd hosts,
 //! or seatd elsewhere. The daemon owns /dev/dri and /dev/input; we ask
 //! it for fds, and in return it:
-//!   - opens devices as root on our behalf (so voidptr runs as the
+//!   - opens devices as root on our behalf (so sol runs as the
 //!     logged-in user with no sudo and no group membership tricks);
 //!   - coordinates VT switches across every registered session
 //!     (pressing Ctrl+Alt+F2 while we're on F3 means we get a

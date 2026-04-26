@@ -22,7 +22,7 @@
 //! transitional buffers during moves/resizes; advertising both
 //! clears that up.
 //!
-//! voidptr currently runs at integer 1.0× everywhere, so the
+//! sol currently runs at integer 1.0× everywhere, so the
 //! preferred scale we report is always `120`. Output-specific
 //! scales (for HiDPI) would plug in here once we add that.
 
@@ -39,7 +39,7 @@ use crate::State;
 pub const FRACTIONAL_SCALE_VERSION: u32 = 1;
 
 /// Fixed-point scale factor the protocol expects: `actual_scale * 120`.
-/// 120 corresponds to 1.0×, which is what voidptr drives today.
+/// 120 corresponds to 1.0×, which is what sol drives today.
 const SCALE_120: u32 = 120;
 
 impl GlobalDispatch<WpFractionalScaleManagerV1, ()> for State {

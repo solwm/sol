@@ -1,8 +1,8 @@
-//! User config loader for voidptr.
+//! User config loader for sol.
 //!
 //! Looks for, in order:
-//!   1. `$XDG_CONFIG_HOME/voidptr/voidptr.conf`
-//!   2. `$HOME/.config/voidptr/voidptr.conf`
+//!   1. `$XDG_CONFIG_HOME/sol/sol.conf`
+//!   2. `$HOME/.config/sol/sol.conf`
 //!   3. built-in defaults — Alt+Return launches alacritty; Alt+D
 //!      launches rofi, which is what the compositor had hardcoded
 //!      before the config system existed.
@@ -80,7 +80,7 @@ pub struct Config {
     /// alpha is fixed at 1.0 since a translucent border isn't a thing
     /// anyone has asked for yet.
     pub border_color: [f32; 4],
-    /// Seconds of no user input before voidptr turns the monitor off
+    /// Seconds of no user input before sol turns the monitor off
     /// via DPMS. 0 disables the feature entirely. Clients that want
     /// to prevent this (video players, presentation tools) create
     /// `zwp_idle_inhibitor_v1` inhibitors on their surfaces and the
@@ -219,13 +219,13 @@ pub fn load() -> Config {
 fn config_path() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("voidptr").join("voidptr.conf");
+            return PathBuf::from(xdg).join("sol").join("sol.conf");
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config/voidptr/voidptr.conf");
+        return PathBuf::from(home).join(".config/sol/sol.conf");
     }
-    PathBuf::from("voidptr.conf")
+    PathBuf::from("sol.conf")
 }
 
 pub fn default_config() -> Config {

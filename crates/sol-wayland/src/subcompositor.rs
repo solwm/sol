@@ -7,7 +7,7 @@
 //! Now actually renders subsurfaces: `get_subsurface` links the child
 //! into the parent's `subsurface_children` list; `set_position` stores
 //! a pending offset applied on commit; the scene walker in
-//! voidptr-wayland/src/lib.rs recurses through the tree from any
+//! sol-wayland/src/lib.rs recurses through the tree from any
 //! mapped xdg_toplevel or layer_surface root, emitting each subsurface
 //! at `parent_origin + offset`.
 //!

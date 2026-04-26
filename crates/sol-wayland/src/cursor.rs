@@ -81,7 +81,7 @@ fn pick_closest(images: &[Image], desired: u32) -> Option<&Image> {
 
 /// XCursor pixel data is RGBA8888 with pre-multiplied alpha. Our
 /// shader samples SHM buffers as ARGB8888 with a BGR swizzle (see
-/// `voidptr-backend-drm/src/quad.rs`), so we store bytes as
+/// `sol-backend-drm/src/quad.rs`), so we store bytes as
 /// `[B, G, R, A]`. Simple per-pixel reorder — no alpha re-multiply,
 /// the source is already premultiplied.
 fn rgba_to_bgra(img: &Image) -> CursorSprite {

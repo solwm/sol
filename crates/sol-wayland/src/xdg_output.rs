@@ -52,8 +52,8 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for State {
                 xo.logical_position(0, 0);
                 xo.logical_size(w, h);
                 if xo.version() >= 2 {
-                    xo.name("VOIDPTR-0".into());
-                    xo.description("voidptr primary output".into());
+                    xo.name("SOL-0".into());
+                    xo.description("sol primary output".into());
                 }
                 xo.done();
             }

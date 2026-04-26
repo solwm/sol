@@ -27,14 +27,14 @@ impl GlobalDispatch<WlOutput, ()> for State {
             300,
             200,
             Subpixel::Unknown,
-            "voidptr".into(),
-            "voidptr-0".into(),
+            "sol".into(),
+            "sol-0".into(),
             Transform::Normal,
         );
         // Advertise the real refresh rate. Chrome / Firefox / anything
         // that uses the presentation-time protocol or wl_frame pacing
         // reads this to decide their rendering cadence. Before this
-        // was dynamic, voidptr shipped a hardcoded 60_000 and Chrome
+        // was dynamic, sol shipped a hardcoded 60_000 and Chrome
         // dutifully capped at 60 Hz even on a 240 Hz panel.
         o.mode(
             Mode::Current | Mode::Preferred,
@@ -46,8 +46,8 @@ impl GlobalDispatch<WlOutput, ()> for State {
             o.scale(1);
         }
         if o.version() >= 4 {
-            o.name("VOIDPTR-0".into());
-            o.description("voidptr primary output".into());
+            o.name("SOL-0".into());
+            o.description("sol primary output".into());
         }
         if o.version() >= 2 {
             o.done();

@@ -21,7 +21,7 @@ use wayland_server::{
 };
 
 use crate::State;
-use voidptr_core::PixelFormat;
+use sol_core::PixelFormat;
 
 /// User data attached to a wl_shm_pool. The mmap lives behind a mutex so the
 /// Resize request (which sees only `&PoolData` via the Dispatch signature)

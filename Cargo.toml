@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/voidptr-core",
-    "crates/voidptr-wayland",
-    "crates/voidptr-backend-drm",
-    "crates/voidptr",
+    "crates/sol-core",
+    "crates/sol-wayland",
+    "crates/sol-backend-drm",
+    "crates/sol",
 ]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
 license = "BSD-3-Clause"
-repository = "https://github.com/magniff/voidptr"
+repository = "https://github.com/magniff/sol"
 rust-version = "1.80"
 
 [workspace.dependencies]
@@ -38,10 +38,10 @@ libc = "0.2"
 xkbcommon = "0.8"
 libseat = "0.2"
 
-voidptr-backend-drm = { path = "crates/voidptr-backend-drm" }
+sol-backend-drm = { path = "crates/sol-backend-drm" }
 
-voidptr-core = { path = "crates/voidptr-core" }
-voidptr-wayland = { path = "crates/voidptr-wayland" }
+sol-core = { path = "crates/sol-core" }
+sol-wayland = { path = "crates/sol-wayland" }
 
 [profile.release]
 lto = "thin"

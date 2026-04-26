@@ -44,8 +44,8 @@ impl Card {
     /// Open the DRM device directly. Requires the caller to have access
     /// to `/dev/dri/cardN`; on a regular user that means `video` group
     /// membership, or sudo. Retained as a convenience for the
-    /// `voidptr-drm-smoke` harness where session management isn't set
-    /// up — the main `voidptr` binary takes the libseat path instead.
+    /// `sol-drm-smoke` harness where session management isn't set
+    /// up — the main `sol` binary takes the libseat path instead.
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -57,7 +57,7 @@ impl Card {
 
     /// Wrap an already-opened DRM fd (typically obtained via
     /// `libseat::open_device`, which runs as the daemon's user and
-    /// hands us the fd via the seat protocol). Lets voidptr run as an
+    /// hands us the fd via the seat protocol). Lets sol run as an
     /// unprivileged user without any group membership.
     pub fn from_fd(fd: std::os::fd::OwnedFd) -> Self {
         Card(Arc::new(File::from(fd)))
@@ -79,7 +79,7 @@ pub struct OutputSelection {
 }
 
 /// Mode selection preference: width x height at the given integer refresh.
-/// Exposed as `VOIDPTR_MODE=WxH@Hz`. When absent, voidptr picks the
+/// Exposed as `SOL_MODE=WxH@Hz`. When absent, sol picks the
 /// highest-refresh mode at the connector's PREFERRED resolution (so a
 /// 1440p@240 monitor gets 240 Hz automatically without hardcoding the
 /// size), falling back to PREFERRED at its native rate and then to the
@@ -154,13 +154,13 @@ pub fn describe_device(device: &Path) -> Result<()> {
 }
 
 pub fn pick_output(card: &Card) -> Result<OutputSelection> {
-    // Parse VOIDPTR_MODE if set. An unparseable value is rejected up front —
+    // Parse SOL_MODE if set. An unparseable value is rejected up front —
     // better to fail loud than silently ignore a typo like `3840X2160@240`.
-    let env_raw = std::env::var("VOIDPTR_MODE").ok();
+    let env_raw = std::env::var("SOL_MODE").ok();
     let env_pref = match env_raw.as_deref() {
         Some(s) => Some(parse_mode_pref(s).ok_or_else(|| {
             anyhow!(
-                "VOIDPTR_MODE={s:?} is not of the form WxH@Hz (e.g., 3840x2160@240)"
+                "SOL_MODE={s:?} is not of the form WxH@Hz (e.g., 3840x2160@240)"
             )
         })?),
         None => None,
@@ -193,7 +193,7 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
                 "available mode"
             );
         }
-        // Explicit VOIDPTR_MODE overrides everything; missing match is a hard
+        // Explicit SOL_MODE overrides everything; missing match is a hard
         // error so the user sees why. Without an override we look at the
         // connector's PREFERRED mode (native resolution) and pick the
         // highest-refresh advertised mode at that same resolution — so a
@@ -209,7 +209,7 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
             match conn.modes().iter().find(|m| p.matches(m)).copied() {
                 Some(m) => (m, "env"),
                 None => bail!(
-                    "VOIDPTR_MODE {}x{}@{} not advertised by connector {:?}; \
+                    "SOL_MODE {}x{}@{} not advertised by connector {:?}; \
                      run `just drm-info` to see what's available",
                     p.width,
                     p.height,

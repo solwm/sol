@@ -1,5 +1,5 @@
 [package]
-name = "voidptr-wayland"
+name = "sol-wayland"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,8 +15,8 @@ wayland-protocols-wlr = { workspace = true }
 memmap2.workspace = true
 png.workspace = true
 rustix.workspace = true
-voidptr-core.workspace = true
-voidptr-backend-drm.workspace = true
+sol-core.workspace = true
+sol-backend-drm.workspace = true
 input.workspace = true
 libc.workspace = true
 xkbcommon.workspace = true
