@@ -153,9 +153,14 @@ pub fn describe_device(device: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn pick_output(card: &Card) -> Result<OutputSelection> {
+pub fn pick_output(
+    card: &Card,
+    config_pref: Option<ModePreference>,
+) -> Result<OutputSelection> {
     // Parse SOL_MODE if set. An unparseable value is rejected up front —
     // better to fail loud than silently ignore a typo like `3840X2160@240`.
+    // SOL_MODE wins over the config-supplied preference: env is the
+    // ad-hoc one-off, config is the persistent intent.
     let env_raw = std::env::var("SOL_MODE").ok();
     let env_pref = match env_raw.as_deref() {
         Some(s) => Some(parse_mode_pref(s).ok_or_else(|| {
@@ -165,6 +170,7 @@ pub fn pick_output(card: &Card) -> Result<OutputSelection> {
         })?),
         None => None,
     };
+    let env_pref = env_pref.or(config_pref);
 
     let res = card.resource_handles().context("resource_handles")?;
 
@@ -451,7 +457,7 @@ pub fn run_smoke_test(
         ));
     }
 
-    let sel = pick_output(&card)?;
+    let sel = pick_output(&card, None)?;
     let (w, h) = sel.mode.size();
     let w = w as u32;
     let h = h as u32;

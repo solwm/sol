@@ -26,7 +26,14 @@
 //! border_width = 2                         # focused-tile border, px (0 = off)
 //! border_color = ffff00                    # hex RRGGBB or #RRGGBB or 0xRRGGBB
 //! idle_timeout = 300                       # DPMS-off after N idle seconds (0 = off)
+//! mode         = 3840x2160@240             # output WIDTHxHEIGHT@HZ; SOL_MODE env wins
 //! ```
+//!
+//! The file is watched at runtime (inotify on its parent dir): saves
+//! re-apply gaps, border, idle_timeout, bindings, and remaps live.
+//! `mode` changes log a "restart to apply" warning (live mode-set
+//! requires GBM/EGL surface rebuild, not yet wired). `exec-once` is
+//! startup-only and is ignored on reload.
 //!
 //! Modifiers (case-insensitive): `ALT`/`MOD1`, `CTRL`/`CONTROL`,
 //! `SHIFT`, `SUPER`/`META`/`MOD4`. Keys: letters `A`-`Z`, digits
@@ -62,6 +69,13 @@ pub const MOD_CTRL: u8 = 1 << 1;
 pub const MOD_SHIFT: u8 = 1 << 2;
 pub const MOD_SUPER: u8 = 1 << 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModePref {
+    pub width: u16,
+    pub height: u16,
+    pub refresh_hz: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bindings: Vec<Binding>,
@@ -86,6 +100,14 @@ pub struct Config {
     /// `zwp_idle_inhibitor_v1` inhibitors on their surfaces and the
     /// timer is suppressed while any inhibitor is live.
     pub idle_timeout: u32,
+    /// Output mode preference (`mode = WIDTHxHEIGHT@HZ`). When set,
+    /// the DRM backend picks this mode at startup (overriding the
+    /// preferred-size-max-Hz heuristic). The `SOL_MODE` env var
+    /// still takes precedence — env is for one-off testing, config
+    /// is the persistent intent. Hot-reloading this value at runtime
+    /// is currently a warn-and-keep-old-mode (changing mode requires
+    /// rebuilding the GBM/EGL surface; restart sol to apply).
+    pub mode: Option<ModePref>,
 }
 
 impl Default for Config {
@@ -99,6 +121,7 @@ impl Default for Config {
             border_width: 2,
             border_color: hex_to_rgba(0xFFFF00),
             idle_timeout: 0,
+            mode: None,
         }
     }
 }
@@ -216,7 +239,7 @@ pub fn load() -> Config {
     }
 }
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return PathBuf::from(xdg).join("sol").join("sol.conf");
@@ -306,6 +329,7 @@ enum Entry {
     BorderWidth(i32),
     BorderColor([f32; 4]),
     IdleTimeout(u32),
+    Mode(ModePref),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -332,6 +356,7 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::BorderWidth(v))) => cfg.border_width = v,
             Ok(Some(Entry::BorderColor(c))) => cfg.border_color = c,
             Ok(Some(Entry::IdleTimeout(v))) => cfg.idle_timeout = v,
+            Ok(Some(Entry::Mode(m))) => cfg.mode = Some(m),
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -366,6 +391,7 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "border_width" => Ok(Some(Entry::BorderWidth(parse_int(rhs)?))),
         "border_color" => Ok(Some(Entry::BorderColor(parse_color(rhs)?))),
         "idle_timeout" => Ok(Some(Entry::IdleTimeout(parse_uint(rhs)?))),
+        "mode" => Ok(Some(Entry::Mode(parse_mode(rhs)?))),
         other => bail!("unknown directive `{other}`"),
     }
 }
@@ -453,6 +479,23 @@ fn tokenize_command(s: &str) -> Result<Vec<String>> {
         tokens.push(cur);
     }
     Ok(tokens)
+}
+
+/// Parse a `WIDTHxHEIGHT@HZ` mode spec — same grammar as the SOL_MODE
+/// env var. Whitespace around the components is tolerated; `x` and
+/// `@` are required separators.
+fn parse_mode(rhs: &str) -> Result<ModePref> {
+    let (wh, hz) = rhs
+        .split_once('@')
+        .ok_or_else(|| anyhow!("`mode` expects WIDTHxHEIGHT@HZ"))?;
+    let (w, h) = wh
+        .split_once('x')
+        .ok_or_else(|| anyhow!("`mode` expects WIDTHxHEIGHT@HZ"))?;
+    Ok(ModePref {
+        width: w.trim().parse().context("invalid mode width")?,
+        height: h.trim().parse().context("invalid mode height")?,
+        refresh_hz: hz.trim().parse().context("invalid mode refresh")?,
+    })
 }
 
 fn parse_remap(rhs: &str) -> Result<Remap> {

@@ -100,8 +100,11 @@ impl DrmPresenter {
     /// that check doesn't match. Operations that actually need master
     /// (set_crtc, page_flip) work fine because the fd itself is
     /// master-flagged.
-    pub fn from_card(card: Card) -> Result<Self> {
-        let sel = pick_output(&card)?;
+    pub fn from_card(
+        card: Card,
+        mode_pref: Option<crate::ModePreference>,
+    ) -> Result<Self> {
+        let sel = pick_output(&card, mode_pref)?;
         let (w_i16, h_i16) = sel.mode.size();
         let width = w_i16 as u32;
         let height = h_i16 as u32;

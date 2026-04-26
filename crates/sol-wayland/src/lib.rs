@@ -526,6 +526,148 @@ fn rebalance_keyboard_focus(state: &mut State) {
     state.set_keyboard_focus(next);
 }
 
+/// Install an inotify-based watcher on the user's `sol.conf` so edits
+/// take effect without restarting. Watches the parent directory (so
+/// rename-on-save editors don't escape the watch) for `CLOSE_WRITE`
+/// and `MOVED_TO`, filtered by the basename of the resolved config
+/// path. On a match, dispatches `apply_config_reload`.
+///
+/// Failure to install (no parent dir, inotify_init failed, etc.) is
+/// logged but non-fatal — sol still runs, just without live reload.
+fn install_config_watcher(
+    event_loop: &EventLoop<'static, Compositor>,
+) -> Result<()> {
+    use std::os::fd::AsFd;
+
+    use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
+
+    let cfg_path = config::config_path();
+    let parent = cfg_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent dir"))?
+        .to_path_buf();
+    let basename = cfg_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("config path has no file name"))?
+        .to_owned();
+
+    // Make sure the dir exists before we try to watch it. A user
+    // running sol without a config dir at all is fine — inotify
+    // returns ENOENT, we log and disable live reload.
+    if !parent.exists() {
+        anyhow::bail!("config dir {} does not exist", parent.display());
+    }
+
+    let inotify_fd = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)
+        .context("inotify_init")?;
+    inotify::add_watch(
+        &inotify_fd,
+        &parent,
+        WatchFlags::CLOSE_WRITE | WatchFlags::MOVED_TO,
+    )
+    .with_context(|| format!("inotify_add_watch {}", parent.display()))?;
+
+    tracing::info!(
+        path = %cfg_path.display(),
+        "config: watching for changes (live reload)"
+    );
+
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(inotify_fd, Interest::READ, Mode::Level),
+            move |_ready, fd, comp| {
+                use std::mem::MaybeUninit;
+                let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
+                let mut reader = inotify::Reader::new(fd.as_fd(), &mut buf);
+                let mut should_reload = false;
+                loop {
+                    match reader.next() {
+                        Ok(ev) => {
+                            // Filter by basename: directory watch fires
+                            // for every file in there (waybar.json,
+                            // wp-cycle.sh) — only the conf matters.
+                            let matches = ev
+                                .file_name()
+                                .map(|n| n.to_bytes() == basename.as_encoded_bytes())
+                                .unwrap_or(false);
+                            if matches
+                                && ev.events().intersects(
+                                    ReadFlags::CLOSE_WRITE | ReadFlags::MOVED_TO,
+                                )
+                            {
+                                should_reload = true;
+                            }
+                        }
+                        Err(e)
+                            if e.raw_os_error()
+                                == rustix::io::Errno::AGAIN.raw_os_error() =>
+                        {
+                            // Drained the buffer; back to the event loop.
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "inotify read failed");
+                            break;
+                        }
+                    }
+                }
+                if should_reload {
+                    apply_config_reload(&mut comp.state);
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert inotify source: {e}"))?;
+
+    Ok(())
+}
+
+/// Re-read `sol.conf` and replace `state.config` in place.
+///
+/// Settings that take effect immediately (just by virtue of being read
+/// from `state.config` on the next render / next idle tick / next
+/// keypress): `gaps_in`, `gaps_out`, `border_width`, `border_color`,
+/// `idle_timeout`, `bindings`, `remaps`.
+///
+/// Deliberately NOT reapplied:
+/// - `exec-once` — would spawn a duplicate waybar / awww-daemon every
+///   save. Startup-only.
+/// - `mode` — changing the output mode requires tearing down and
+///   rebuilding the GBM/EGL surface to the new size; that work isn't
+///   wired yet. We log a warning so the user knows their edit won't
+///   take effect until restart.
+fn apply_config_reload(state: &mut State) {
+    let new_cfg = config::load();
+
+    if new_cfg.mode != state.config.mode {
+        match new_cfg.mode {
+            Some(m) => tracing::warn!(
+                width = m.width,
+                height = m.height,
+                refresh_hz = m.refresh_hz,
+                "config: `mode` changed; restart sol to apply (live mode-set not yet implemented)"
+            ),
+            None => tracing::warn!(
+                "config: `mode` cleared; restart sol to revert to the default mode-pick heuristic"
+            ),
+        }
+    }
+
+    tracing::info!(
+        bindings = new_cfg.bindings.len(),
+        remaps = new_cfg.remaps.len(),
+        gaps_in = new_cfg.gaps_in,
+        gaps_out = new_cfg.gaps_out,
+        border_width = new_cfg.border_width,
+        idle_timeout = new_cfg.idle_timeout,
+        "config reloaded"
+    );
+    state.config = new_cfg;
+    // Force a fresh layout pass so gap / border tweaks animate in.
+    state.needs_render = true;
+}
+
 /// Master-stack layout. First window takes the left half (or full screen if
 /// it's the only one); remaining windows split the right half evenly, top to
 /// bottom in mapping order — so the most recently mapped toplevel is the
@@ -1521,6 +1663,7 @@ fn setup_event_loop(
     input: Option<(InputState, std::os::fd::OwnedFd)>,
     drm_device_path: Option<PathBuf>,
     session: Option<session::SharedSession>,
+    cfg: config::Config,
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, Compositor> =
         EventLoop::try_new().context("create calloop event loop")?;
@@ -1614,6 +1757,18 @@ fn setup_event_loop(
             },
         )
         .map_err(|e| anyhow::anyhow!("insert socket source: {e}"))?;
+
+    // Watch sol.conf for changes so layout knobs / keybinds / colors
+    // tweak live. We watch the parent *directory*, not the file
+    // itself: editors that save via "write to tmp, rename over" (vim
+    // with `set backupcopy=auto`, neovim's default, kate, gedit) would
+    // delete and replace the inode, taking our file-level watch with
+    // it. Catching CLOSE_WRITE + MOVED_TO on the directory and
+    // filtering by basename covers both write-in-place editors and
+    // rename-on-save editors.
+    if let Err(e) = install_config_watcher(&event_loop) {
+        tracing::warn!(error = %e, "config file watch unavailable; live reload disabled");
+    }
 
     let display_fd = display.backend().poll_fd().try_clone_to_owned()?;
     event_loop
@@ -1841,7 +1996,7 @@ fn setup_event_loop(
         right_shift_down: false,
         left_super_down: false,
         right_super_down: false,
-        config: config::load(),
+        config: cfg,
         zoomed: None,
         flip_counter: 0,
         flip_counter_reset: None,
@@ -2646,9 +2801,10 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
         canvas: Canvas::new(width, height),
         png_path,
     };
+    let cfg = config::load();
     // 60 mHz is a stand-in; headless has no real output and nothing
     // paces off wl_output.mode here.
-    setup_event_loop(backend, width, height, 60_000, None, None, None)
+    setup_event_loop(backend, width, height, 60_000, None, None, None, cfg)
 }
 
 /// DRM backend, managed via libseat.
@@ -2701,6 +2857,16 @@ pub fn run_drm(device: &Path) -> Result<()> {
         tracing::info!(seat = %s.name(), "libseat session active");
     }
 
+    // Load config first so the user's `mode = WxH@Hz` (if any) drives
+    // initial mode selection. The DRM backend's pick_output uses this
+    // as a fallback when SOL_MODE isn't set.
+    let cfg = config::load();
+    let mode_pref = cfg.mode.map(|m| sol_backend_drm::ModePreference {
+        width: m.width,
+        height: m.height,
+        refresh_hz: m.refresh_hz,
+    });
+
     // Open the DRM device through libseat, wrap into a Card, build the
     // presenter off it.
     let drm_fd = session
@@ -2708,8 +2874,8 @@ pub fn run_drm(device: &Path) -> Result<()> {
         .open_device_keep_fd(device)
         .context("libseat: open DRM device")?;
     let card = sol_backend_drm::Card::from_fd(drm_fd);
-    let presenter =
-        DrmPresenter::from_card(card).context("initialise DrmPresenter")?;
+    let presenter = DrmPresenter::from_card(card, mode_pref)
+        .context("initialise DrmPresenter")?;
     let (w, h) = presenter.size();
     let refresh_mhz = presenter.refresh_hz() as i32 * 1000;
     tracing::info!(width = w, height = h, refresh_mhz, "drm backend");
@@ -2730,6 +2896,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
         input,
         Some(device.to_path_buf()),
         Some(session),
+        cfg,
     )
 }
 
