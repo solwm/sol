@@ -993,6 +993,33 @@ fn send_pending_configures(state: &mut State) {
             "sent xdg_toplevel.configure (tiled+maximized)"
         );
     }
+
+    // Move-only layout changes (e.g. swapping two equal-size tiles in
+    // the master-stack's right column) need no configure — the client
+    // already drew at the right size — so the configure→ack→commit
+    // path that normally fires `settle_pending_layout` will never run
+    // and `pending_layout` would stay stuck `true` forever, holding
+    // `render_rect` at the old slot. Symptom: the tile doesn't visibly
+    // move, and the slot it was assigned to renders as wallpaper.
+    // Settle these inline now: pending_size already matches the target
+    // dims, so the existing buffer is correct for the new rect — kick
+    // off the position tween directly.
+    let now = Instant::now();
+    for win in state.mapped_toplevels.iter_mut() {
+        if !win.pending_layout {
+            continue;
+        }
+        let target_dims = (win.rect.w, win.rect.h);
+        if win.pending_size != Some(target_dims) {
+            continue;
+        }
+        win.pending_layout = false;
+        let target_f: RectF = win.rect.into();
+        if win.render_rect != target_f && win.anim_started_at.is_none() {
+            win.from_rect = win.render_rect;
+            win.anim_started_at = Some(now);
+        }
+    }
 }
 
 /// Collects scene elements in back-to-front render order:
