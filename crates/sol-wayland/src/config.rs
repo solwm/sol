@@ -31,6 +31,7 @@
 //! keyboard_repeat_delay = 200              # wl_keyboard.repeat_info delay, ms
 //! animation_duration_ms = 150              # layout-tween duration, 0 = snap
 //! animation_curve       = cubic_out        # linear|cubic_out|quart_out|quint_out|expo_out|in_out_cubic
+//! workspace_animation   = crossfade        # none|crossfade
 //! ```
 //!
 //! The file is watched at runtime (inotify on its parent dir): saves
@@ -127,6 +128,11 @@ pub struct Config {
     pub animation_duration_ms: u32,
     /// Easing curve applied to layout-transition tweens.
     pub animation_curve: AnimationCurve,
+    /// Visual transition for `workspace, N` switches. Default
+    /// `Crossfade` — the leaving workspace fades out while the
+    /// arriving one fades in over `animation_duration_ms` using
+    /// `animation_curve`. `None` is an instant cut.
+    pub workspace_animation: WorkspaceAnimation,
 }
 
 /// Easing functions exposed to the config. All map `t ∈ [0, 1]`
@@ -149,6 +155,17 @@ pub enum AnimationCurve {
     InOutCubic,
 }
 
+/// Workspace-switch transition kind. `Crossfade` renders both the
+/// outgoing and incoming workspaces together for the duration of
+/// the animation, lerping per-window alpha via `animation_curve`.
+/// `None` skips the transition and snaps to the new workspace on
+/// the same frame as the keybind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceAnimation {
+    None,
+    Crossfade,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -165,6 +182,7 @@ impl Default for Config {
             keyboard_repeat_delay: 200,
             animation_duration_ms: 150,
             animation_curve: AnimationCurve::CubicOut,
+            workspace_animation: WorkspaceAnimation::Crossfade,
         }
     }
 }
@@ -377,6 +395,7 @@ enum Entry {
     KeyboardRepeatDelay(i32),
     AnimationDurationMs(u32),
     AnimationCurve(AnimationCurve),
+    WorkspaceAnimation(WorkspaceAnimation),
 }
 
 pub fn parse(text: &str) -> Config {
@@ -408,6 +427,7 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::KeyboardRepeatDelay(v))) => cfg.keyboard_repeat_delay = v,
             Ok(Some(Entry::AnimationDurationMs(v))) => cfg.animation_duration_ms = v,
             Ok(Some(Entry::AnimationCurve(c))) => cfg.animation_curve = c,
+            Ok(Some(Entry::WorkspaceAnimation(w))) => cfg.workspace_animation = w,
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(line = lineno + 1, error = %e, "config: skipping line");
@@ -447,6 +467,9 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "keyboard_repeat_delay" => Ok(Some(Entry::KeyboardRepeatDelay(parse_int(rhs)?))),
         "animation_duration_ms" => Ok(Some(Entry::AnimationDurationMs(parse_uint(rhs)?))),
         "animation_curve" => Ok(Some(Entry::AnimationCurve(parse_animation_curve(rhs)?))),
+        "workspace_animation" => {
+            Ok(Some(Entry::WorkspaceAnimation(parse_workspace_animation(rhs)?)))
+        }
         other => bail!("unknown directive `{other}`"),
     }
 }
@@ -551,6 +574,16 @@ fn parse_mode(rhs: &str) -> Result<ModePref> {
         height: h.trim().parse().context("invalid mode height")?,
         refresh_hz: hz.trim().parse().context("invalid mode refresh")?,
     })
+}
+
+fn parse_workspace_animation(s: &str) -> Result<WorkspaceAnimation> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => Ok(WorkspaceAnimation::None),
+        "crossfade" | "fade" => Ok(WorkspaceAnimation::Crossfade),
+        other => bail!(
+            "unknown workspace_animation `{other}` (expected none / crossfade)"
+        ),
+    }
 }
 
 fn parse_animation_curve(s: &str) -> Result<AnimationCurve> {

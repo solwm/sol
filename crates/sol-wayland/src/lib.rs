@@ -161,6 +161,22 @@ pub struct Window {
     pub workspace: u32,
 }
 
+/// In-flight workspace crossfade. While set, both the outgoing and
+/// the (already-promoted) incoming workspace render simultaneously,
+/// with alpha derived from `now - started_at` against
+/// `config.animation_duration_ms` and the configured easing curve.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceAnim {
+    /// The workspace we're leaving. Its windows render on top during
+    /// the animation, fading from alpha 1.0 → 0.0.
+    pub from_ws: u32,
+    /// The workspace we just switched to (already in `state.active_ws`).
+    /// Fades 0.0 → 1.0.
+    pub to_ws: u32,
+    /// Wall-clock the switch was triggered.
+    pub started_at: Instant,
+}
+
 /// Compositor state shared across Dispatch impls. Backend-specific resources
 /// (canvas, presenter) live on `Compositor` alongside this, not here.
 pub struct State {
@@ -264,6 +280,13 @@ pub struct State {
     /// wallpapers) and the cursor are global, i.e. not gated by
     /// this.
     pub active_ws: u32,
+    /// In-flight workspace-switch animation state. While `Some`, the
+    /// outgoing workspace is rendered on top of the incoming one with
+    /// per-window alpha computed from the elapsed fraction of
+    /// `config.animation_duration_ms`. When the animation finishes
+    /// `tick_workspace_animation` clears this back to `None` and only
+    /// the active workspace renders again.
+    pub workspace_anim: Option<WorkspaceAnim>,
     /// All `wl_output` resources that clients have bound. Tracked so
     /// the `ext_workspace_v1` manager can emit `output_enter` on the
     /// workspace group for each client's output.
@@ -901,13 +924,19 @@ fn send_pending_configures(state: &mut State) {
 /// crop rect in buffer coordinates (x, y, w, h). When the source rect
 /// is Some, the presenter samples only that sub-rect of the buffer;
 /// otherwise the full texture is used.
+/// 4-tuple ABI passed from `collect_scene` to `scene_from_buffers`:
+/// the buffer to draw, the on-screen rect, an optional
+/// `wp_viewport.set_source` crop in buffer coords, and a per-element
+/// alpha in `[0, 1]` (1.0 = opaque, anything less = blended over the
+/// framebuffer per the configured blend func).
 type PlacedBuffer = (
     wayland_server::protocol::wl_buffer::WlBuffer,
     RectF,
     Option<(f64, f64, f64, f64)>,
+    f32,
 );
 
-fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
+fn collect_scene(state: &State, now: Instant) -> Vec<PlacedBuffer> {
     let mut out: Vec<PlacedBuffer> = Vec::new();
     let screen = Rect {
         x: 0,
@@ -919,54 +948,83 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
     use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
     let layers = layer_shell::mapped_layers(state, screen);
 
-    // 1. Background + Bottom layer surfaces.
+    // 1. Background + Bottom layer surfaces. Layer-shell surfaces
+    // are global (not per-workspace), so they always draw at full
+    // alpha — workspace-switch crossfade only affects toplevels.
     for ml in &layers {
         if matches!(ml.layer, Layer::Background | Layer::Bottom) {
             let vsrc = surface_viewport_src(&ml.surface);
             let r: RectF = ml.rect.into();
-            out.push((ml.buffer.clone(), r, vsrc));
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y);
+            out.push((ml.buffer.clone(), r, vsrc, 1.0));
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
 
-    // 2. Tiled xdg_toplevels. While zoom is active, only the zoomed
-    // surface renders — other tiles are effectively hidden even
-    // though their mapped_toplevels entries remain untouched.
-    // Position uses `render_rect`, not `rect`: during a layout
-    // transition `tick_animations` is interpolating the former
-    // toward the latter, and the GPU scales the buffer to whatever
-    // intermediate size we ask for — that's what makes the resize
-    // read as motion rather than a snap.
+    // 2. Tiled xdg_toplevels.
+    //
+    // While zoom is active, only the zoomed surface renders. During a
+    // workspace-switch crossfade, both the outgoing (`from_ws`) and
+    // incoming (`to_ws == active_ws`) workspaces render together
+    // with descending / ascending alpha; the outgoing draws *after*
+    // the incoming in the same back-to-front pass so it's painted
+    // on top — that way as it fades it reveals the incoming
+    // workspace beneath rather than the wallpaper.
+    //
+    // Position uses `render_rect`, not `rect`: `tick_animations` is
+    // interpolating it toward `rect`, and the GPU scales the buffer
+    // to whatever intermediate size we ask for — that's what makes
+    // the layout transition read as motion rather than a snap.
     let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
-    for win in state.mapped_toplevels.iter() {
-        if win.workspace != state.active_ws {
-            continue;
-        }
-        let Ok(surface) = win.surface.upgrade() else { continue };
-        if let Some(zs) = &zoomed {
-            if surface != *zs {
+    let crossfade = workspace_anim_alphas(state, now);
+    let active_ws = state.active_ws;
+
+    let emit_for_ws = |out: &mut Vec<PlacedBuffer>, ws: u32, alpha: f32| {
+        for win in state.mapped_toplevels.iter() {
+            if win.workspace != ws {
                 continue;
             }
-        }
-        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
-            continue;
-        };
-        let (buf_opt, vsrc, vdst) = {
-            let sd = sd_arc.lock().unwrap();
-            if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
-                continue;
+            let Ok(surface) = win.surface.upgrade() else { continue };
+            if let Some(zs) = &zoomed {
+                if surface != *zs {
+                    continue;
+                }
             }
-            (
-                sd.current.buffer.clone(),
-                sd.viewport_src,
-                sd.viewport_dst,
-            )
-        };
-        let _ = vdst;
-        if let Some(buf) = buf_opt {
-            out.push((buf, win.render_rect, vsrc));
+            let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
+                continue;
+            };
+            let (buf_opt, vsrc, vdst) = {
+                let sd = sd_arc.lock().unwrap();
+                if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
+                    continue;
+                }
+                (
+                    sd.current.buffer.clone(),
+                    sd.viewport_src,
+                    sd.viewport_dst,
+                )
+            };
+            let _ = vdst;
+            if let Some(buf) = buf_opt {
+                out.push((buf, win.render_rect, vsrc, alpha));
+            }
+            emit_subsurface_tree(
+                out,
+                &surface,
+                win.render_rect.x,
+                win.render_rect.y,
+                alpha,
+            );
         }
-        emit_subsurface_tree(&mut out, &surface, win.render_rect.x, win.render_rect.y);
+    };
+
+    if let Some((from_alpha, to_alpha)) = crossfade {
+        let from_ws = state.workspace_anim.map(|a| a.from_ws).unwrap_or(active_ws);
+        // Incoming workspace first (drawn underneath); outgoing on
+        // top so it covers the incoming until its alpha falls.
+        emit_for_ws(&mut out, active_ws, to_alpha);
+        emit_for_ws(&mut out, from_ws, from_alpha);
+    } else {
+        emit_for_ws(&mut out, active_ws, 1.0);
     }
 
     // 3. Top + Overlay layer surfaces.
@@ -974,8 +1032,8 @@ fn collect_scene(state: &State) -> Vec<PlacedBuffer> {
         if matches!(ml.layer, Layer::Top | Layer::Overlay) {
             let vsrc = surface_viewport_src(&ml.surface);
             let r: RectF = ml.rect.into();
-            out.push((ml.buffer.clone(), r, vsrc));
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y);
+            out.push((ml.buffer.clone(), r, vsrc, 1.0));
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
 
@@ -1000,6 +1058,7 @@ fn emit_subsurface_tree(
     parent: &WlSurface,
     parent_x: f32,
     parent_y: f32,
+    alpha: f32,
 ) {
     let Some(sd_arc) = parent.data::<Arc<Mutex<SurfaceData>>>() else {
         return;
@@ -1054,9 +1113,10 @@ fn emit_subsurface_tree(
                     h: h as f32,
                 },
                 vsrc,
+                alpha,
             ));
         }
-        emit_subsurface_tree(out, &child, child_x, child_y);
+        emit_subsurface_tree(out, &child, child_x, child_y, alpha);
     }
 }
 
@@ -1065,7 +1125,7 @@ fn scene_from_buffers<'a>(
     cursor: &'a Cursor,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
-    for (buf, rect, vsrc) in placed {
+    for (buf, rect, vsrc, alpha) in placed {
         if let Some(bd) = buf.data::<shm::BufferData>() {
             let Some(bytes) = bd.bytes() else { continue };
             let Some(format) = bd.pixel_format() else { continue };
@@ -1083,6 +1143,7 @@ fn scene_from_buffers<'a>(
                 uv_y: uy,
                 uv_w: uw,
                 uv_h: uh,
+                alpha: *alpha,
                 content: SceneContent::Shm {
                     pixels: bytes,
                     stride: bd.stride,
@@ -1107,6 +1168,7 @@ fn scene_from_buffers<'a>(
                 uv_y: uy,
                 uv_w: uw,
                 uv_h: uh,
+                alpha: *alpha,
                 content: SceneContent::Dmabuf {
                     fd: p0.fd.as_raw_fd(),
                     fourcc: db.format,
@@ -1132,6 +1194,7 @@ fn scene_from_buffers<'a>(
             uv_y: 0.0,
             uv_w: 1.0,
             uv_h: 1.0,
+            alpha: 1.0,
             content: SceneContent::Shm {
                 pixels: &cursor.pixels,
                 stride: cursor.width * 4,
@@ -1282,6 +1345,53 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         }
     }
     any_active
+}
+
+/// Per-workspace alphas for the active crossfade, if any.
+///
+/// Returns `(from_alpha, to_alpha)` where:
+/// - `from_alpha` is what windows on `state.workspace_anim.from_ws`
+///   should multiply their output by (fading 1 → 0 over the duration)
+/// - `to_alpha` is what windows on `state.workspace_anim.to_ws`
+///   should use (fading 0 → 1)
+///
+/// `None` means no animation is in flight; the caller renders the
+/// active workspace at full alpha as usual.
+fn workspace_anim_alphas(state: &State, now: Instant) -> Option<(f32, f32)> {
+    let anim = state.workspace_anim?;
+    let duration = state.config.animation_duration_ms as u128;
+    if duration == 0 {
+        return None;
+    }
+    let elapsed = now.duration_since(anim.started_at).as_millis();
+    if elapsed >= duration {
+        return None;
+    }
+    let t = elapsed as f32 / duration as f32;
+    let eased = apply_easing(state.config.animation_curve, t);
+    Some((1.0 - eased, eased))
+}
+
+/// Mark the workspace animation as finished if the elapsed time has
+/// exceeded the configured duration. Called from render_tick after
+/// drawing so the next frame stops compositing the outgoing
+/// workspace. Returns `true` if an animation is still in flight, so
+/// the caller can keep `needs_render` high.
+fn tick_workspace_animation(state: &mut State, now: Instant) -> bool {
+    let Some(anim) = state.workspace_anim else {
+        return false;
+    };
+    let duration = state.config.animation_duration_ms as u128;
+    if duration == 0 {
+        state.workspace_anim = None;
+        return false;
+    }
+    if now.duration_since(anim.started_at).as_millis() >= duration {
+        state.workspace_anim = None;
+        false
+    } else {
+        true
+    }
 }
 
 /// A surface's logical size per the Wayland protocol layering:
@@ -1490,6 +1600,23 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
             win.anim_started_at = None;
         }
     }
+    // Kick off the configured workspace transition. Crossfade keeps
+    // the outgoing workspace rendered on top during the animation
+    // with descending alpha; None just doesn't set the field and
+    // the swap is instant. A duration of 0 also short-circuits to
+    // the instant path.
+    state.workspace_anim = match state.config.workspace_animation {
+        config::WorkspaceAnimation::Crossfade
+            if state.config.animation_duration_ms > 0 =>
+        {
+            Some(WorkspaceAnim {
+                from_ws: old,
+                to_ws: n,
+                started_at: Instant::now(),
+            })
+        }
+        _ => None,
+    };
     let new_focus = state
         .mapped_toplevels
         .iter()
@@ -1641,11 +1768,12 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     // this is a belt-and-braces guard for headless and for ticks
     // where no other event is pending.
     let animating = tick_animations(&mut comp.state, now);
-    if animating {
+    let ws_animating = tick_workspace_animation(&mut comp.state, now);
+    if animating || ws_animating {
         comp.state.needs_render = true;
     }
 
-    let placed = collect_scene(&comp.state);
+    let placed = collect_scene(&comp.state, now);
     let mut scene = scene_from_buffers(&placed, &comp.state.cursor);
     scene.borders.extend(focus_border(&comp.state));
     let drawn = scene.elements.len();
@@ -2022,6 +2150,7 @@ fn setup_event_loop(
         clients_seen: 0,
         mapped_toplevels: Vec::new(),
         active_ws: 1,
+        workspace_anim: None,
         outputs: Vec::new(),
         ext_workspace_managers: Vec::new(),
         idle_inhibitors: Vec::new(),

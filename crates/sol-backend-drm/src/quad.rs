@@ -37,11 +37,16 @@ const FS: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_opaque;
+uniform float u_alpha;
 varying vec2 v_uv;
 void main() {
     vec4 t = texture2D(u_tex, v_uv);
-    float a = mix(t.a, 1.0, u_opaque);
-    gl_FragColor = vec4(t.bgr, a);
+    float a = mix(t.a, 1.0, u_opaque) * u_alpha;
+    // Pre-multiply the colour by u_alpha too so the SRC_ALPHA blend
+    // function fades the colour contribution along with coverage —
+    // otherwise a faded surface darkens whatever's behind it because
+    // we're feeding full-strength colour into a smaller alpha weight.
+    gl_FragColor = vec4(t.bgr * u_alpha, a);
 }
 "#;
 
@@ -50,13 +55,14 @@ const FS_EXTERNAL: &str = r#"#version 100
 precision mediump float;
 uniform samplerExternalOES u_tex;
 uniform float u_opaque;
+uniform float u_alpha;
 varying vec2 v_uv;
 void main() {
     vec4 t = texture2D(u_tex, v_uv);
-    float a = mix(t.a, 1.0, u_opaque);
+    float a = mix(t.a, 1.0, u_opaque) * u_alpha;
     // Driver returns (R, G, B, A) in fourcc order for external images,
     // so no channel swizzle needed here (unlike the SHM path).
-    gl_FragColor = vec4(t.rgb, a);
+    gl_FragColor = vec4(t.rgb * u_alpha, a);
 }
 "#;
 
@@ -76,6 +82,7 @@ pub struct QuadProgram {
     pub u_uv: NativeUniformLocation,
     pub u_tex: NativeUniformLocation,
     pub u_opaque: NativeUniformLocation,
+    pub u_alpha: NativeUniformLocation,
 }
 
 /// Border / solid-color rect program. Same vertex pipeline and VBO
@@ -175,6 +182,9 @@ fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
         let u_opaque = gl
             .get_uniform_location(program, "u_opaque")
             .ok_or_else(|| anyhow!("u_opaque missing"))?;
+        let u_alpha = gl
+            .get_uniform_location(program, "u_alpha")
+            .ok_or_else(|| anyhow!("u_alpha missing"))?;
 
         let verts: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let vbo = gl
@@ -195,6 +205,7 @@ fn build_with_fs(gl: &glow::Context, fs_src: &str) -> Result<QuadProgram> {
             u_uv,
             u_tex,
             u_opaque,
+            u_alpha,
         })
     }
 }

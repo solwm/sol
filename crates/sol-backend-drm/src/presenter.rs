@@ -418,6 +418,7 @@ impl DrmPresenter {
                     elem.uv_h,
                 );
                 gl.uniform_1_f32(Some(&prog.u_opaque), opaque);
+                gl.uniform_1_f32(Some(&prog.u_alpha), elem.alpha.clamp(0.0, 1.0));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.bind_texture(entry.target, None);
             }

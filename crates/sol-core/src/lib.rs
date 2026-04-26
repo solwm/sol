@@ -72,6 +72,13 @@ pub struct SceneElement<'a> {
     pub uv_y: f32,
     pub uv_w: f32,
     pub uv_h: f32,
+    /// Per-element alpha multiplier in `[0, 1]`. Multiplied into the
+    /// fragment shader's output (both alpha channel and RGB) so the
+    /// surface blends with the framebuffer over the configured blend
+    /// func. 1.0 is full opacity (the default for every element);
+    /// 0.0 invisible. Used today for crossfade during workspace
+    /// switches; available to any future caller that wants a fade.
+    pub alpha: f32,
     pub content: SceneContent<'a>,
 }
 
