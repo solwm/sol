@@ -278,6 +278,17 @@ pub struct State {
     /// focus or move direction command, and automatically if the
     /// zoomed surface dies.
     pub zoomed: Option<Weak<WlSurface>>,
+    /// Master/stack split ratio in [0.1, 0.9] — fraction of the
+    /// usable width given to the master tile. Adjusted live in
+    /// `resize_mode` (Alt+R then H/L). Persists across config
+    /// reloads but resets on restart.
+    pub master_ratio: f32,
+    /// True while a modal resize loop is active: H/L tweak
+    /// `master_ratio`, Escape exits, all other keys are swallowed
+    /// (we do NOT forward them to the focused client). Entered via
+    /// the `resize_mode` action; intentionally modal so the user
+    /// can rapid-fire adjustments without holding a chord.
+    pub resize_mode: bool,
     /// If Some, the tile currently fullscreened to the raw output
     /// rect — no outer gaps, no border, no rounded corners, drawn
     /// above Top-layer surfaces so it covers waybar etc. Overlay
@@ -870,12 +881,17 @@ fn apply_config_reload(state: &mut State) {
 /// it's the only one); remaining windows split the right half evenly, top to
 /// bottom in mapping order — so the most recently mapped toplevel is the
 /// bottom of the stack. Pure function over window count + screen rect.
-fn master_stack_layout(n: usize, screen: Rect) -> Vec<Rect> {
+fn master_stack_layout(n: usize, screen: Rect, master_ratio: f32) -> Vec<Rect> {
     match n {
         0 => Vec::new(),
         1 => vec![screen],
         _ => {
-            let mid = screen.w / 2;
+            // Clamp guards against values outside [0.1, 0.9] making
+            // either pane vanish or go negative; resize_mode
+            // already clamps, this is a belt-and-braces.
+            let r = master_ratio.clamp(0.1, 0.9);
+            let mid = (screen.w as f32 * r).round() as i32;
+            let mid = mid.clamp(1, screen.w - 1);
             let master = Rect {
                 x: screen.x,
                 y: screen.y,
@@ -975,7 +991,7 @@ fn apply_layout(state: &mut State, now: Instant) {
         .iter()
         .filter(|w| w.workspace == active_ws)
         .count();
-    let rects = master_stack_layout(n, inner);
+    let rects = master_stack_layout(n, inner, state.master_ratio);
     let gaps_in = state.config.gaps_in;
     let mut rect_iter = rects.into_iter();
     for win in state.mapped_toplevels.iter_mut() {
@@ -2874,6 +2890,8 @@ fn setup_event_loop(
         config: cfg,
         zoomed: None,
         fullscreened: None,
+        master_ratio: 0.5,
+        resize_mode: false,
         flip_counter: 0,
         flip_counter_reset: None,
         pending_presentation: presentation_time::empty(),
@@ -3120,6 +3138,44 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             let shift = state.left_shift_down || state.right_shift_down;
             let sup = state.left_super_down || state.right_super_down;
 
+            // Modal resize loop. While active, H / L bump the
+            // master/stack split ratio by ±5% per press, Escape
+            // exits, every other key (including modifiers) is
+            // swallowed instead of being forwarded to the focused
+            // client — the user pressed `resize_mode` to *adjust*,
+            // not to type. Modifier *tracking* above still runs so
+            // the next bind after exit sees correct state.
+            if state.resize_mode {
+                if pressed {
+                    match keycode {
+                        KEY_ESC => {
+                            state.resize_mode = false;
+                            tracing::debug!("resize_mode: exit");
+                        }
+                        KEY_L => {
+                            state.master_ratio =
+                                (state.master_ratio + 0.05).clamp(0.1, 0.9);
+                            state.needs_render = true;
+                            tracing::debug!(
+                                ratio = state.master_ratio,
+                                "resize_mode: L"
+                            );
+                        }
+                        KEY_H => {
+                            state.master_ratio =
+                                (state.master_ratio - 0.05).clamp(0.1, 0.9);
+                            state.needs_render = true;
+                            tracing::debug!(
+                                ratio = state.master_ratio,
+                                "resize_mode: H"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+
             // Ctrl+Alt+F1..F12 → libseat VT switch. Intentionally not
             // overridable from the config: a misconfigured .conf must
             // never be able to trap the user on the compositor.
@@ -3170,6 +3226,10 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                         config::Action::ToggleZoom => {
                             toggle_zoom(state);
                         }
+                        config::Action::ResizeMode => {
+                            state.resize_mode = true;
+                            tracing::debug!("resize_mode: enter");
+                        }
                         config::Action::CloseWindow => {
                             close_focused_window(state);
                         }
@@ -3209,6 +3269,11 @@ const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
+/// Used by the modal resize loop. Match the values in
+/// `config::key_from_name`.
+const KEY_ESC: u32 = 1;
+const KEY_H: u32 = 35;
+const KEY_L: u32 = 38;
 
 /// Fork/exec a Wayland client connected to our own socket. Env is
 /// inherited wholesale from sol's process, which was normalised at

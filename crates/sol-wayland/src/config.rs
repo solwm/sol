@@ -297,6 +297,12 @@ pub enum Action {
     /// so the client doesn't enter its own fullscreen UI mode
     /// (Chrome's controls stay visible, etc.).
     ToggleFullscreen,
+    /// Enter the modal resize loop. While active, H / L adjust the
+    /// master/stack split ratio by ±5%, Escape exits. Other key
+    /// events are swallowed (not forwarded to the focused client)
+    /// so the user can rapid-fire adjustments without accidentally
+    /// typing into whatever's focused.
+    ResizeMode,
     /// Ask the focused toplevel to close via `xdg_toplevel.close`.
     /// The client decides what to do (terminals exit, text editors
     /// may prompt to save, etc.). If a client ignores the request
@@ -784,6 +790,7 @@ fn parse_action(kind: &str, args: &str) -> Result<Action> {
         "move_dir" => Ok(Action::MoveDir(parse_direction(args)?)),
         "toggle_zoom" => Ok(Action::ToggleZoom),
         "toggle_fullscreen" => Ok(Action::ToggleFullscreen),
+        "resize_mode" => Ok(Action::ResizeMode),
         "close_window" => Ok(Action::CloseWindow),
         "workspace" => Ok(Action::Workspace(parse_workspace_num(args)?)),
         "move_to_workspace" => Ok(Action::MoveToWorkspace(parse_workspace_num(args)?)),
