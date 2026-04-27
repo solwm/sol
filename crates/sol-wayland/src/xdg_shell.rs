@@ -235,7 +235,10 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
             xdg_surface::Request::AckConfigure { serial } => {
                 tracing::debug!(serial, "client ack_configure");
             }
-            xdg_surface::Request::SetWindowGeometry { .. } => {}
+            xdg_surface::Request::SetWindowGeometry { x, y, width, height } => {
+                let mut sd = data.surface_data.lock().unwrap();
+                sd.xdg_window_geometry = Some((x, y, width, height));
+            }
             xdg_surface::Request::Destroy => {}
             _ => {}
         }

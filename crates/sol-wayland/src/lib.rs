@@ -1779,43 +1779,56 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
     // fullscreened browser still appears in front of its content.
     // Each popup's screen origin is its parent's render origin plus
     // the popup's surface-local offset (computed from xdg_positioner
-    // at GetPopup time). Subsurface trees beneath a popup recurse
-    // the same way as toplevels.
+    // at GetPopup time). The popup *buffer* may extend beyond the
+    // logical popup rect when the client draws drop-shadow inside
+    // it — we honor xdg_surface.set_window_geometry to align the
+    // geometry rect with the positioner's anchor and let the
+    // shadow spill out around it. Subsurface trees beneath the
+    // popup recurse the same way as toplevels, anchored to the
+    // BUFFER origin (not the geometry rect) so subsurface
+    // positions in surface-local coords land where the client
+    // expects.
     for popup in &state.mapped_popups {
         let Ok(surface) = popup.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (offset, size, buf, vsrc) = {
+        let (offset, buf, vsrc, geom, buf_dims) = {
             let sd = sd_arc.lock().unwrap();
-            match sd.role {
-                SurfaceRole::XdgPopup { mapped: true, offset, size } => (
-                    offset,
-                    size,
-                    sd.current.buffer.clone(),
-                    sd.viewport_src,
-                ),
-                _ => continue,
-            }
+            let SurfaceRole::XdgPopup { mapped: true, offset, .. } = sd.role else {
+                continue;
+            };
+            let buf = sd.current.buffer.clone();
+            let buf_dims = buf.as_ref().and_then(surface_buffer_dims);
+            (offset, buf, sd.viewport_src, sd.xdg_window_geometry, buf_dims)
         };
         let Some((origin_x, origin_y)) = popup_screen_origin(state, &surface) else {
             continue;
         };
-        let popup_x = origin_x + offset.0 as f32;
-        let popup_y = origin_y + offset.1 as f32;
+        let logical_x = origin_x + offset.0 as f32;
+        let logical_y = origin_y + offset.1 as f32;
+        // Pull the geometry offset (shadow padding inside the
+        // buffer) and the buffer dims; default to a 0,0,buf,buf
+        // geometry when the client hasn't set one — that matches
+        // pre-window_geometry behavior.
+        let (geom_x, geom_y) = match geom {
+            Some((gx, gy, _, _)) => (gx as f32, gy as f32),
+            None => (0.0, 0.0),
+        };
+        let buffer_x = logical_x - geom_x;
+        let buffer_y = logical_y - geom_y;
+        let (bw, bh) = match buf_dims {
+            Some((w, h)) => (w as f32, h as f32),
+            None => continue,
+        };
         if let Some(buf) = buf {
             out.push(Placed::Buffer {
                 buf,
-                rect: RectF {
-                    x: popup_x,
-                    y: popup_y,
-                    w: size.0 as f32,
-                    h: size.1 as f32,
-                },
+                rect: RectF { x: buffer_x, y: buffer_y, w: bw, h: bh },
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
             });
         }
-        emit_subsurface_tree(&mut out, &surface, popup_x, popup_y, 1.0);
+        emit_subsurface_tree(&mut out, &surface, buffer_x, buffer_y, 1.0);
     }
 
     // 6. Overlay layer surfaces — always on top, even of fullscreen.
@@ -3851,12 +3864,26 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
     // toplevels and over Top/Overlay layers, so click resolution
     // must check them before anything else — otherwise right-click
     // on an open context menu lands on the toplevel underneath.
+    //
+    // Hit-test against the LOGICAL popup rect (positioner-sized,
+    // matches what the user perceives as the menu — clicks on the
+    // shadow padding outside fall through). The surface-local
+    // coords we hand to `resolve_hit`, however, are buffer-space:
+    // we add the window_geometry offset back in, so a hover
+    // halfway down the visible menu lands on the menu item Chrome
+    // drew at that surface position rather than one shifted by
+    // the shadow_top of however much the client padded.
     for popup in state.mapped_popups.iter().rev() {
         let Ok(surface) = popup.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (offset, size) = match sd_arc.lock().ok().map(|sd| sd.role.clone()) {
-            Some(SurfaceRole::XdgPopup { mapped: true, offset, size }) => (offset, size),
-            _ => continue,
+        let (offset, size, geom) = match sd_arc.lock().ok() {
+            Some(sd) => match sd.role.clone() {
+                SurfaceRole::XdgPopup { mapped: true, offset, size } => {
+                    (offset, size, sd.xdg_window_geometry)
+                }
+                _ => continue,
+            },
+            None => continue,
         };
         let Some((ox, oy)) = popup_screen_origin(state, &surface) else { continue };
         let popup_rect = Rect {
@@ -3866,7 +3893,14 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
             h: size.1,
         };
         if let Some((lx, ly)) = hit_rect(popup_rect) {
-            return Some(resolve_hit(surface, lx, ly));
+            // Translate from "logical popup" coords into
+            // surface-buffer coords. resolve_hit walks subsurfaces
+            // off this point, so they land at the right offsets too.
+            let (gx, gy) = match geom {
+                Some((gx, gy, _, _)) => (gx as f64, gy as f64),
+                None => (0.0, 0.0),
+            };
+            return Some(resolve_hit(surface, lx + gx, ly + gy));
         }
     }
 

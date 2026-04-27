@@ -133,6 +133,22 @@ pub struct SurfaceData {
     /// `min == max` is a fixed-size window — see
     /// `is_fixed_size_floater` for the routing rule that uses this.
     pub xdg_max_size: (i32, i32),
+    /// Most recent rect set via `xdg_surface.set_window_geometry`,
+    /// in surface-local coords (so within the buffer). When `Some`,
+    /// it carves out the "logical" window inside a possibly-larger
+    /// buffer — clients use this to draw decoration / shadow that
+    /// extends outside the window's user-perceived bounds. Chrome
+    /// and Firefox set this on popups so their drop-shadow rounds
+    /// the menu. We use it to:
+    /// - render the buffer at `(popup_x - geom.x, popup_y - geom.y)`
+    ///   so the geometry rect aligns with the positioner's anchor
+    ///   instead of the buffer origin, and
+    /// - convert pointer events into surface-local coords by
+    ///   adding `(geom.x, geom.y)` to the in-rect offset so the
+    ///   client highlights the item the user is actually pointing
+    ///   at.
+    /// `None` → treat as `(0, 0, buffer_w, buffer_h)`.
+    pub xdg_window_geometry: Option<(i32, i32, i32, i32)>,
     /// For surfaces with role=Subsurface: weak ref to the parent the
     /// child hangs off of. The scene walker follows this in reverse
     /// (parent → children) but carries the parent link so cleanup on
