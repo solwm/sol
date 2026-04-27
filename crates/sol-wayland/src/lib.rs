@@ -478,6 +478,15 @@ pub struct State {
     /// `unmap_toplevel` and on workspace move so dead/relocated
     /// surfaces don't sit around as ghosts in this map.
     pub last_focus_per_workspace: std::collections::HashMap<u32, Weak<WlSurface>>,
+    /// Per-workspace memory of the last keyboard-focused STACK
+    /// tile (any toplevel that wasn't the master tile in its
+    /// workspace at focus time). Used by `focus_direction(Right)`
+    /// from master so going master → stack returns to the tile the
+    /// user was on, not whatever's geometrically closest. Updated
+    /// in `set_keyboard_focus` whenever focus lands on a non-
+    /// master tile; entries are weak so tiles that close or move
+    /// away naturally drop out on lookup.
+    pub last_stack_focus_per_workspace: std::collections::HashMap<u32, Weak<WlSurface>>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -642,7 +651,41 @@ impl State {
                 }
             }
         }
+        // Remember the focused tile's slot per workspace if it's a
+        // STACK tile (any tile that isn't the master / first entry
+        // in mapped_toplevels for its workspace). `focus_direction`
+        // uses this to make Right-from-master return to the same
+        // stack tile the user was on, instead of whatever's
+        // geometrically closest.
+        if let Some(s) = new.as_ref() {
+            if let Some((ws, is_master)) = self.position_in_workspace(s) {
+                if !is_master {
+                    self.last_stack_focus_per_workspace
+                        .insert(ws, s.downgrade());
+                }
+            }
+        }
+
         self.keyboard_focus = new;
+    }
+
+    /// If `surface` is a tiled toplevel, return its workspace and
+    /// whether it's the master tile (first non-skipped entry on
+    /// that workspace). `None` for layer surfaces, popups, dialogs,
+    /// or anything not in `mapped_toplevels`.
+    pub fn position_in_workspace(&self, surface: &WlSurface) -> Option<(u32, bool)> {
+        let mut master_seen_for: std::collections::HashMap<u32, bool> =
+            std::collections::HashMap::new();
+        for w in self.mapped_toplevels.iter() {
+            let same = w.surface.upgrade().ok().as_ref() == Some(surface);
+            let entry = master_seen_for.entry(w.workspace).or_insert(false);
+            if same {
+                let is_master = !*entry;
+                return Some((w.workspace, is_master));
+            }
+            *entry = true;
+        }
+        None
     }
 
     // Cheeky: hand back the current `next_serial` without mutating. Only
@@ -2528,7 +2571,42 @@ fn focused_toplevel_index(state: &State) -> Option<usize> {
         .position(|w| w.surface.upgrade().ok().as_ref() == Some(focus))
 }
 
+/// If the keyboard-focused tile is the master of its workspace AND
+/// we have a remembered last-stack-tile for that workspace AND that
+/// tile is still in the stack, return it. Returns `None` otherwise
+/// — caller falls back to geometric `neighbor_in_direction`.
+fn focus_to_remembered_stack_tile(state: &State) -> Option<WlSurface> {
+    let focus = state.keyboard_focus.as_ref()?;
+    let (ws, is_master) = state.position_in_workspace(focus)?;
+    if !is_master {
+        return None;
+    }
+    let saved = state.last_stack_focus_per_workspace.get(&ws)?.upgrade().ok()?;
+    let (saved_ws, saved_is_master) = state.position_in_workspace(&saved)?;
+    if saved_ws != ws || saved_is_master {
+        return None;
+    }
+    Some(saved)
+}
+
 fn focus_direction(state: &mut State, dir: config::Direction) {
+    // Right-from-master shortcut: prefer the last stack tile the
+    // user was on over geometric "nearest". Without this,
+    // master → right always picks the vertically-closest stack tile
+    // (typically the middle one in a 3-tile stack), even if the
+    // user just came from the top or bottom — frustrating in a
+    // 2-pane workflow where you bounce between master and "the
+    // tile you were just reading".
+    if matches!(dir, config::Direction::Right) {
+        if let Some(saved) = focus_to_remembered_stack_tile(state) {
+            state.zoomed = None;
+            state.fullscreened = None;
+            state.set_keyboard_focus(Some(saved));
+            state.needs_render = true;
+            return;
+        }
+    }
+
     let Some(idx) = focused_toplevel_index(state) else { return };
     let Some(n) =
         neighbor_in_direction(&state.mapped_toplevels, idx, dir, state.active_ws)
@@ -3396,6 +3474,7 @@ fn setup_event_loop(
         dragging: None,
         popup_grab: None,
         last_focus_per_workspace: std::collections::HashMap::new(),
+        last_stack_focus_per_workspace: std::collections::HashMap::new(),
     };
     let mut compositor = Compositor {
         state,
