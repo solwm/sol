@@ -166,17 +166,22 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                     sd.xdg_toplevel = Some(toplevel.downgrade());
                     sd.xdg_surface = Some(xs.downgrade());
                 }
-                // Give the client a real initial tile size with MAXIMIZED +
-                // ACTIVATED set, so it commits its first buffer at this
-                // size rather than whatever its hard-coded default is.
-                // Once the window actually maps, apply_layout re-sends a
-                // configure with the precise tile rect.
-                let sw = state.screen_width as i32;
-                let sh = state.screen_height as i32;
-                toplevel.configure(sw, sh, tile_state_bytes());
+                // Initial configure with size 0,0 and no states tells
+                // the client "pick your own size for now". This is the
+                // only signal we have at this point that lets dialogs
+                // (xdg_toplevel with set_parent) actually use their
+                // preferred size — if we sent MAXIMIZED+screen-sized
+                // here, every save/discard prompt would draw at the
+                // full screen and ignore its own intrinsic dims.
+                // Tiled toplevels get their proper sized + MAXIMIZED
+                // configure from `apply_layout` once they map; the
+                // brief moment of "client at preferred size" before
+                // that arrives is invisible because we don't render a
+                // toplevel until it has a buffer anyway.
+                toplevel.configure(0, 0, Vec::new());
                 let serial = state.next_serial();
                 xs.configure(serial);
-                tracing::debug!(width = sw, height = sh, "initial xdg_toplevel.configure");
+                tracing::debug!(?serial, "initial xdg_toplevel.configure(0,0)");
             }
             xdg_surface::Request::GetPopup {
                 id,
@@ -248,6 +253,26 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
         _init: &mut DataInit<'_, Self>,
     ) {
         match request {
+            xdg_toplevel::Request::SetParent { parent } => {
+                // Parent links a transient window (dialog, file
+                // picker, preferences) to its owner toplevel. When
+                // set, we treat this surface as a floating dialog
+                // at first map time rather than a tile. None
+                // unsets and reverts to a regular toplevel for any
+                // future remap.
+                let parent_surface = parent.as_ref().and_then(|tl| {
+                    tl.data::<WlSurface>().cloned()
+                });
+                if let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() {
+                    let mut sd = sd_arc.lock().unwrap();
+                    sd.xdg_toplevel_parent = parent_surface.as_ref().map(|s| s.downgrade());
+                }
+                tracing::debug!(
+                    id = ?surface.id(),
+                    parent = ?parent_surface.as_ref().map(|s| s.id()),
+                    "toplevel set_parent"
+                );
+            }
             xdg_toplevel::Request::SetTitle { title } => {
                 tracing::info!(id = ?surface.id(), %title, "toplevel title");
             }

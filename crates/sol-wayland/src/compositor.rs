@@ -116,6 +116,13 @@ pub struct SurfaceData {
     /// + popup_offset) and to walk up the chain when dismissing
     /// nested popup grabs.
     pub xdg_popup_parent: Option<Weak<WlSurface>>,
+    /// Set by `xdg_toplevel.set_parent`. When `Some` at first map
+    /// time, this toplevel is treated as a dialog/transient: it
+    /// stays out of the tile layout and floats centered over the
+    /// parent's tile. Used by save/discard prompts, file pickers,
+    /// preferences windows, etc. — anything the protocol marks as
+    /// belonging to another window.
+    pub xdg_toplevel_parent: Option<Weak<WlSurface>>,
     /// For surfaces with role=Subsurface: weak ref to the parent the
     /// child hangs off of. The scene walker follows this in reverse
     /// (parent → children) but carries the parent link so cleanup on
@@ -298,17 +305,40 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                             if !*mapped {
                                 *mapped = true;
                                 just_mapped_toplevel = true;
-                                tracing::info!(id = ?surface.id(), "toplevel mapped");
-                                state.mapped_toplevels.push(crate::Window {
-                                    surface: surface.downgrade(),
-                                    rect: crate::Rect::default(),
-                                    render_rect: crate::RectF::default(),
-                                    from_rect: crate::RectF::default(),
-                                    anim_started_at: None,
-                                    pending_size: None,
-                                    pending_layout: false,
-                                    workspace: state.active_ws,
-                                });
+                                // Dialog vs tile fork. A toplevel
+                                // that called set_parent before its
+                                // first commit is a transient
+                                // window — save/discard prompts,
+                                // file pickers, etc. — and gets a
+                                // floating slot instead of a tile.
+                                let dialog_parent = sd
+                                    .xdg_toplevel_parent
+                                    .as_ref()
+                                    .and_then(|w| w.upgrade().ok());
+                                if let Some(parent) = dialog_parent {
+                                    tracing::info!(
+                                        id = ?surface.id(),
+                                        parent = ?parent.id(),
+                                        "dialog mapped"
+                                    );
+                                    state.mapped_dialogs.push(crate::DialogWindow {
+                                        surface: surface.downgrade(),
+                                        parent: parent.downgrade(),
+                                        workspace: state.active_ws,
+                                    });
+                                } else {
+                                    tracing::info!(id = ?surface.id(), "toplevel mapped");
+                                    state.mapped_toplevels.push(crate::Window {
+                                        surface: surface.downgrade(),
+                                        rect: crate::Rect::default(),
+                                        render_rect: crate::RectF::default(),
+                                        from_rect: crate::RectF::default(),
+                                        anim_started_at: None,
+                                        pending_size: None,
+                                        pending_layout: false,
+                                        workspace: state.active_ws,
+                                    });
+                                }
                             }
                         } else if *mapped {
                             // Null-buffer commit unmaps per wl_surface

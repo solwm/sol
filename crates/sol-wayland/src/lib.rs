@@ -192,6 +192,26 @@ pub struct Window {
     pub workspace: u32,
 }
 
+/// A floating dialog/transient toplevel anchored to a parent tile.
+/// Lives outside the master-stack layout: no `rect` / `from_rect` /
+/// animation state, no configure round-trip — the client picked its
+/// own size on its initial configure (we send `(0,0)` for the
+/// initial), so its current buffer dims drive the rendered size.
+/// Position is computed at render time as "centered over the parent's
+/// `render_rect`", so dialogs follow their parent through layout
+/// changes for free.
+#[derive(Debug, Clone)]
+pub struct DialogWindow {
+    pub surface: Weak<WlSurface>,
+    pub parent: Weak<WlSurface>,
+    /// Workspace the dialog belongs to — inherited from the parent
+    /// at map time. We don't track parent-workspace changes; if the
+    /// user moves the parent across workspaces while a dialog is
+    /// open, the dialog stays on the original workspace. Rare and
+    /// not worth the bookkeeping.
+    pub workspace: u32,
+}
+
 /// In-flight workspace crossfade. While set, both the outgoing and
 /// the (already-promoted) incoming workspace render simultaneously,
 /// with alpha derived from `now - started_at` against
@@ -395,6 +415,14 @@ pub struct State {
     pub primary_selection_source: Option<
         wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
     >,
+    /// Mapped dialog/transient toplevels — `xdg_toplevel`s that
+    /// declared a parent via `set_parent` before mapping. Live
+    /// outside the master-stack tile layout: they self-size from
+    /// their own buffer and float centered over the parent's tile.
+    /// Drawn above tiles + Top-layer surfaces, below popups + Overlay.
+    /// Pruned of dead-surface entries each render tick. Cleared
+    /// alongside their parent if the parent unmaps.
+    pub mapped_dialogs: Vec<DialogWindow>,
     /// Mapped xdg_popups in creation order (topmost last). Each entry
     /// is a weak ref to the popup's wl_surface; per-popup data
     /// (parent, offset, size) lives on `SurfaceData`. Dead weaks are
@@ -682,8 +710,33 @@ pub struct Compositor {
 /// per-workspace focus memory.
 pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
     let was_focused = surface_eq(state.keyboard_focus.as_ref(), Some(surface));
-    let active_ws = state.active_ws;
 
+    // Dialog path: floating transient, never lived in
+    // mapped_toplevels. Focus falls back to the parent tile if it's
+    // still alive — that's where the user was working before the
+    // dialog popped up.
+    if let Some(dlg_idx) = state
+        .mapped_dialogs
+        .iter()
+        .position(|d| d.surface.upgrade().ok().as_ref() == Some(surface))
+    {
+        let parent_surface = state.mapped_dialogs[dlg_idx]
+            .parent
+            .upgrade()
+            .ok();
+        state
+            .last_focus_per_workspace
+            .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
+        state.mapped_dialogs.remove(dlg_idx);
+        state.needs_render = true;
+        if was_focused {
+            state.set_keyboard_focus(parent_surface);
+        }
+        return;
+    }
+
+    // Tile path: pick the next-down stack tile after removal.
+    let active_ws = state.active_ws;
     let removed_idx = state
         .mapped_toplevels
         .iter()
@@ -696,6 +749,13 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
     state
         .mapped_toplevels
         .retain(|w| w.surface.upgrade().ok().as_ref() != Some(surface));
+    // Dialogs anchored to this tile lose their host — drop them so
+    // they don't render in mid-air. Most clients destroy their
+    // dialogs alongside the parent, but well-behaved is not
+    // universally true.
+    state
+        .mapped_dialogs
+        .retain(|d| d.parent.upgrade().ok().as_ref() != Some(surface));
     state.needs_render = true;
 
     if !was_focused {
@@ -1431,6 +1491,57 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                 );
             }
         }
+    }
+
+    // 4b. Floating dialogs (xdg_toplevels with set_parent). Self-
+    // sized from their committed buffer, centered over their
+    // parent's render_rect, drawn above the tile pass and any
+    // fullscreen tile. Skipped for the wrong workspace, for dead
+    // surfaces, and when the parent is dead (the cleanup path
+    // drops orphans, but a render between unmap and cleanup is
+    // possible).
+    for dlg in &state.mapped_dialogs {
+        if dlg.workspace != active_ws {
+            continue;
+        }
+        let Ok(surface) = dlg.surface.upgrade() else { continue };
+        let Ok(parent) = dlg.parent.upgrade() else { continue };
+        let Some(parent_rect) = state
+            .mapped_toplevels
+            .iter()
+            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&parent))
+            .map(|w| w.render_rect)
+        else {
+            continue;
+        };
+        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
+        let (buf, vsrc, logical) = {
+            let sd = sd_arc.lock().unwrap();
+            (
+                sd.current.buffer.clone(),
+                sd.viewport_src,
+                surface_logical_size(&sd),
+            )
+        };
+        let Some((dw, dh)) = logical else { continue };
+        // Center over the parent. Clamped so a dialog larger than
+        // its parent stays on-screen rather than spilling out one
+        // side; rare, but Firefox's permission popup at small tile
+        // sizes hits it.
+        let dw_f = dw as f32;
+        let dh_f = dh as f32;
+        let dx = parent_rect.x + (parent_rect.w - dw_f) * 0.5;
+        let dy = parent_rect.y + (parent_rect.h - dh_f) * 0.5;
+        if let Some(buf) = buf {
+            out.push(Placed::Buffer {
+                buf,
+                rect: RectF { x: dx, y: dy, w: dw_f, h: dh_f },
+                vsrc,
+                alpha: 1.0,
+                corner_radius,
+            });
+        }
+        emit_subsurface_tree(&mut out, &surface, dx, dy, 1.0);
     }
 
     // 5. Mapped xdg_popups. Stacked above tiled toplevels, Top
@@ -2483,6 +2594,13 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     comp.state
         .mapped_popups
         .retain(|w| w.upgrade().is_ok());
+    // Prune dialogs whose surface or parent died. Dropping
+    // parent-orphaned dialogs here matches the "no floating windows
+    // in general" stance — a dialog without its anchor has no
+    // sensible position so we'd rather not render it at all.
+    comp.state
+        .mapped_dialogs
+        .retain(|d| d.surface.upgrade().is_ok() && d.parent.upgrade().is_ok());
     rebalance_keyboard_focus(&mut comp.state);
     let now = Instant::now();
     apply_layout(&mut comp.state, now);
@@ -2958,6 +3076,7 @@ fn setup_event_loop(
         primary_devices: Vec::new(),
         primary_selection_source: None,
         mapped_popups: Vec::new(),
+        mapped_dialogs: Vec::new(),
         popup_grab: None,
         last_focus_per_workspace: std::collections::HashMap::new(),
     };
@@ -3518,6 +3637,42 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
     for ml in layers.iter().filter(|m| matches!(m.layer, Layer::Overlay)) {
         if let Some((lx, ly)) = hit_rect(ml.rect) {
             return Some(resolve_hit(ml.surface.clone(), lx, ly));
+        }
+    }
+
+    // Pass 1aa: floating dialogs. Iterate newest-first so a dialog
+    // opened on top of another dialog catches its own clicks.
+    for dlg in state.mapped_dialogs.iter().rev() {
+        if dlg.workspace != state.active_ws {
+            continue;
+        }
+        let Ok(surface) = dlg.surface.upgrade() else { continue };
+        let Ok(parent) = dlg.parent.upgrade() else { continue };
+        let Some(parent_rect) = state
+            .mapped_toplevels
+            .iter()
+            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&parent))
+            .map(|w| w.render_rect)
+        else {
+            continue;
+        };
+        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
+        let Some((dw, dh)) = sd_arc.lock().ok().and_then(|sd| surface_logical_size(&sd))
+        else {
+            continue;
+        };
+        let dw_f = dw as f32;
+        let dh_f = dh as f32;
+        let dx = parent_rect.x + (parent_rect.w - dw_f) * 0.5;
+        let dy = parent_rect.y + (parent_rect.h - dh_f) * 0.5;
+        let dlg_rect = Rect {
+            x: dx.round() as i32,
+            y: dy.round() as i32,
+            w: dw,
+            h: dh,
+        };
+        if let Some((lx, ly)) = hit_rect(dlg_rect) {
+            return Some(resolve_hit(surface, lx, ly));
         }
     }
 
