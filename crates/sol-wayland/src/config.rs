@@ -29,8 +29,10 @@
 //! mode         = 3840x2160@240             # output WIDTHxHEIGHT@HZ; SOL_MODE env wins
 //! keyboard_repeat_rate  = 100              # wl_keyboard.repeat_info chars/sec (0 disables)
 //! keyboard_repeat_delay = 200              # wl_keyboard.repeat_info delay, ms
-//! animation_duration_ms = 150              # layout-tween duration, 0 = snap
-//! animation_curve       = cubic_out        # linear|cubic_out|quart_out|quint_out|expo_out|in_out_cubic
+//! animation_duration_ms = 150              # legacy: time-based-tween duration; the layout tween now uses springs (see below). Still drives the workspace crossfade.
+//! animation_curve       = cubic_out        # linear|cubic_out|quart_out|quint_out|expo_out|in_out_cubic; same caveat — workspace crossfade only.
+//! spring_stiffness      = 200.0            # layout spring pull strength; higher = snappier
+//! spring_damping        = 22.0             # layout spring damping; ratio = damping / (2*sqrt(stiffness)). 1.0 = critical (no overshoot), <1 underdamped (overshoots once)
 //! workspace_animation   = crossfade        # none|crossfade
 //! workspace_animation_duration_ms = 250    # crossfade duration, separate from animation_duration_ms
 //! inactive_alpha        = 0.85             # alpha for non-focused toplevels (1.0 = no effect)
@@ -134,6 +136,20 @@ pub struct Config {
     pub animation_duration_ms: u32,
     /// Easing curve applied to layout-transition tweens.
     pub animation_curve: AnimationCurve,
+    /// Spring stiffness for the layout-transition spring physics
+    /// (see `tick_animations`). Higher = faster pull toward the
+    /// target. Default 200.0 — feels responsive without being
+    /// twitchy. Hyprland's "default" bezier is roughly equivalent
+    /// to stiffness ~250 + damping ~25.
+    pub spring_stiffness: f32,
+    /// Spring damping for the layout-transition spring. Higher =
+    /// less overshoot, slower settle. The damping ratio is
+    /// `damping / (2 * sqrt(stiffness))`; ratio 1.0 is critical
+    /// (no overshoot, slowest settle), <1 underdamped (overshoots
+    /// then settles), >1 overdamped (no overshoot, very slow).
+    /// Default 22.0 → ratio ~0.78, slight overshoot for that
+    /// "alive" feel without bouncing.
+    pub spring_damping: f32,
     /// Visual transition for `workspace, N` switches. Default
     /// `Crossfade` — the leaving workspace fades out while the
     /// arriving one fades in. `None` is an instant cut.
@@ -232,6 +248,8 @@ impl Default for Config {
             keyboard_repeat_delay: 200,
             animation_duration_ms: 150,
             animation_curve: AnimationCurve::CubicOut,
+            spring_stiffness: 200.0,
+            spring_damping: 22.0,
             workspace_animation: WorkspaceAnimation::Crossfade,
             workspace_animation_duration_ms: 250,
             inactive_alpha: 0.85,
@@ -466,6 +484,8 @@ enum Entry {
     KeyboardRepeatDelay(i32),
     AnimationDurationMs(u32),
     AnimationCurve(AnimationCurve),
+    SpringStiffness(f32),
+    SpringDamping(f32),
     WorkspaceAnimation(WorkspaceAnimation),
     WorkspaceAnimationDurationMs(u32),
     InactiveAlpha(f32),
@@ -504,6 +524,8 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::KeyboardRepeatDelay(v))) => cfg.keyboard_repeat_delay = v,
             Ok(Some(Entry::AnimationDurationMs(v))) => cfg.animation_duration_ms = v,
             Ok(Some(Entry::AnimationCurve(c))) => cfg.animation_curve = c,
+            Ok(Some(Entry::SpringStiffness(v))) => cfg.spring_stiffness = v,
+            Ok(Some(Entry::SpringDamping(v))) => cfg.spring_damping = v,
             Ok(Some(Entry::WorkspaceAnimation(w))) => cfg.workspace_animation = w,
             Ok(Some(Entry::WorkspaceAnimationDurationMs(v))) => {
                 cfg.workspace_animation_duration_ms = v
@@ -552,6 +574,8 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "keyboard_repeat_delay" => Ok(Some(Entry::KeyboardRepeatDelay(parse_int(rhs)?))),
         "animation_duration_ms" => Ok(Some(Entry::AnimationDurationMs(parse_uint(rhs)?))),
         "animation_curve" => Ok(Some(Entry::AnimationCurve(parse_animation_curve(rhs)?))),
+        "spring_stiffness" => Ok(Some(Entry::SpringStiffness(parse_pos_float(rhs)?))),
+        "spring_damping" => Ok(Some(Entry::SpringDamping(parse_pos_float(rhs)?))),
         "workspace_animation" => {
             Ok(Some(Entry::WorkspaceAnimation(parse_workspace_animation(rhs)?)))
         }

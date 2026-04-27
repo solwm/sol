@@ -104,7 +104,7 @@ pub struct Rect {
 
 /// Sub-pixel-precision counterpart of [`Rect`], used everywhere the
 /// value will be drawn to the GPU and could land between integer
-/// pixels: animation interpolation (`render_rect`, `from_rect`) and
+/// pixels: animation interpolation (`render_rect`, `velocity`) and
 /// scene transport (`PlacedBuffer`, `SceneElement`).
 ///
 /// Layout math, focus borders, and hit-testing keep using integer
@@ -151,17 +151,17 @@ impl RectF {
 ///   right now. Updated by `apply_layout` when the layout changes
 ///   (tile closed, move/focus command, zoom, etc.).
 /// - `render_rect`: where the tile is actually drawn this frame.
-///   `tick_animations` interpolates from `from_rect` toward `rect` over
-///   `config.animation_duration_ms` using `config.animation_curve`, so layout changes read
-///   as motion rather than instant snaps. The buffer is GPU-scaled to
-///   `render_rect` regardless of its intrinsic size — during the tween
-///   it's stretched/squished smoothly, and the eye reads the scaling
-///   as resize motion rather than artifact.
-/// - `from_rect`: snapshot of `render_rect` at the moment the current
-///   tween started. The interpolation origin.
-/// - `anim_started_at`: wall-clock the current tween started, or
-///   `None` when settled. `apply_layout` writes this whenever it
-///   changes `rect`.
+///   `tick_animations` runs a per-component spring (x, y, w, h) that
+///   pulls `render_rect` toward `rect` with the configured stiffness
+///   and damping. The buffer is GPU-scaled to `render_rect`
+///   regardless of its intrinsic size — during the tween it's
+///   stretched smoothly, and the eye reads the scaling as resize
+///   motion rather than artifact. Mid-flight target changes (rapid
+///   move / close cascades) preserve the current `velocity` instead
+///   of restarting from `t=0`, so the motion stays continuous.
+/// - `velocity`: per-component spring velocity, in pixels-per-second.
+///   Carries momentum across `apply_layout` calls; settled when the
+///   spring decays under threshold.
 /// - `pending_size` is the (w, h) most recently sent to the client via
 ///   `xdg_toplevel.configure`; layout sends a fresh configure only
 ///   when the target rect differs, so we don't spam configures every
@@ -170,8 +170,7 @@ pub struct Window {
     pub surface: Weak<WlSurface>,
     pub rect: Rect,
     pub render_rect: RectF,
-    pub from_rect: RectF,
-    pub anim_started_at: Option<Instant>,
+    pub velocity: RectF,
     pub pending_size: Option<(i32, i32)>,
     /// True after `apply_layout` changed `rect` but before the client
     /// committed a buffer at the new configured size. While set,
@@ -196,7 +195,7 @@ pub struct Window {
 /// parent tile (save/discard prompts, file pickers) or an unparented
 /// fixed-size window (splash screens, "About" boxes, password
 /// prompts). Lives outside the master-stack layout: no `rect` /
-/// `from_rect` / animation state, no configure round-trip — the
+/// `velocity` / animation state, no configure round-trip — the
 /// client picked its own size on its initial configure (we send
 /// `(0,0)` for the initial), so its current buffer dims drive the
 /// rendered size.
@@ -386,6 +385,11 @@ pub struct State {
     /// finishes `tick_workspace_animation` clears this back to `None`
     /// and only the active workspace renders again.
     pub workspace_anim: Option<WorkspaceAnim>,
+    /// Wall-clock of the previous `tick_animations` call. Used to
+    /// compute `dt` for the spring integrator. `None` means "the
+    /// next tick is the first one" — start with dt=0 (no motion
+    /// step), just record the timestamp.
+    pub last_anim_tick: Option<Instant>,
     /// All `wl_output` resources that clients have bound. Tracked so
     /// the `ext_workspace_v1` manager can emit `output_enter` on the
     /// workspace group for each client's output.
@@ -886,8 +890,7 @@ pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
                 surface: surface.downgrade(),
                 rect: Rect::default(),
                 render_rect: RectF::default(),
-                from_rect: RectF::default(),
-                anim_started_at: None,
+                velocity: RectF::default(),
                 pending_size: None,
                 pending_layout: false,
                 workspace: dlg.workspace,
@@ -1531,7 +1534,6 @@ fn send_pending_configures(state: &mut State) {
     // Settle these inline now: pending_size already matches the target
     // dims, so the existing buffer is correct for the new rect — kick
     // off the position tween directly.
-    let now = Instant::now();
     for win in state.mapped_toplevels.iter_mut() {
         if !win.pending_layout {
             continue;
@@ -1541,11 +1543,11 @@ fn send_pending_configures(state: &mut State) {
             continue;
         }
         win.pending_layout = false;
-        let target_f: RectF = win.rect.into();
-        if win.render_rect != target_f && win.anim_started_at.is_none() {
-            win.from_rect = win.render_rect;
-            win.anim_started_at = Some(now);
-        }
+        // No explicit kickoff under springs — `tick_animations`
+        // naturally drives `render_rect` toward `win.rect` on the
+        // next pass. Carry-over velocity from a previous tween is
+        // preserved, so a move chained on top of a settling resize
+        // looks continuous.
     }
 }
 
@@ -2256,86 +2258,88 @@ fn apply_easing(curve: config::AnimationCurve, t: f32) -> f32 {
     }
 }
 
-fn lerp_f32(from: f32, to: f32, t: f32) -> f32 {
-    from + (to - from) * t
-}
-
-fn lerp_rectf(from: RectF, to: RectF, t: f32) -> RectF {
-    RectF {
-        x: lerp_f32(from.x, to.x, t),
-        y: lerp_f32(from.y, to.y, t),
-        w: lerp_f32(from.w, to.w, t).max(1.0),
-        h: lerp_f32(from.h, to.h, t).max(1.0),
-    }
-}
-
-/// Step every animating window's `render_rect` toward its target
-/// `rect`. Returns `true` if any window is still mid-tween, so the
-/// caller can keep `needs_render` set and the loop ticks at vblank
-/// cadence until the animation settles.
+/// Step every window's render_rect spring toward its target rect.
+/// Returns `true` if anything is still in motion, so the render
+/// loop knows to keep ticking.
 ///
-/// Duration and curve come from `state.config`; saving the conf with
-/// new values applies on the *next* tick — including in-flight tweens
-/// (a shrunk duration just snaps any tween whose elapsed already
-/// exceeds the new total). `animation_duration_ms = 0` disables
-/// tweening entirely and snaps to target on the same frame the rect
-/// changes.
+/// Springs run a damped harmonic oscillator per component (x, y,
+/// w, h):
 ///
-/// Newly-mapped windows (render_rect zero) snap to their assigned
-/// rect on first sight — there's nothing on screen to interpolate
-/// from, and a "spawn from a point" animation is a polish for later.
+/// ```text
+/// force = stiffness * (target - current)
+/// damp  = -damping * velocity
+/// velocity += (force + damp) * dt
+/// current  += velocity * dt
+/// ```
+///
+/// vs the previous fixed-duration eased tween, this gets us:
+/// - mid-flight target changes preserve velocity instead of
+///   restarting from t=0 (the rapid-move stutter goes away);
+/// - settle time is implicit in the spring constants, so
+///   different-magnitude targets self-pace (a tiny resize finishes
+///   sooner than a full half-screen swap);
+/// - slight overshoot (we run sub-critically damped) reads as
+///   "alive" rather than scripted.
 fn tick_animations(state: &mut State, now: Instant) -> bool {
-    let duration_ms = state.config.animation_duration_ms as u128;
-    let curve = state.config.animation_curve;
+    // dt for the integrator. Cap at ~33 ms so a frame missed for
+    // 200 ms (e.g. a stall, VT switch, suspend) doesn't catapult
+    // the spring across the screen on resume — clamp keeps each
+    // step linearizable.
+    let dt = match state.last_anim_tick {
+        Some(prev) => now.duration_since(prev).as_secs_f32().min(1.0 / 30.0),
+        None => 0.0,
+    };
+    state.last_anim_tick = Some(now);
+
+    let stiffness = state.config.spring_stiffness;
+    let damping = state.config.spring_damping;
+    // Settled thresholds: under half a pixel away with sub-pixel-
+    // per-second velocity is indistinguishable from a snap.
+    const POS_EPS: f32 = 0.5;
+    const VEL_EPS: f32 = 0.5;
+
     let mut any_active = false;
+
     for win in state.mapped_toplevels.iter_mut() {
         let target: RectF = win.rect.into();
+
         // Newly mapped: snap, no animation. Clearing pending_layout
-        // here is fine — there's nothing to interpolate from, and the
-        // commit-driven kickoff would have nothing useful to do.
+        // is fine — there's nothing to interpolate from, and a
+        // commit-driven settle right after would have nothing to do.
         if win.render_rect.w == 0.0 || win.render_rect.h == 0.0 {
             win.render_rect = target;
-            win.from_rect = target;
-            win.anim_started_at = None;
+            win.velocity = RectF::default();
             win.pending_layout = false;
             continue;
         }
-        // Tweening disabled (or already settled): keep render_rect
-        // pinned to the target and never report active.
-        if duration_ms == 0 {
-            win.render_rect = target;
-            win.anim_started_at = None;
-            win.pending_layout = false;
+
+        // Holding for the client to commit at the configured size.
+        // No spring step — `settle_pending_layout` clears the flag
+        // once the buffer arrives and the next tick takes over.
+        if win.pending_layout {
             continue;
         }
-        let Some(started) = win.anim_started_at else {
-            // No tween in progress. If we're waiting for the client
-            // to commit at the newly-configured size, hold render_rect
-            // where it is — `settle_pending_layout` (commit handler)
-            // is what kicks the tween off, so the buffer matches the
-            // rect we're animating toward.
-            if win.pending_layout {
-                continue;
+
+        // Step the four springs.
+        for (cur, vel, tgt) in [
+            (&mut win.render_rect.x, &mut win.velocity.x, target.x),
+            (&mut win.render_rect.y, &mut win.velocity.y, target.y),
+            (&mut win.render_rect.w, &mut win.velocity.w, target.w),
+            (&mut win.render_rect.h, &mut win.velocity.h, target.h),
+        ] {
+            let force = (tgt - *cur) * stiffness;
+            let damp = -*vel * damping;
+            *vel += (force + damp) * dt;
+            *cur += *vel * dt;
+            if (tgt - *cur).abs() > POS_EPS || vel.abs() > VEL_EPS {
+                any_active = true;
+            } else {
+                *cur = tgt;
+                *vel = 0.0;
             }
-            // Idempotent guard: keep render_rect == rect even if some
-            // other code path mutated rect without going through
-            // apply_layout.
-            if win.render_rect != target {
-                win.render_rect = target;
-            }
-            continue;
-        };
-        let elapsed = now.duration_since(started).as_millis();
-        if elapsed >= duration_ms {
-            win.render_rect = target;
-            win.anim_started_at = None;
-        } else {
-            let t = elapsed as f32 / duration_ms as f32;
-            let eased = apply_easing(curve, t);
-            win.render_rect = lerp_rectf(win.from_rect, target, eased);
-            any_active = true;
         }
     }
+
     any_active
 }
 
@@ -2394,11 +2398,29 @@ fn tick_workspace_animation(state: &mut State, now: Instant) -> bool {
 /// toplevels — N is at most a handful and this only fires once per
 /// flip event, not per frame body.
 fn has_active_animation(state: &State) -> bool {
-    state.workspace_anim.is_some()
-        || state
-            .mapped_toplevels
-            .iter()
-            .any(|w| w.anim_started_at.is_some())
+    if state.workspace_anim.is_some() {
+        return true;
+    }
+    // A spring is "active" while either (a) render_rect hasn't
+    // reached rect, or (b) velocity is non-zero (still settling
+    // even if pos==target due to overshoot crossing through). We
+    // mirror the per-component check `tick_animations` uses so
+    // both functions agree on "settled".
+    const POS_EPS: f32 = 0.5;
+    const VEL_EPS: f32 = 0.5;
+    state.mapped_toplevels.iter().any(|w| {
+        let target: RectF = w.rect.into();
+        let r = w.render_rect;
+        let v = w.velocity;
+        (target.x - r.x).abs() > POS_EPS
+            || (target.y - r.y).abs() > POS_EPS
+            || (target.w - r.w).abs() > POS_EPS
+            || (target.h - r.h).abs() > POS_EPS
+            || v.x.abs() > VEL_EPS
+            || v.y.abs() > VEL_EPS
+            || v.w.abs() > VEL_EPS
+            || v.h.abs() > VEL_EPS
+    })
 }
 
 /// A surface's logical size per the Wayland protocol layering:
@@ -2454,10 +2476,10 @@ fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
 /// Called from the wl_surface commit handler whenever a mapped
 /// toplevel attaches a buffer. If the toplevel has a pending layout
 /// change AND the buffer's logical size matches the pending
-/// configure, mark the change as settled and kick off the resize
-/// tween from the current `render_rect` to the new target. Until
-/// this runs the window keeps drawing at its old rect with its old
-/// buffer — the protocol-correct "client owns its size" behaviour.
+/// configure, clear the hold flag so `tick_animations` resumes
+/// driving `render_rect` toward `win.rect`. Until this runs the
+/// window keeps drawing at its old rect with its old buffer — the
+/// protocol-correct "client owns its size" behaviour.
 pub(crate) fn settle_pending_layout(state: &mut State, surface: &WlSurface) {
     // Pull logical size out of the surface's SurfaceData while we
     // already have a Mutex guard available; cheap and read-only.
@@ -2465,7 +2487,6 @@ pub(crate) fn settle_pending_layout(state: &mut State, surface: &WlSurface) {
         .data::<Arc<Mutex<compositor::SurfaceData>>>()
         .and_then(|arc| arc.lock().ok().and_then(|sd| surface_logical_size(&sd)));
 
-    let now = Instant::now();
     let mut kicked = false;
     for win in state.mapped_toplevels.iter_mut() {
         if win.surface.upgrade().ok().as_ref() != Some(surface) {
@@ -2485,10 +2506,11 @@ pub(crate) fn settle_pending_layout(state: &mut State, surface: &WlSurface) {
             return;
         }
         win.pending_layout = false;
+        // Spring picks up automatically on the next tick — no
+        // explicit kickoff. Velocity that built up before the hold
+        // (e.g. a settle-while-moving sequence) carries over.
         let target: RectF = win.rect.into();
-        if win.render_rect != target && win.anim_started_at.is_none() {
-            win.from_rect = win.render_rect;
-            win.anim_started_at = Some(now);
+        if win.render_rect != target {
             kicked = true;
         }
         break;
@@ -2842,8 +2864,7 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
     for win in state.mapped_toplevels.iter_mut() {
         if win.workspace == n {
             win.render_rect = RectF::default();
-            win.from_rect = RectF::default();
-            win.anim_started_at = None;
+            win.velocity = RectF::default();
         }
     }
     // Kick off the configured workspace transition. Crossfade keeps
@@ -2908,10 +2929,10 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
         .map(|w| {
             w.workspace = n;
             // Clear render_rect so the window gets first-frame
-            // treatment when the user switches to `n`.
+            // treatment when the user switches to `n` (snap-on-zero
+            // in tick_animations).
             w.render_rect = RectF::default();
-            w.from_rect = RectF::default();
-            w.anim_started_at = None;
+            w.velocity = RectF::default();
         })
         .is_some();
     if moved {
@@ -3494,6 +3515,7 @@ fn setup_event_loop(
         mapped_toplevels: Vec::new(),
         active_ws: 1,
         workspace_anim: None,
+        last_anim_tick: None,
         outputs: Vec::new(),
         ext_workspace_managers: Vec::new(),
         idle_inhibitors: Vec::new(),
