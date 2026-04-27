@@ -255,11 +255,12 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
         match request {
             xdg_toplevel::Request::SetParent { parent } => {
                 // Parent links a transient window (dialog, file
-                // picker, preferences) to its owner toplevel. When
-                // set, we treat this surface as a floating dialog
-                // at first map time rather than a tile. None
-                // unsets and reverts to a regular toplevel for any
-                // future remap.
+                // picker, preferences) to its owner toplevel. The
+                // protocol lets clients call this at any time, and
+                // GTK clients (GIMP among them) often call it AFTER
+                // the dialog's first commit — we have to handle the
+                // late case by reclassifying the surface live, not
+                // just at first-map time.
                 let parent_surface = parent.as_ref().and_then(|tl| {
                     tl.data::<WlSurface>().cloned()
                 });
@@ -267,11 +268,12 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
                     let mut sd = sd_arc.lock().unwrap();
                     sd.xdg_toplevel_parent = parent_surface.as_ref().map(|s| s.downgrade());
                 }
-                tracing::debug!(
+                tracing::info!(
                     id = ?surface.id(),
                     parent = ?parent_surface.as_ref().map(|s| s.id()),
                     "toplevel set_parent"
                 );
+                crate::reclassify_dialog(state, surface, parent_surface.as_ref());
             }
             xdg_toplevel::Request::SetTitle { title } => {
                 tracing::info!(id = ?surface.id(), %title, "toplevel title");

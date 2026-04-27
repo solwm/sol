@@ -699,6 +699,96 @@ pub struct Compositor {
     pub backend: BackendState,
 }
 
+/// React to a `xdg_toplevel.set_parent` arriving after the surface is
+/// already mapped: promote a tile to a dialog (parent now Some, was
+/// in `mapped_toplevels`) or demote a dialog back to a tile (parent
+/// now None, was in `mapped_dialogs`). Called from the SetParent
+/// handler so GTK clients that finalize the parent link AFTER their
+/// first commit (GIMP's New Image dialog hits this path) end up
+/// floating instead of being given half the screen.
+///
+/// Pre-mapping calls are silently no-ops here — the first-commit
+/// fork in `compositor.rs` reads the freshly-set parent off
+/// `SurfaceData` and routes correctly without any reclassification.
+pub(crate) fn reclassify_dialog(
+    state: &mut State,
+    surface: &WlSurface,
+    new_parent: Option<&WlSurface>,
+) {
+    let in_tiles = state
+        .mapped_toplevels
+        .iter()
+        .position(|w| w.surface.upgrade().ok().as_ref() == Some(surface));
+    let in_dialogs = state
+        .mapped_dialogs
+        .iter()
+        .position(|d| d.surface.upgrade().ok().as_ref() == Some(surface));
+
+    match (in_tiles, in_dialogs, new_parent) {
+        // Tile gaining a parent → demote to dialog. Drop tile-side
+        // state (rect, animation, pending_layout) and start fresh
+        // as a floating dialog. apply_layout will reshuffle the
+        // remaining tiles. Also send an unconstrained
+        // (0,0,no-states) configure so the client lets go of the
+        // tile-size MAXIMIZED state we last imposed and redraws at
+        // its preferred size — without this the dialog stays
+        // visually huge until the client decides on its own to
+        // resize, which most never do.
+        (Some(idx), None, Some(parent)) => {
+            let win = state.mapped_toplevels.remove(idx);
+            state.mapped_dialogs.push(DialogWindow {
+                surface: surface.downgrade(),
+                parent: parent.downgrade(),
+                workspace: win.workspace,
+            });
+            if let Some(sd_arc) = surface.data::<Arc<Mutex<compositor::SurfaceData>>>() {
+                let sd = sd_arc.lock().unwrap();
+                if let (Some(tl_w), Some(xs_w)) =
+                    (sd.xdg_toplevel.as_ref(), sd.xdg_surface.as_ref())
+                {
+                    if let (Ok(tl), Ok(xs)) = (tl_w.upgrade(), xs_w.upgrade()) {
+                        drop(sd);
+                        tl.configure(0, 0, Vec::new());
+                        let serial = state.next_serial();
+                        xs.configure(serial);
+                    }
+                }
+            }
+            state.needs_render = true;
+            tracing::info!(id = ?surface.id(), "tile → dialog");
+        }
+        // Dialog losing its parent → promote back to a tile. Push
+        // with default rect; tick_animations snaps it to the new
+        // layout slot (render_rect.w is 0).
+        (None, Some(idx), None) => {
+            let dlg = state.mapped_dialogs.remove(idx);
+            state.mapped_toplevels.push(Window {
+                surface: surface.downgrade(),
+                rect: Rect::default(),
+                render_rect: RectF::default(),
+                from_rect: RectF::default(),
+                anim_started_at: None,
+                pending_size: None,
+                pending_layout: false,
+                workspace: dlg.workspace,
+            });
+            state.needs_render = true;
+            tracing::info!(id = ?surface.id(), "dialog → tile");
+        }
+        // Dialog re-anchored to a different parent → just update
+        // the parent ref. Render position recomputes against
+        // whichever parent is current.
+        (None, Some(idx), Some(parent)) => {
+            state.mapped_dialogs[idx].parent = parent.downgrade();
+            state.needs_render = true;
+        }
+        // Already-correct classification (tile staying a tile with
+        // a null set_parent that was never set, or unmapped surface
+        // that hasn't reached compositor.rs yet): nothing to do.
+        _ => {}
+    }
+}
+
 /// Remove a toplevel from `mapped_toplevels`, and — if it was the
 /// keyboard-focused one — pick the next-down-the-stack tile on the
 /// same workspace as the new focus. `mapped_toplevels` is ordered
