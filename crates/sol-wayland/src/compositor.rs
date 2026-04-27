@@ -368,6 +368,14 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                         rect: crate::Rect::default(),
                                         render_rect: crate::RectF::default(),
                                         velocity: crate::RectF::default(),
+                                        // Open animation: window pops in from
+                                        // 0% alpha + 70% scale up to fully
+                                        // opaque + native size. Springs in
+                                        // tick_animations drive both toward 1.
+                                        render_alpha: 0.0,
+                                        vel_alpha: 0.0,
+                                        render_scale: 0.7,
+                                        vel_scale: 0.0,
                                         pending_size: None,
                                         pending_layout: false,
                                         workspace: state.active_ws,

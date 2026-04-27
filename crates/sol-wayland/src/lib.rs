@@ -171,6 +171,23 @@ pub struct Window {
     pub rect: Rect,
     pub render_rect: RectF,
     pub velocity: RectF,
+    /// Alpha multiplier for the open animation: starts at 0.0 on
+    /// first map, springs to 1.0. Static at 1.0 once settled. The
+    /// overall window alpha emitted to the scene is
+    /// `ws_alpha * render_alpha * (focused ? 1.0 : inactive_alpha)`.
+    pub render_alpha: f32,
+    pub vel_alpha: f32,
+    /// Uniform scale around `render_rect`'s center for the open
+    /// animation: starts at 0.7, springs to 1.0. The drawn rect is
+    /// `render_rect` scaled by this factor about its center, so
+    /// the effect is "pops out from a smaller copy of itself"
+    /// rather than from a corner.
+    pub render_scale: f32,
+    pub vel_scale: f32,
+    /// Most recent `(width, height)` configured to the client via
+    /// `xdg_toplevel.configure`. Cached so steady-state render
+    /// ticks don't re-send configures when the layout target's
+    /// dims haven't changed.
     pub pending_size: Option<(i32, i32)>,
     /// True after `apply_layout` changed `rect` but before the client
     /// committed a buffer at the new configured size. While set,
@@ -238,6 +255,29 @@ pub struct DialogDrag {
     /// deltas don't accumulate floating-point error or drift on the
     /// first pointer event after the press.
     pub offset: (f32, f32),
+}
+
+/// A tile that's been removed from the layout but is still on screen
+/// while its close animation plays out. Holds a strong ref to the
+/// last `WlBuffer` so the surface dying doesn't take the buffer with
+/// it; we keep rendering that buffer while `render_alpha` springs
+/// toward 0 and `render_scale` toward ~0.7. Dropped from
+/// `state.closing_windows` once the spring settles below the
+/// invisible threshold.
+#[derive(Debug)]
+pub struct ClosingWindow {
+    pub buffer: wayland_server::protocol::wl_buffer::WlBuffer,
+    /// Static through the close animation — the rect doesn't move,
+    /// only the scale around its center and the alpha change.
+    pub render_rect: RectF,
+    pub workspace: u32,
+    pub render_alpha: f32,
+    pub vel_alpha: f32,
+    pub render_scale: f32,
+    pub vel_scale: f32,
+    /// Optional viewport src — preserved so the same crop the live
+    /// window had keeps working through the fade.
+    pub vsrc: Option<(f64, f64, f64, f64)>,
 }
 
 /// In-flight workspace crossfade. While set, both the outgoing and
@@ -390,6 +430,13 @@ pub struct State {
     /// next tick is the first one" — start with dt=0 (no motion
     /// step), just record the timestamp.
     pub last_anim_tick: Option<Instant>,
+    /// Tiles in their close animation. Each holds a strong WlBuffer
+    /// ref so the surface destruction underneath them doesn't drop
+    /// the pixels. Walked in `tick_animations` (alpha+scale springs
+    /// toward 0/0.7) and `collect_scene` (drawn over the same
+    /// z-layer as live tiles); pruned once a window's alpha falls
+    /// below the invisible threshold and velocities decay.
+    pub closing_windows: Vec<ClosingWindow>,
     /// All `wl_output` resources that clients have bound. Tracked so
     /// the `ext_workspace_v1` manager can emit `output_enter` on the
     /// workspace group for each client's output.
@@ -891,6 +938,13 @@ pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
                 rect: Rect::default(),
                 render_rect: RectF::default(),
                 velocity: RectF::default(),
+                // Demoted dialog: skip the open animation since the
+                // surface has already been on screen as a float; an
+                // alpha-fade-in here would look jarring.
+                render_alpha: 1.0,
+                vel_alpha: 0.0,
+                render_scale: 1.0,
+                vel_scale: 0.0,
                 pending_size: None,
                 pending_layout: false,
                 workspace: dlg.workspace,
@@ -1057,6 +1111,40 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
     state
         .last_focus_per_workspace
         .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
+
+    // Snapshot the dying tile for the close animation: clone its
+    // last buffer (Strong WlBuffer), capture render_rect + alpha
+    // + scale at the moment of removal so the spring doesn't have
+    // to interpolate from a stale start. The other tiles
+    // simultaneously spring into the freed slot via the upcoming
+    // apply_layout — no extra work for them.
+    if let Some(idx) = removed_idx {
+        let win = &state.mapped_toplevels[idx];
+        let buffer = win
+            .surface
+            .upgrade()
+            .ok()
+            .and_then(|s| {
+                s.data::<Arc<Mutex<compositor::SurfaceData>>>().and_then(|arc| {
+                    let sd = arc.lock().ok()?;
+                    let buf = sd.current.buffer.clone()?;
+                    let vsrc = sd.viewport_src;
+                    Some((buf, vsrc))
+                })
+            });
+        if let Some((buffer, vsrc)) = buffer {
+            state.closing_windows.push(ClosingWindow {
+                buffer,
+                render_rect: win.render_rect,
+                workspace: win.workspace,
+                render_alpha: win.render_alpha,
+                vel_alpha: win.vel_alpha,
+                render_scale: win.render_scale,
+                vel_scale: win.vel_scale,
+                vsrc,
+            });
+        }
+    }
 
     state
         .mapped_toplevels
@@ -1445,6 +1533,27 @@ fn set_target_rect(win: &mut Window, new_rect: Rect, _now: Instant) {
     win.pending_layout = true;
 }
 
+/// Scale a `RectF` uniformly by `s` about its center. `s == 1.0`
+/// is a no-op and returns the same rect; small `s` shrinks the
+/// rect toward its midpoint without moving its center. Used by the
+/// open / close animations so the buffer pops in/out from a
+/// smaller copy of itself rather than from one corner.
+fn scale_about_center(r: RectF, s: f32) -> RectF {
+    if s == 1.0 {
+        return r;
+    }
+    let cx = r.x + r.w * 0.5;
+    let cy = r.y + r.h * 0.5;
+    let nw = r.w * s;
+    let nh = r.h * s;
+    RectF {
+        x: cx - nw * 0.5,
+        y: cy - nh * 0.5,
+        w: nw,
+        h: nh,
+    }
+}
+
 fn shrink_rect(r: Rect, by: i32) -> Rect {
     Rect {
         x: r.x + by,
@@ -1706,17 +1815,26 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                 .unwrap_or(false)
                 || zoomed.is_some();
             let win_alpha = ws_alpha
+                * win.render_alpha
                 * if is_active { 1.0 } else { inactive_alpha };
+
+            // Open animation scales the tile around its center,
+            // so the buffer pops into view from a slightly smaller
+            // copy of itself rather than appearing at full size.
+            // Settled `render_scale == 1.0` is a no-op.
+            let scaled = scale_about_center(win.render_rect, win.render_scale);
 
             if !is_active && inactive_blur {
                 // Backdrop emitted with ws_alpha (not win_alpha) so
                 // it covers the wallpaper fully outside crossfade,
                 // and fades together with its window during one.
                 // Subsurface contents don't get a separate backdrop —
-                // only the toplevel rect itself.
+                // only the toplevel rect itself. Scaled along with
+                // the window so the frosted area follows the
+                // open-animation shrink.
                 out.push(Placed::Backdrop {
-                    rect: win.render_rect,
-                    alpha: ws_alpha,
+                    rect: scaled,
+                    alpha: ws_alpha * win.render_alpha,
                     passes: inactive_blur_passes,
                     radius: inactive_blur_radius,
                     corner_radius,
@@ -1726,7 +1844,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
             if let Some(buf) = buf_opt {
                 out.push(Placed::Buffer {
                     buf,
-                    rect: win.render_rect,
+                    rect: scaled,
                     vsrc,
                     alpha: win_alpha,
                     corner_radius,
@@ -1735,8 +1853,8 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
             emit_subsurface_tree(
                 out,
                 &surface,
-                win.render_rect.x,
-                win.render_rect.y,
+                scaled.x,
+                scaled.y,
                 win_alpha,
             );
         }
@@ -1750,6 +1868,27 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
         emit_for_ws(&mut out, from_ws, from_alpha);
     } else {
         emit_for_ws(&mut out, active_ws, 1.0);
+    }
+
+    // 2c. Closing tiles. Same z-level as live tiles (drawn over
+    // any live tile that springs into the freed slot — the closing
+    // copy fades + shrinks while the new occupant grows in
+    // underneath, which is the visual continuity we want). Workspace
+    // gating uses the captured `workspace`, not the live one, so a
+    // close on workspace 1 still fades there even if the user has
+    // already switched to workspace 2.
+    for cw in &state.closing_windows {
+        if cw.workspace != active_ws {
+            continue;
+        }
+        let scaled = scale_about_center(cw.render_rect, cw.render_scale);
+        out.push(Placed::Buffer {
+            buf: cw.buffer.clone(),
+            rect: scaled,
+            vsrc: cw.vsrc,
+            alpha: cw.render_alpha,
+            corner_radius,
+        });
     }
 
     // 3. Top layer surfaces. Emitted before any fullscreen tile so
@@ -1788,21 +1927,25 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
                     let sd = sd_arc.lock().unwrap();
                     (sd.current.buffer.clone(), sd.viewport_src)
                 };
+                // Honor open animation in fullscreen too — popping
+                // up scaled and fading in still reads natural even
+                // at full size.
+                let scaled = scale_about_center(win.render_rect, win.render_scale);
                 if let Some(buf) = buf {
                     out.push(Placed::Buffer {
                         buf,
-                        rect: win.render_rect,
+                        rect: scaled,
                         vsrc,
-                        alpha: 1.0,
+                        alpha: win.render_alpha,
                         corner_radius: 0.0,
                     });
                 }
                 emit_subsurface_tree(
                     &mut out,
                     fs,
-                    win.render_rect.x,
-                    win.render_rect.y,
-                    1.0,
+                    scaled.x,
+                    scaled.y,
+                    win.render_alpha,
                 );
             }
         }
@@ -2320,7 +2463,10 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
             continue;
         }
 
-        // Step the four springs.
+        // Step the four rect springs (x, y, w, h) plus alpha and
+        // scale for the open animation. Alpha/scale targets are
+        // hard-coded to 1.0 — once the window has opened they stay
+        // settled and add no work to the loop.
         for (cur, vel, tgt) in [
             (&mut win.render_rect.x, &mut win.velocity.x, target.x),
             (&mut win.render_rect.y, &mut win.velocity.y, target.y),
@@ -2338,7 +2484,50 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
                 *vel = 0.0;
             }
         }
+        // Alpha + scale springs use tighter epsilons since their
+        // values live in [0, 1] — half-a-pixel doesn't translate
+        // here.
+        const ALPHA_EPS: f32 = 0.005;
+        for (cur, vel, tgt) in [
+            (&mut win.render_alpha, &mut win.vel_alpha, 1.0_f32),
+            (&mut win.render_scale, &mut win.vel_scale, 1.0_f32),
+        ] {
+            let force = (tgt - *cur) * stiffness;
+            let damp = -*vel * damping;
+            *vel += (force + damp) * dt;
+            *cur += *vel * dt;
+            if (tgt - *cur).abs() > ALPHA_EPS || vel.abs() > ALPHA_EPS {
+                any_active = true;
+            } else {
+                *cur = tgt;
+                *vel = 0.0;
+            }
+        }
     }
+
+    // Tick closing windows: alpha → 0, scale → 0.7. Drop entries
+    // that have decayed below the visible threshold AND have
+    // damped to a near-stop, since beyond that point further
+    // ticking would just be invisible bookkeeping.
+    state.closing_windows.retain_mut(|cw| {
+        const ALPHA_EPS: f32 = 0.005;
+        for (cur, vel, tgt) in [
+            (&mut cw.render_alpha, &mut cw.vel_alpha, 0.0_f32),
+            (&mut cw.render_scale, &mut cw.vel_scale, 0.7_f32),
+        ] {
+            let force = (tgt - *cur) * stiffness;
+            let damp = -*vel * damping;
+            *vel += (force + damp) * dt;
+            *cur += *vel * dt;
+        }
+        // Alive while still visibly opaque OR still moving fast
+        // enough that another step will change the picture.
+        let keep = cw.render_alpha > ALPHA_EPS || cw.vel_alpha.abs() > ALPHA_EPS;
+        if keep {
+            any_active = true;
+        }
+        keep
+    });
 
     any_active
 }
@@ -2401,13 +2590,20 @@ fn has_active_animation(state: &State) -> bool {
     if state.workspace_anim.is_some() {
         return true;
     }
+    // Closing windows are always "active" until tick_animations
+    // drops them.
+    if !state.closing_windows.is_empty() {
+        return true;
+    }
     // A spring is "active" while either (a) render_rect hasn't
     // reached rect, or (b) velocity is non-zero (still settling
-    // even if pos==target due to overshoot crossing through). We
-    // mirror the per-component check `tick_animations` uses so
-    // both functions agree on "settled".
+    // even if pos==target due to overshoot crossing through). Same
+    // for the alpha + scale springs that drive the open animation.
+    // Thresholds mirror `tick_animations` so both functions agree
+    // on "settled".
     const POS_EPS: f32 = 0.5;
     const VEL_EPS: f32 = 0.5;
+    const A_EPS: f32 = 0.005;
     state.mapped_toplevels.iter().any(|w| {
         let target: RectF = w.rect.into();
         let r = w.render_rect;
@@ -2420,6 +2616,10 @@ fn has_active_animation(state: &State) -> bool {
             || v.y.abs() > VEL_EPS
             || v.w.abs() > VEL_EPS
             || v.h.abs() > VEL_EPS
+            || (1.0 - w.render_alpha).abs() > A_EPS
+            || w.vel_alpha.abs() > A_EPS
+            || (1.0 - w.render_scale).abs() > A_EPS
+            || w.vel_scale.abs() > A_EPS
     })
 }
 
@@ -3516,6 +3716,7 @@ fn setup_event_loop(
         active_ws: 1,
         workspace_anim: None,
         last_anim_tick: None,
+        closing_windows: Vec::new(),
         outputs: Vec::new(),
         ext_workspace_managers: Vec::new(),
         idle_inhibitors: Vec::new(),
