@@ -479,6 +479,15 @@ impl State {
     pub fn on_toplevel_mapped(&mut self, surface: &WlSurface) {
         use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
         use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::KeyboardInteractivity;
+
+        // A new toplevel mapping means the user wanted to bring up
+        // another window, which they can't see while one tile is
+        // taking the whole screen. Drop zoom / fullscreen so the
+        // layout reshuffles and the new tile is actually visible.
+        // No-ops when neither mode is active.
+        self.zoomed = None;
+        self.fullscreened = None;
+
         let screen = Rect {
             x: 0,
             y: 0,
