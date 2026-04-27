@@ -4325,10 +4325,25 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
     if !focus.is_alive() {
         return;
     }
-    // Click-to-focus: on press, move keyboard focus to the window under the
-    // cursor. No-op if that window already has focus (set_keyboard_focus
-    // compares first).
-    if pressed {
+    // Click-to-focus: on press, move keyboard focus to the window
+    // under the cursor. No-op if that window already has focus
+    // (set_keyboard_focus compares first).
+    //
+    // BUT skip the focus change when the click is inside a popup
+    // chain. A popup is a transient surface — it'll be torn down by
+    // the click that activates a menu item — and moving keyboard
+    // focus to it produces wl_keyboard.leave + wl_keyboard.enter
+    // events on the parent client mid-click, then another pair when
+    // the popup destroys, which is exactly the focus-dance pattern
+    // Chrome interprets as "the user clicked elsewhere, abandon the
+    // menu action". Symptom: Save Image As doesn't open its file
+    // picker. Keep keyboard focus on whatever already had it (the
+    // main app window) so the click is a clean pointer-only event.
+    let is_popup_click = state.mapped_popups.iter().any(|p| {
+        let Ok(s) = p.upgrade() else { return false };
+        s == focus || surface_in_subtree(&s, &focus)
+    });
+    if pressed && !is_popup_click {
         state.set_keyboard_focus(Some(focus.clone()));
     }
     let serial = state.next_serial();
