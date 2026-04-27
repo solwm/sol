@@ -487,6 +487,14 @@ pub struct State {
     /// master tile; entries are weak so tiles that close or move
     /// away naturally drop out on lookup.
     pub last_stack_focus_per_workspace: std::collections::HashMap<u32, Weak<WlSurface>>,
+    /// Per-workspace memory of the tile that was demoted from
+    /// master to stack on the most recent `move_dir(Left)` from a
+    /// stack tile. `move_dir(Right)` from the new master uses this
+    /// to swap the pair back, so a Left/Right loop is a true noop
+    /// instead of geometric drift. Overwritten on each new
+    /// Left-from-stack; weak ref so it self-invalidates.
+    pub last_master_swap_partner_per_workspace:
+        std::collections::HashMap<u32, Weak<WlSurface>>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -2634,8 +2642,27 @@ fn focus_direction(state: &mut State, dir: config::Direction) {
 /// resize into their new tiles.
 fn move_direction(state: &mut State, dir: config::Direction) {
     let Some(idx) = focused_toplevel_index(state) else { return };
+    let active_ws = state.active_ws;
+
+    // Right-from-master inverse: if the most recent move was a
+    // Left-from-stack-to-master, do the exact opposite — swap the
+    // current master with the tile we just demoted. Without this,
+    // geometric `neighbor_in_direction` picks the vertically-
+    // closest stack tile (usually the middle one in a 3-tile
+    // stack), so a Left/Right loop drifts windows instead of being
+    // a noop.
+    if matches!(dir, config::Direction::Right) {
+        if let Some(partner_idx) = master_swap_partner_index(state, idx, active_ws) {
+            state.zoomed = None;
+            state.fullscreened = None;
+            state.mapped_toplevels.swap(idx, partner_idx);
+            state.needs_render = true;
+            return;
+        }
+    }
+
     let Some(n) =
-        neighbor_in_direction(&state.mapped_toplevels, idx, dir, state.active_ws)
+        neighbor_in_direction(&state.mapped_toplevels, idx, dir, active_ws)
     else {
         return;
     };
@@ -2645,7 +2672,52 @@ fn move_direction(state: &mut State, dir: config::Direction) {
     state.zoomed = None;
     state.fullscreened = None;
     state.mapped_toplevels.swap(idx, n);
+
+    // After Left-from-stack-to-master, remember the demoted master
+    // (now sitting at the focused tile's old slot) so the next
+    // Right-from-master can swap back to it. Overwriting any
+    // previous saved partner — only the most recent Left counts as
+    // the inverse target.
+    if matches!(dir, config::Direction::Left) && n == 0 && idx != 0 {
+        if let Ok(prev_master) = state.mapped_toplevels[idx].surface.upgrade() {
+            state
+                .last_master_swap_partner_per_workspace
+                .insert(active_ws, prev_master.downgrade());
+        }
+    }
+
     state.needs_render = true;
+}
+
+/// Resolve the saved master-swap partner to an index in
+/// `mapped_toplevels` iff (a) `focus_idx` IS the master of `ws`,
+/// (b) a partner is recorded for `ws` and is still alive, and
+/// (c) the partner currently sits in the stack (not master).
+/// `None` otherwise; the caller falls through to geometric
+/// `neighbor_in_direction`. Once partner ↔ master are swapped on
+/// the next call, the partner is now master and (c) fails on the
+/// following call, so this naturally only "consumes" itself once.
+fn master_swap_partner_index(state: &State, focus_idx: usize, ws: u32) -> Option<usize> {
+    let master_pos = state
+        .mapped_toplevels
+        .iter()
+        .position(|w| w.workspace == ws)?;
+    if master_pos != focus_idx {
+        return None;
+    }
+    let partner = state
+        .last_master_swap_partner_per_workspace
+        .get(&ws)?
+        .upgrade()
+        .ok()?;
+    let (partner_ws, partner_is_master) = state.position_in_workspace(&partner)?;
+    if partner_ws != ws || partner_is_master {
+        return None;
+    }
+    state
+        .mapped_toplevels
+        .iter()
+        .position(|w| w.surface.upgrade().ok().as_ref() == Some(&partner))
 }
 
 /// Ctrl+Q handler: send `xdg_toplevel.close` to whichever tile has
@@ -3475,6 +3547,7 @@ fn setup_event_loop(
         popup_grab: None,
         last_focus_per_workspace: std::collections::HashMap::new(),
         last_stack_focus_per_workspace: std::collections::HashMap::new(),
+        last_master_swap_partner_per_workspace: std::collections::HashMap::new(),
     };
     let mut compositor = Compositor {
         state,
