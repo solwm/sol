@@ -29,12 +29,10 @@
 //! mode         = 3840x2160@240             # output WIDTHxHEIGHT@HZ; SOL_MODE env wins
 //! keyboard_repeat_rate  = 100              # wl_keyboard.repeat_info chars/sec (0 disables)
 //! keyboard_repeat_delay = 200              # wl_keyboard.repeat_info delay, ms
-//! animation_duration_ms = 150              # legacy: time-based-tween duration; the layout tween now uses springs (see below). Still drives the workspace crossfade.
-//! animation_curve       = cubic_out        # linear|cubic_out|quart_out|quint_out|expo_out|in_out_cubic; same caveat — workspace crossfade only.
 //! spring_stiffness      = 200.0            # layout spring pull strength; higher = snappier
 //! spring_damping        = 22.0             # layout spring damping; ratio = damping / (2*sqrt(stiffness)). 1.0 = critical (no overshoot), <1 underdamped (overshoots once)
 //! workspace_animation   = crossfade        # none|crossfade
-//! workspace_animation_duration_ms = 250    # crossfade duration, separate from animation_duration_ms
+//! workspace_animation_duration_ms = 250    # crossfade duration in ms (cubic-out, hardcoded)
 //! inactive_alpha        = 0.85             # alpha for non-focused toplevels (1.0 = no effect)
 //! inactive_blur         = on               # frosted-glass blur behind inactive toplevels
 //! inactive_blur_passes  = 4                # blur intensity (more passes = blurrier, costs a bit more GPU)
@@ -129,13 +127,6 @@ pub struct Config {
     /// `wl_keyboard.repeat_info` delay before repeat starts, in
     /// milliseconds. Default 200 ms (Hyprland's tuning).
     pub keyboard_repeat_delay: i32,
-    /// Layout-transition animation duration, in milliseconds. 0 means
-    /// "snap, no tween." Default 150 ms — long enough that the eye
-    /// reads the resize as motion, short enough that keyboard-driven
-    /// users don't notice the latency.
-    pub animation_duration_ms: u32,
-    /// Easing curve applied to layout-transition tweens.
-    pub animation_curve: AnimationCurve,
     /// Spring stiffness for the layout-transition spring physics
     /// (see `tick_animations`). Higher = faster pull toward the
     /// target. Default 200.0 — feels responsive without being
@@ -155,12 +146,11 @@ pub struct Config {
     /// arriving one fades in. `None` is an instant cut.
     pub workspace_animation: WorkspaceAnimation,
     /// Duration of the workspace transition (`workspace_animation`),
-    /// in milliseconds. Independent of `animation_duration_ms` —
-    /// workspace switches usually feel right a touch slower than
-    /// layout tweens because a workspace switch is a bigger context
-    /// shift than a tile resize. Default 250 ms. The shared
-    /// `animation_curve` still applies. `0` falls back to an
-    /// instant cut just like `workspace_animation = none`.
+    /// in milliseconds. Default 250 ms — workspace switches usually
+    /// feel right a touch slower than per-tile layout motion since
+    /// the context shift is bigger. `0` falls back to an instant
+    /// cut, same as `workspace_animation = none`. Easing is
+    /// hardcoded to cubic-out (slight front-load + soft settle).
     pub workspace_animation_duration_ms: u32,
     /// Alpha multiplier applied to any tiled toplevel that doesn't
     /// own keyboard focus. `1.0` disables the effect (inactive looks
@@ -201,31 +191,12 @@ pub struct Config {
     pub corner_radius: i32,
 }
 
-/// Easing functions exposed to the config. All map `t ∈ [0, 1]`
-/// (linear progress) to a smoothed output in `[0, 1]`. Names follow
-/// the easings.net taxonomy.
-///
-/// `CubicOut` (the default) front-loads motion and slows to a gentle
-/// settle, which reads as "thing snapping into place." `QuartOut` /
-/// `QuintOut` are increasingly aggressive front-loads. `ExpoOut`
-/// is the most aggressive — almost instant with a tail. `InOutCubic`
-/// is symmetric (slow start, slow stop, fast middle), feels more
-/// deliberate. `Linear` is no easing — for debugging or taste.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnimationCurve {
-    Linear,
-    CubicOut,
-    QuartOut,
-    QuintOut,
-    ExpoOut,
-    InOutCubic,
-}
-
 /// Workspace-switch transition kind. `Crossfade` renders both the
 /// outgoing and incoming workspaces together for the duration of
-/// the animation, lerping per-window alpha via `animation_curve`.
-/// `None` skips the transition and snaps to the new workspace on
-/// the same frame as the keybind.
+/// the animation, with per-window alpha lerped through a hardcoded
+/// cubic-out curve over `workspace_animation_duration_ms`. `None`
+/// skips the transition and snaps to the new workspace on the same
+/// frame as the keybind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceAnimation {
     None,
@@ -246,8 +217,6 @@ impl Default for Config {
             mode: None,
             keyboard_repeat_rate: 100,
             keyboard_repeat_delay: 200,
-            animation_duration_ms: 150,
-            animation_curve: AnimationCurve::CubicOut,
             spring_stiffness: 200.0,
             spring_damping: 22.0,
             workspace_animation: WorkspaceAnimation::Crossfade,
@@ -482,8 +451,6 @@ enum Entry {
     Mode(ModePref),
     KeyboardRepeatRate(i32),
     KeyboardRepeatDelay(i32),
-    AnimationDurationMs(u32),
-    AnimationCurve(AnimationCurve),
     SpringStiffness(f32),
     SpringDamping(f32),
     WorkspaceAnimation(WorkspaceAnimation),
@@ -522,8 +489,6 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::Mode(m))) => cfg.mode = Some(m),
             Ok(Some(Entry::KeyboardRepeatRate(v))) => cfg.keyboard_repeat_rate = v,
             Ok(Some(Entry::KeyboardRepeatDelay(v))) => cfg.keyboard_repeat_delay = v,
-            Ok(Some(Entry::AnimationDurationMs(v))) => cfg.animation_duration_ms = v,
-            Ok(Some(Entry::AnimationCurve(c))) => cfg.animation_curve = c,
             Ok(Some(Entry::SpringStiffness(v))) => cfg.spring_stiffness = v,
             Ok(Some(Entry::SpringDamping(v))) => cfg.spring_damping = v,
             Ok(Some(Entry::WorkspaceAnimation(w))) => cfg.workspace_animation = w,
@@ -572,8 +537,6 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "mode" => Ok(Some(Entry::Mode(parse_mode(rhs)?))),
         "keyboard_repeat_rate" => Ok(Some(Entry::KeyboardRepeatRate(parse_int(rhs)?))),
         "keyboard_repeat_delay" => Ok(Some(Entry::KeyboardRepeatDelay(parse_int(rhs)?))),
-        "animation_duration_ms" => Ok(Some(Entry::AnimationDurationMs(parse_uint(rhs)?))),
-        "animation_curve" => Ok(Some(Entry::AnimationCurve(parse_animation_curve(rhs)?))),
         "spring_stiffness" => Ok(Some(Entry::SpringStiffness(parse_pos_float(rhs)?))),
         "spring_damping" => Ok(Some(Entry::SpringDamping(parse_pos_float(rhs)?))),
         "workspace_animation" => {
@@ -733,24 +696,6 @@ fn parse_workspace_animation(s: &str) -> Result<WorkspaceAnimation> {
         "crossfade" | "fade" => Ok(WorkspaceAnimation::Crossfade),
         other => bail!(
             "unknown workspace_animation `{other}` (expected none / crossfade)"
-        ),
-    }
-}
-
-fn parse_animation_curve(s: &str) -> Result<AnimationCurve> {
-    // Snake_case names follow easings.net taxonomy. `cubic` and
-    // `cubic_out` are aliases for the default since most users mean
-    // ease-out when they say "cubic" in a window-manager context.
-    match s.trim().to_ascii_lowercase().as_str() {
-        "linear" => Ok(AnimationCurve::Linear),
-        "cubic" | "cubic_out" => Ok(AnimationCurve::CubicOut),
-        "quart" | "quart_out" => Ok(AnimationCurve::QuartOut),
-        "quint" | "quint_out" => Ok(AnimationCurve::QuintOut),
-        "expo" | "expo_out" => Ok(AnimationCurve::ExpoOut),
-        "in_out_cubic" | "cubic_in_out" => Ok(AnimationCurve::InOutCubic),
-        other => bail!(
-            "unknown animation_curve `{other}` \
-             (expected linear / cubic / quart / quint / expo / in_out_cubic)"
         ),
     }
 }

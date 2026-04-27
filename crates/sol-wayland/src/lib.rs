@@ -2373,47 +2373,6 @@ const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
 /// BufferData / DmabufBuffer pointer.
 const BACKDROP_SCENE_KEY: u64 = 0xB10B1B_DEADBEEF;
 
-/// Apply the configured easing curve to a raw `[0, 1]` progress value.
-/// Names follow the easings.net taxonomy. `CubicOut` (the default)
-/// front-loads motion and slows to a settle, which reads as "snap
-/// into place" without the harshness of an actual snap.
-fn apply_easing(curve: config::AnimationCurve, t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    match curve {
-        config::AnimationCurve::Linear => t,
-        config::AnimationCurve::CubicOut => {
-            let inv = 1.0 - t;
-            1.0 - inv * inv * inv
-        }
-        config::AnimationCurve::QuartOut => {
-            let inv = 1.0 - t;
-            1.0 - inv * inv * inv * inv
-        }
-        config::AnimationCurve::QuintOut => {
-            let inv = 1.0 - t;
-            1.0 - inv * inv * inv * inv * inv
-        }
-        config::AnimationCurve::ExpoOut => {
-            // Closed-form ease-out exponential, with the t==1 case
-            // pinned to exactly 1.0 (otherwise 2^-10 leaves a tiny
-            // residual ~0.001 that would make the snap visible).
-            if t >= 1.0 {
-                1.0
-            } else {
-                1.0 - 2f32.powf(-10.0 * t)
-            }
-        }
-        config::AnimationCurve::InOutCubic => {
-            if t < 0.5 {
-                4.0 * t * t * t
-            } else {
-                let a = -2.0 * t + 2.0;
-                1.0 - a * a * a / 2.0
-            }
-        }
-    }
-}
-
 /// Step every window's render_rect spring toward its target rect.
 /// Returns `true` if anything is still in motion, so the render
 /// loop knows to keep ticking.
@@ -2593,8 +2552,12 @@ fn workspace_anim_alphas(state: &State, now: Instant) -> Option<(f32, f32)> {
     if elapsed >= duration {
         return None;
     }
-    let t = elapsed as f32 / duration as f32;
-    let eased = apply_easing(state.config.animation_curve, t);
+    let t = (elapsed as f32 / duration as f32).clamp(0.0, 1.0);
+    // Cubic-out: front-loaded fade with a soft settle. Slight
+    // start, slow finish — reads as "thing slides in / out" rather
+    // than the mechanical bisection of a linear lerp.
+    let inv = 1.0 - t;
+    let eased = 1.0 - inv * inv * inv;
     Some((1.0 - eased, eased))
 }
 
