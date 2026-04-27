@@ -561,6 +561,59 @@ impl State {
     fn next_serial_const(&self) -> u32 {
         self.next_serial
     }
+
+    /// Send `wl_keyboard.leave` to the focused client without
+    /// touching `keyboard_focus`. Used by `resize_mode` to suspend
+    /// key delivery while still remembering which surface should
+    /// regain focus on exit. Per spec, leave releases all currently
+    /// pressed keys for that surface, so the client's view of held
+    /// modifiers is reset — we re-broadcast modifier state on
+    /// `keyboard_resume_focused`.
+    pub fn keyboard_suspend_focused(&mut self) {
+        let Some(focus) = self.keyboard_focus.clone() else { return };
+        if !focus.is_alive() {
+            return;
+        }
+        let serial = self.next_serial();
+        for kb in &self.keyboards {
+            if same_client(kb, &focus) {
+                kb.leave(serial, &focus);
+            }
+        }
+    }
+
+    /// Counterpart of `keyboard_suspend_focused`: re-attach the
+    /// `wl_keyboard` to `keyboard_focus` and re-send modifier state
+    /// from xkb so a still-physically-held modifier doesn't leave
+    /// the client thinking modifiers are clear when they aren't.
+    /// Empty pressed-keys list — anything actually held by the user
+    /// will produce a release event on the next physical action,
+    /// which clients are tolerant of.
+    pub fn keyboard_resume_focused(&mut self) {
+        let Some(focus) = self.keyboard_focus.clone() else { return };
+        if !focus.is_alive() {
+            return;
+        }
+        let serial = self.next_serial();
+        for kb in &self.keyboards {
+            if same_client(kb, &focus) {
+                kb.enter(serial, &focus, Vec::new());
+            }
+        }
+        if let Some(km) = self.keymap.as_ref() {
+            use xkbcommon::xkb as x;
+            let depressed = km.state.serialize_mods(x::STATE_MODS_DEPRESSED);
+            let latched = km.state.serialize_mods(x::STATE_MODS_LATCHED);
+            let locked = km.state.serialize_mods(x::STATE_MODS_LOCKED);
+            let group = km.state.serialize_layout(x::STATE_LAYOUT_EFFECTIVE);
+            let mods_serial = self.next_serial();
+            for kb in &self.keyboards {
+                if same_client(kb, &focus) {
+                    kb.modifiers(mods_serial, depressed, latched, locked, group);
+                }
+            }
+        }
+    }
 }
 
 fn same_client<A: Resource, B: Resource>(a: &A, b: &B) -> bool {
@@ -3145,11 +3198,27 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             // client — the user pressed `resize_mode` to *adjust*,
             // not to type. Modifier *tracking* above still runs so
             // the next bind after exit sees correct state.
+            //
+            // We still feed xkb every key here so its modifier
+            // state matches physical reality on exit — without
+            // this, a release we swallow leaves xkb thinking the
+            // mod is held, and the modifier event we re-send to
+            // the client on resume would be wrong.
             if state.resize_mode {
+                let _ = state.keymap.as_mut().map(|km| km.feed_key(keycode, pressed));
                 if pressed {
                     match keycode {
                         KEY_ESC => {
                             state.resize_mode = false;
+                            // Re-attach the keyboard to the focused
+                            // client and re-broadcast modifier state
+                            // from xkb. Without this the client's
+                            // view of held keys is stale (we sent it
+                            // a leave on entry) and typing reads as
+                            // Alt+letter / Ctrl+letter for any modifier
+                            // that was held when the user entered the
+                            // mode.
+                            state.keyboard_resume_focused();
                             tracing::debug!("resize_mode: exit");
                         }
                         KEY_L => {
@@ -3228,6 +3297,15 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                         }
                         config::Action::ResizeMode => {
                             state.resize_mode = true;
+                            // Suspend key delivery to the focused
+                            // client so the H / L / Esc presses we
+                            // intercept here don't reach it as
+                            // unmatched events. wl_keyboard.leave
+                            // releases all keys for that surface, so
+                            // any modifier the user was holding at
+                            // entry won't get stuck "down" on the
+                            // client side.
+                            state.keyboard_suspend_focused();
                             tracing::debug!("resize_mode: enter");
                         }
                         config::Action::CloseWindow => {
