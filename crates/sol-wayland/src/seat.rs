@@ -111,15 +111,40 @@ impl Dispatch<WlSeat, ()> for State {
 
 impl Dispatch<WlPointer, ()> for State {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WlPointer,
-        _request: wl_pointer::Request,
+        request: wl_pointer::Request,
         _data: &(),
         _dh: &DisplayHandle,
         _init: &mut DataInit<'_, Self>,
     ) {
-        // set_cursor / release — safe to ignore at B5.
+        match request {
+            wl_pointer::Request::SetCursor {
+                serial: _,
+                surface,
+                hotspot_x,
+                hotspot_y,
+            } => {
+                // Client is asking for a custom cursor while the
+                // pointer is over its surface (Chrome's hand-pointer
+                // over a link, a text I-beam in an editor, etc.) or,
+                // when `surface` is None, asking for the cursor to be
+                // hidden entirely (fullscreen video players after a
+                // few idle seconds). Per spec the choice expires the
+                // next time the pointer leaves the surface — see
+                // `update_pointer_focus_and_motion`, which clears
+                // `client_override_active` on focus change.
+                state.cursor.client_override_active = true;
+                state.cursor.client_surface =
+                    surface.as_ref().map(|s| s.downgrade());
+                state.cursor.client_hot_x = hotspot_x;
+                state.cursor.client_hot_y = hotspot_y;
+                state.needs_render = true;
+            }
+            wl_pointer::Request::Release => {}
+            _ => {}
+        }
     }
 }
 

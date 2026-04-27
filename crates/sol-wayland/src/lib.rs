@@ -492,6 +492,20 @@ pub struct Cursor {
     pub height: i32,
     pub hot_x: i32,
     pub hot_y: i32,
+    /// Set when the focused client called `wl_pointer.set_cursor`
+    /// during the current pointer-enter. Cleared on the next focus
+    /// change because per spec the cursor association expires the
+    /// moment the pointer leaves the surface that received the
+    /// enter event.
+    pub client_override_active: bool,
+    /// `client_override_active` + `Some(s)` → render `s` as the
+    /// cursor (e.g. Chrome's hand pointer over a link).
+    /// `client_override_active` + `None` → cursor is hidden (e.g.
+    /// Chrome over a fullscreen video, after a few seconds idle).
+    /// Both flags off → render the default sprite.
+    pub client_surface: Option<Weak<WlSurface>>,
+    pub client_hot_x: i32,
+    pub client_hot_y: i32,
 }
 
 impl Cursor {
@@ -506,6 +520,10 @@ impl Cursor {
             height: sprite.height,
             hot_x: sprite.hot_x,
             hot_y: sprite.hot_y,
+            client_override_active: false,
+            client_surface: None,
+            client_hot_x: 0,
+            client_hot_y: 0,
         }
     }
 }
@@ -1846,6 +1864,49 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
+
+    // 7. Client-supplied cursor surface, if any. Drawn last so it
+    // sits above every other layer including Overlay — pointer
+    // visuals must always be on top. The default sprite path in
+    // `scene_from_buffers` skips itself when this fires; if the
+    // client requested cursor=None (hidden), we emit nothing here
+    // and the skip path keeps the screen cursor-less.
+    if state.cursor.client_override_active {
+        if let Some(cur) = state
+            .cursor
+            .client_surface
+            .as_ref()
+            .and_then(|w| w.upgrade().ok())
+        {
+            if let Some(sd_arc) = cur.data::<Arc<Mutex<SurfaceData>>>() {
+                let (buf, vsrc, dims) = {
+                    let sd = sd_arc.lock().unwrap();
+                    let buf = sd.current.buffer.clone();
+                    let dims = buf.as_ref().and_then(surface_buffer_dims);
+                    (buf, sd.viewport_src, dims)
+                };
+                if let (Some(buf), Some((w, h))) = (buf, dims) {
+                    let cx = state.cursor.pos_x as f32
+                        - state.cursor.client_hot_x as f32;
+                    let cy = state.cursor.pos_y as f32
+                        - state.cursor.client_hot_y as f32;
+                    out.push(Placed::Buffer {
+                        buf,
+                        rect: RectF {
+                            x: cx,
+                            y: cy,
+                            w: w as f32,
+                            h: h as f32,
+                        },
+                        vsrc,
+                        alpha: 1.0,
+                        corner_radius: 0.0,
+                    });
+                    emit_subsurface_tree(&mut out, &cur, cx, cy, 1.0);
+                }
+            }
+        }
+    }
     (out, background_count)
 }
 
@@ -2035,9 +2096,14 @@ fn scene_from_buffers<'a>(
             });
         }
     }
-    // Cursor last so it always draws on top. dst_* = 0.0 forces the
-    // presenter to render at the sprite's intrinsic size.
-    if cursor.visible {
+    // Default cursor sprite — drawn last so it always sits on
+    // top. Skipped when the focused client has called
+    // wl_pointer.set_cursor: collect_scene already pushed the
+    // client-supplied surface (or, if the client explicitly asked
+    // for cursor=None, pushed nothing — the pointer is hidden).
+    // dst_* = 0.0 forces the presenter to render at the sprite's
+    // intrinsic size.
+    if cursor.visible && !cursor.client_override_active {
         scene.elements.push(SceneElement {
             buffer_key: CURSOR_SCENE_KEY,
             width: cursor.width,
@@ -4117,6 +4183,13 @@ fn update_pointer_focus_and_motion(state: &mut State) {
     let focus_changed = !surface_eq(state.pointer_focus.as_ref(), new_focus.as_ref());
 
     if focus_changed {
+        // Per `wl_pointer.set_cursor` spec, the client's cursor
+        // choice is bound to the surface that received the most
+        // recent `enter` event — the moment the pointer leaves, we
+        // revert to the default sprite. The new client gets the
+        // chance to call set_cursor itself after its own enter.
+        state.cursor.client_override_active = false;
+        state.cursor.client_surface = None;
         if let Some(old) = state.pointer_focus.take() {
             if old.is_alive() {
                 let serial = state.next_serial();
