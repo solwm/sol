@@ -273,13 +273,35 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
                     parent = ?parent_surface.as_ref().map(|s| s.id()),
                     "toplevel set_parent"
                 );
-                crate::reclassify_dialog(state, surface, parent_surface.as_ref());
+                crate::reclassify_window(state, surface);
             }
             xdg_toplevel::Request::SetTitle { title } => {
                 tracing::info!(id = ?surface.id(), %title, "toplevel title");
             }
             xdg_toplevel::Request::SetAppId { app_id } => {
                 tracing::info!(id = ?surface.id(), %app_id, "toplevel app_id");
+            }
+            xdg_toplevel::Request::SetMinSize { width, height } => {
+                if let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() {
+                    sd_arc.lock().unwrap().xdg_min_size = (width, height);
+                }
+                crate::reclassify_window(state, surface);
+            }
+            xdg_toplevel::Request::SetMaxSize { width, height } => {
+                if let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() {
+                    sd_arc.lock().unwrap().xdg_max_size = (width, height);
+                }
+                crate::reclassify_window(state, surface);
+            }
+            xdg_toplevel::Request::Move { seat: _, serial: _ } => {
+                // Client-driven window move — GTK dialogs send this
+                // when the user click-and-drags their titlebar. We
+                // start an interactive move that follows the pointer
+                // until the same button is released; only meaningful
+                // for floating dialogs (tiles can't be repositioned
+                // from the layout, so the drag is silently ignored
+                // there).
+                crate::start_dialog_drag(state, surface);
             }
             xdg_toplevel::Request::Destroy => {
                 crate::unmap_toplevel(state, surface);

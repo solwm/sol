@@ -192,24 +192,53 @@ pub struct Window {
     pub workspace: u32,
 }
 
-/// A floating dialog/transient toplevel anchored to a parent tile.
-/// Lives outside the master-stack layout: no `rect` / `from_rect` /
-/// animation state, no configure round-trip — the client picked its
-/// own size on its initial configure (we send `(0,0)` for the
-/// initial), so its current buffer dims drive the rendered size.
-/// Position is computed at render time as "centered over the parent's
-/// `render_rect`", so dialogs follow their parent through layout
-/// changes for free.
+/// A floating window — either a transient dialog anchored to a
+/// parent tile (save/discard prompts, file pickers) or an unparented
+/// fixed-size window (splash screens, "About" boxes, password
+/// prompts). Lives outside the master-stack layout: no `rect` /
+/// `from_rect` / animation state, no configure round-trip — the
+/// client picked its own size on its initial configure (we send
+/// `(0,0)` for the initial), so its current buffer dims drive the
+/// rendered size.
+///
+/// Position is centered: over the parent's `render_rect` when
+/// `parent` is `Some`, on the workspace's screen rect otherwise.
+/// `position` overrides this when the user has dragged the dialog
+/// (xdg_toplevel.move) — top-left in screen coords, persists until
+/// the dialog unmaps.
 #[derive(Debug, Clone)]
 pub struct DialogWindow {
     pub surface: Weak<WlSurface>,
-    pub parent: Weak<WlSurface>,
+    /// `None` → free-floater (splash, unparented modal), centered on
+    /// the screen. `Some` → transient, centered over the parent's
+    /// current render_rect so it follows the parent through tile
+    /// resize tweens.
+    pub parent: Option<Weak<WlSurface>>,
     /// Workspace the dialog belongs to — inherited from the parent
-    /// at map time. We don't track parent-workspace changes; if the
-    /// user moves the parent across workspaces while a dialog is
-    /// open, the dialog stays on the original workspace. Rare and
-    /// not worth the bookkeeping.
+    /// at map time, or the active workspace for parentless floats.
+    /// We don't track parent-workspace changes; if the user moves
+    /// the parent across workspaces while a dialog is open, the
+    /// dialog stays on the original workspace.
     pub workspace: u32,
+    /// User-overridden top-left in screen coords, set by an
+    /// interactive drag (`xdg_toplevel.move`). When `None` we
+    /// recompute the centered rect every frame.
+    pub position: Option<(f32, f32)>,
+}
+
+/// State of a compositor-driven interactive window drag, kicked off
+/// by `xdg_toplevel.move` and ended by the next pointer button
+/// release. While set, pointer motion updates the dragged dialog's
+/// `position` and pointer events are not dispatched to clients
+/// normally — the compositor "captures" the pointer for the move.
+#[derive(Debug, Clone)]
+pub struct DialogDrag {
+    pub surface: Weak<WlSurface>,
+    /// Vector from the dragged dialog's top-left to the cursor at
+    /// drag start; constant for the duration of the drag so motion
+    /// deltas don't accumulate floating-point error or drift on the
+    /// first pointer event after the press.
+    pub offset: (f32, f32),
 }
 
 /// In-flight workspace crossfade. While set, both the outgoing and
@@ -423,6 +452,11 @@ pub struct State {
     /// Pruned of dead-surface entries each render tick. Cleared
     /// alongside their parent if the parent unmaps.
     pub mapped_dialogs: Vec<DialogWindow>,
+    /// In-progress interactive dialog move kicked off by
+    /// `xdg_toplevel.move`. `None` means no drag — pointer events
+    /// flow normally. `Some` captures the pointer to a specific
+    /// dialog until the next button release.
+    pub dragging: Option<DialogDrag>,
     /// Mapped xdg_popups in creation order (topmost last). Each entry
     /// is a weak ref to the popup's wl_surface; per-popup data
     /// (parent, offset, size) lives on `SurfaceData`. Dead weaks are
@@ -699,22 +733,31 @@ pub struct Compositor {
     pub backend: BackendState,
 }
 
-/// React to a `xdg_toplevel.set_parent` arriving after the surface is
-/// already mapped: promote a tile to a dialog (parent now Some, was
-/// in `mapped_toplevels`) or demote a dialog back to a tile (parent
-/// now None, was in `mapped_dialogs`). Called from the SetParent
-/// handler so GTK clients that finalize the parent link AFTER their
-/// first commit (GIMP's New Image dialog hits this path) end up
-/// floating instead of being given half the screen.
-///
-/// Pre-mapping calls are silently no-ops here — the first-commit
-/// fork in `compositor.rs` reads the freshly-set parent off
-/// `SurfaceData` and routes correctly without any reclassification.
-pub(crate) fn reclassify_dialog(
-    state: &mut State,
-    surface: &WlSurface,
-    new_parent: Option<&WlSurface>,
-) {
+/// True when this surface declared a non-zero, equal min/max size
+/// via `xdg_toplevel.set_min_size` + `set_max_size`. That's the
+/// strongest "I'm not a tile-friendly window" signal a client can
+/// send through xdg-shell — splash screens, GTK dialogs, file
+/// pickers, password prompts all do this. Caught here so we float
+/// them even if `set_parent` isn't called (splash screens) or only
+/// arrives after the first commit (GIMP's New Image dialog —
+/// previously the surface mapped as a tile, was given half the
+/// screen, then jumped to a centered float once set_parent landed,
+/// producing a visible flash).
+pub(crate) fn is_fixed_size_floater(sd: &compositor::SurfaceData) -> bool {
+    let (min_w, min_h) = sd.xdg_min_size;
+    let (max_w, max_h) = sd.xdg_max_size;
+    min_w > 0 && min_h > 0 && min_w == max_w && min_h == max_h
+}
+
+/// Classify a mapped surface as tile vs floating dialog based on its
+/// current `xdg_toplevel_parent` and min/max-size hints, and move it
+/// between `mapped_toplevels` / `mapped_dialogs` if its current slot
+/// disagrees. Idempotent: pre-mapping calls and already-correct
+/// classifications are silent no-ops. Called from
+/// `xdg_toplevel.set_parent` / `set_min_size` / `set_max_size` so
+/// GTK clients that finalize their dialog identity AFTER the first
+/// commit still end up floating.
+pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
     let in_tiles = state
         .mapped_toplevels
         .iter()
@@ -724,43 +767,41 @@ pub(crate) fn reclassify_dialog(
         .iter()
         .position(|d| d.surface.upgrade().ok().as_ref() == Some(surface));
 
-    match (in_tiles, in_dialogs, new_parent) {
-        // Tile gaining a parent → demote to dialog. Drop tile-side
-        // state (rect, animation, pending_layout) and start fresh
-        // as a floating dialog. apply_layout will reshuffle the
-        // remaining tiles. Also send an unconstrained
-        // (0,0,no-states) configure so the client lets go of the
-        // tile-size MAXIMIZED state we last imposed and redraws at
-        // its preferred size — without this the dialog stays
-        // visually huge until the client decides on its own to
-        // resize, which most never do.
-        (Some(idx), None, Some(parent)) => {
+    let Some(sd_arc) = surface.data::<Arc<Mutex<compositor::SurfaceData>>>() else {
+        return;
+    };
+    let (parent_weak, fixed) = {
+        let sd = sd_arc.lock().unwrap();
+        (sd.xdg_toplevel_parent.clone(), is_fixed_size_floater(&sd))
+    };
+    let parent_alive = parent_weak.as_ref().and_then(|w| w.upgrade().ok());
+    let should_float = parent_alive.is_some() || fixed;
+
+    match (in_tiles, in_dialogs, should_float) {
+        // Tile that should be floating → demote. Drop tile state
+        // (rect, animation, pending_layout) and re-fire an
+        // unconstrained (0,0,no-states) configure so the client
+        // lets go of the MAXIMIZED+TILED state we'd imposed and
+        // redraws at its preferred size — without this the dialog
+        // stays visually huge until the client decides on its own
+        // to resize.
+        (Some(idx), None, true) => {
             let win = state.mapped_toplevels.remove(idx);
             state.mapped_dialogs.push(DialogWindow {
                 surface: surface.downgrade(),
-                parent: parent.downgrade(),
+                parent: parent_alive.as_ref().map(|s| s.downgrade()),
                 workspace: win.workspace,
+                position: None,
             });
-            if let Some(sd_arc) = surface.data::<Arc<Mutex<compositor::SurfaceData>>>() {
-                let sd = sd_arc.lock().unwrap();
-                if let (Some(tl_w), Some(xs_w)) =
-                    (sd.xdg_toplevel.as_ref(), sd.xdg_surface.as_ref())
-                {
-                    if let (Ok(tl), Ok(xs)) = (tl_w.upgrade(), xs_w.upgrade()) {
-                        drop(sd);
-                        tl.configure(0, 0, Vec::new());
-                        let serial = state.next_serial();
-                        xs.configure(serial);
-                    }
-                }
-            }
+            send_unconstrained_configure(state, surface);
             state.needs_render = true;
             tracing::info!(id = ?surface.id(), "tile → dialog");
         }
-        // Dialog losing its parent → promote back to a tile. Push
-        // with default rect; tick_animations snaps it to the new
-        // layout slot (render_rect.w is 0).
-        (None, Some(idx), None) => {
+        // Dialog that should be a tile → promote. Push with default
+        // rect; tick_animations snaps it on the next frame
+        // (render_rect.w is 0). apply_layout will send a sized +
+        // MAXIMIZED + TILED configure on the next render tick.
+        (None, Some(idx), false) => {
             let dlg = state.mapped_dialogs.remove(idx);
             state.mapped_toplevels.push(Window {
                 surface: surface.downgrade(),
@@ -775,18 +816,117 @@ pub(crate) fn reclassify_dialog(
             state.needs_render = true;
             tracing::info!(id = ?surface.id(), "dialog → tile");
         }
-        // Dialog re-anchored to a different parent → just update
-        // the parent ref. Render position recomputes against
-        // whichever parent is current.
-        (None, Some(idx), Some(parent)) => {
-            state.mapped_dialogs[idx].parent = parent.downgrade();
-            state.needs_render = true;
+        // Dialog staying a dialog: refresh the parent ref in case
+        // set_parent re-anchored to a different toplevel, or
+        // promoted from "unparented float" to "child of X".
+        (None, Some(idx), true) => {
+            let new_parent = parent_alive.as_ref().map(|s| s.downgrade());
+            if !weak_eq(state.mapped_dialogs[idx].parent.as_ref(), new_parent.as_ref()) {
+                state.mapped_dialogs[idx].parent = new_parent;
+                // Re-anchoring may move the centered position;
+                // also reset any user drag-position so the dialog
+                // re-snaps to the new center.
+                state.mapped_dialogs[idx].position = None;
+                state.needs_render = true;
+            }
         }
-        // Already-correct classification (tile staying a tile with
-        // a null set_parent that was never set, or unmapped surface
-        // that hasn't reached compositor.rs yet): nothing to do.
+        // Tile staying a tile, or surface not yet mapped (the
+        // first-commit fork in compositor.rs handles those): no-op.
         _ => {}
     }
+}
+
+fn weak_eq(a: Option<&Weak<WlSurface>>, b: Option<&Weak<WlSurface>>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.upgrade().ok() == y.upgrade().ok(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn send_unconstrained_configure(state: &mut State, surface: &WlSurface) {
+    let Some(sd_arc) = surface.data::<Arc<Mutex<compositor::SurfaceData>>>() else {
+        return;
+    };
+    let (tl, xs) = {
+        let sd = sd_arc.lock().unwrap();
+        let Some(tl) = sd.xdg_toplevel.as_ref().and_then(|w| w.upgrade().ok()) else {
+            return;
+        };
+        let Some(xs) = sd.xdg_surface.as_ref().and_then(|w| w.upgrade().ok()) else {
+            return;
+        };
+        (tl, xs)
+    };
+    tl.configure(0, 0, Vec::new());
+    let serial = state.next_serial();
+    xs.configure(serial);
+}
+
+/// Kick off a compositor-driven interactive move for a dialog —
+/// invoked from `xdg_toplevel.move` (GTK clients fire this when the
+/// user click-and-drags their CSD titlebar). Captures the pointer
+/// until the next button release; pointer motion updates the
+/// dialog's `position`. Silently ignored for tiles (their position
+/// is owned by the layout, not draggable) and for surfaces that
+/// aren't currently mapped as a dialog at all.
+pub(crate) fn start_dialog_drag(state: &mut State, surface: &WlSurface) {
+    let Some(idx) = state
+        .mapped_dialogs
+        .iter()
+        .position(|d| d.surface.upgrade().ok().as_ref() == Some(surface))
+    else {
+        return;
+    };
+    let Some((dx, dy)) = dialog_render_origin(state, idx) else {
+        return;
+    };
+    let cursor_x = state.cursor.pos_x as f32;
+    let cursor_y = state.cursor.pos_y as f32;
+    state.dragging = Some(DialogDrag {
+        surface: surface.downgrade(),
+        offset: (cursor_x - dx, cursor_y - dy),
+    });
+    tracing::debug!(id = ?surface.id(), "dialog drag started");
+}
+
+/// Compute the current top-left of the dialog at `idx` as it would
+/// be rendered: user-overridden `position` if set, else centered
+/// over the parent's `render_rect`, else centered on screen.
+/// Returns `None` if any required input (surface, parent, logical
+/// size) is missing — caller should skip drawing / hit-testing.
+fn dialog_render_origin(state: &State, idx: usize) -> Option<(f32, f32)> {
+    let dlg = state.mapped_dialogs.get(idx)?;
+    let surface = dlg.surface.upgrade().ok()?;
+    let sd_arc = surface.data::<Arc<Mutex<compositor::SurfaceData>>>()?;
+    let (dw, dh) = {
+        let sd = sd_arc.lock().ok()?;
+        surface_logical_size(&sd)?
+    };
+    let dw_f = dw as f32;
+    let dh_f = dh as f32;
+
+    if let Some(pos) = dlg.position {
+        return Some(pos);
+    }
+
+    let host_rect = match dlg.parent.as_ref().and_then(|w| w.upgrade().ok()) {
+        Some(parent) => state
+            .mapped_toplevels
+            .iter()
+            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&parent))
+            .map(|w| w.render_rect)?,
+        None => RectF {
+            x: 0.0,
+            y: 0.0,
+            w: state.screen_width as f32,
+            h: state.screen_height as f32,
+        },
+    };
+    Some((
+        host_rect.x + (host_rect.w - dw_f) * 0.5,
+        host_rect.y + (host_rect.h - dh_f) * 0.5,
+    ))
 }
 
 /// Remove a toplevel from `mapped_toplevels`, and — if it was the
@@ -812,8 +952,8 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
     {
         let parent_surface = state.mapped_dialogs[dlg_idx]
             .parent
-            .upgrade()
-            .ok();
+            .as_ref()
+            .and_then(|w| w.upgrade().ok());
         state
             .last_focus_per_workspace
             .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
@@ -843,9 +983,13 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
     // they don't render in mid-air. Most clients destroy their
     // dialogs alongside the parent, but well-behaved is not
     // universally true.
-    state
-        .mapped_dialogs
-        .retain(|d| d.parent.upgrade().ok().as_ref() != Some(surface));
+    state.mapped_dialogs.retain(|d| {
+        d.parent
+            .as_ref()
+            .and_then(|w| w.upgrade().ok())
+            .as_ref()
+            != Some(surface)
+    });
     state.needs_render = true;
 
     if !was_focused {
@@ -1590,20 +1734,12 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
     // surfaces, and when the parent is dead (the cleanup path
     // drops orphans, but a render between unmap and cleanup is
     // possible).
-    for dlg in &state.mapped_dialogs {
+    for (idx, dlg) in state.mapped_dialogs.iter().enumerate() {
         if dlg.workspace != active_ws {
             continue;
         }
         let Ok(surface) = dlg.surface.upgrade() else { continue };
-        let Ok(parent) = dlg.parent.upgrade() else { continue };
-        let Some(parent_rect) = state
-            .mapped_toplevels
-            .iter()
-            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&parent))
-            .map(|w| w.render_rect)
-        else {
-            continue;
-        };
+        let Some((dx, dy)) = dialog_render_origin(state, idx) else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
         let (buf, vsrc, logical) = {
             let sd = sd_arc.lock().unwrap();
@@ -1614,14 +1750,8 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
             )
         };
         let Some((dw, dh)) = logical else { continue };
-        // Center over the parent. Clamped so a dialog larger than
-        // its parent stays on-screen rather than spilling out one
-        // side; rare, but Firefox's permission popup at small tile
-        // sizes hits it.
         let dw_f = dw as f32;
         let dh_f = dh as f32;
-        let dx = parent_rect.x + (parent_rect.w - dw_f) * 0.5;
-        let dy = parent_rect.y + (parent_rect.h - dh_f) * 0.5;
         if let Some(buf) = buf {
             out.push(Placed::Buffer {
                 buf,
@@ -2684,13 +2814,20 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     comp.state
         .mapped_popups
         .retain(|w| w.upgrade().is_ok());
-    // Prune dialogs whose surface or parent died. Dropping
-    // parent-orphaned dialogs here matches the "no floating windows
-    // in general" stance — a dialog without its anchor has no
-    // sensible position so we'd rather not render it at all.
-    comp.state
-        .mapped_dialogs
-        .retain(|d| d.surface.upgrade().is_ok() && d.parent.upgrade().is_ok());
+    // Prune dead-surface dialogs. Parented dialogs whose parent
+    // died also drop — orphan dialogs have no sensible position
+    // since we anchor them to the parent's render_rect. Parentless
+    // floats (splash screens, About boxes) have no parent to
+    // outlive, so the parent check is skipped for them.
+    comp.state.mapped_dialogs.retain(|d| {
+        if d.surface.upgrade().is_err() {
+            return false;
+        }
+        match &d.parent {
+            Some(weak) => weak.upgrade().is_ok(),
+            None => true,
+        }
+    });
     rebalance_keyboard_focus(&mut comp.state);
     let now = Instant::now();
     apply_layout(&mut comp.state, now);
@@ -3167,6 +3304,7 @@ fn setup_event_loop(
         primary_selection_source: None,
         mapped_popups: Vec::new(),
         mapped_dialogs: Vec::new(),
+        dragging: None,
         popup_grab: None,
         last_focus_per_workspace: std::collections::HashMap::new(),
     };
@@ -3732,29 +3870,17 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
 
     // Pass 1aa: floating dialogs. Iterate newest-first so a dialog
     // opened on top of another dialog catches its own clicks.
-    for dlg in state.mapped_dialogs.iter().rev() {
+    for (idx, dlg) in state.mapped_dialogs.iter().enumerate().rev() {
         if dlg.workspace != state.active_ws {
             continue;
         }
         let Ok(surface) = dlg.surface.upgrade() else { continue };
-        let Ok(parent) = dlg.parent.upgrade() else { continue };
-        let Some(parent_rect) = state
-            .mapped_toplevels
-            .iter()
-            .find(|w| w.surface.upgrade().ok().as_ref() == Some(&parent))
-            .map(|w| w.render_rect)
-        else {
-            continue;
-        };
+        let Some((dx, dy)) = dialog_render_origin(state, idx) else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
         let Some((dw, dh)) = sd_arc.lock().ok().and_then(|sd| surface_logical_size(&sd))
         else {
             continue;
         };
-        let dw_f = dw as f32;
-        let dh_f = dh as f32;
-        let dx = parent_rect.x + (parent_rect.w - dw_f) * 0.5;
-        let dy = parent_rect.y + (parent_rect.h - dh_f) * 0.5;
         let dlg_rect = Rect {
             x: dx.round() as i32,
             y: dy.round() as i32,
@@ -3918,6 +4044,30 @@ fn surface_buffer_dims(
 }
 
 fn update_pointer_focus_and_motion(state: &mut State) {
+    // Compositor-driven dialog drag captures the pointer until the
+    // button release ends it. While set, motion updates the dialog's
+    // `position` (top-left = cursor − captured offset) and we skip
+    // the regular focus + motion dispatch so the dragged client
+    // doesn't see motion events from outside its own surface.
+    if let Some(drag) = state.dragging.clone() {
+        let cursor_x = state.cursor.pos_x as f32;
+        let cursor_y = state.cursor.pos_y as f32;
+        if let Ok(surface) = drag.surface.upgrade() {
+            for d in state.mapped_dialogs.iter_mut() {
+                if d.surface.upgrade().ok().as_ref() == Some(&surface) {
+                    d.position =
+                        Some((cursor_x - drag.offset.0, cursor_y - drag.offset.1));
+                    break;
+                }
+            }
+        } else {
+            // Dragged surface died mid-drag — just drop the capture.
+            state.dragging = None;
+        }
+        state.needs_render = true;
+        return;
+    }
+
     let hit = surface_under_cursor(state);
     let new_focus = hit.as_ref().map(|(s, _, _)| s.clone());
     let focus_changed = !surface_eq(state.pointer_focus.as_ref(), new_focus.as_ref());
@@ -4104,6 +4254,21 @@ fn dismiss_popup_grab(state: &mut State) {
 }
 
 fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
+    // While an interactive dialog drag is in progress, the next
+    // button release ends it; intervening presses (multi-button
+    // mash) and the release itself are swallowed instead of being
+    // forwarded to the dragged client, so it doesn't see a release
+    // it didn't get a press for. After clearing the drag we return
+    // — the click was the user "letting go of the window", not a
+    // click on whatever's under the cursor.
+    if state.dragging.is_some() {
+        if !pressed {
+            state.dragging = None;
+            state.needs_render = true;
+        }
+        return;
+    }
+
     // If a popup is currently grabbing and the press landed outside
     // its surface tree, dismiss it before forwarding the click. The
     // client tears the popup chain down in response to `popup_done`,

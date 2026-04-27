@@ -123,6 +123,16 @@ pub struct SurfaceData {
     /// preferences windows, etc. — anything the protocol marks as
     /// belonging to another window.
     pub xdg_toplevel_parent: Option<Weak<WlSurface>>,
+    /// Most recent (width, height) seen via `xdg_toplevel.set_min_size`.
+    /// (0, 0) means "no minimum declared". Combined with `xdg_max_size`
+    /// to detect fixed-size windows (splash screens, GTK dialogs, file
+    /// pickers) that should float rather than tile.
+    pub xdg_min_size: (i32, i32),
+    /// Most recent (width, height) seen via `xdg_toplevel.set_max_size`.
+    /// (0, 0) means "no maximum declared". A window with a non-zero
+    /// `min == max` is a fixed-size window — see
+    /// `is_fixed_size_floater` for the routing rule that uses this.
+    pub xdg_max_size: (i32, i32),
     /// For surfaces with role=Subsurface: weak ref to the parent the
     /// child hangs off of. The scene walker follows this in reverse
     /// (parent → children) but carries the parent link so cleanup on
@@ -306,25 +316,34 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                 *mapped = true;
                                 just_mapped_toplevel = true;
                                 // Dialog vs tile fork. A toplevel
-                                // that called set_parent before its
-                                // first commit is a transient
-                                // window — save/discard prompts,
-                                // file pickers, etc. — and gets a
-                                // floating slot instead of a tile.
+                                // floats if it has a parent OR is
+                                // fixed-size (min == max). Catches
+                                // save/discard prompts, file pickers,
+                                // GIMP's New Image dialog (parent
+                                // arrives late but min/max are set
+                                // early), and unparented splash
+                                // screens (parent never set, but
+                                // they're fixed-size). See
+                                // `is_fixed_size_floater`.
                                 let dialog_parent = sd
                                     .xdg_toplevel_parent
                                     .as_ref()
                                     .and_then(|w| w.upgrade().ok());
-                                if let Some(parent) = dialog_parent {
+                                let fixed = crate::is_fixed_size_floater(&sd);
+                                if dialog_parent.is_some() || fixed {
                                     tracing::info!(
                                         id = ?surface.id(),
-                                        parent = ?parent.id(),
+                                        parent = ?dialog_parent.as_ref().map(|s| s.id()),
+                                        fixed,
                                         "dialog mapped"
                                     );
                                     state.mapped_dialogs.push(crate::DialogWindow {
                                         surface: surface.downgrade(),
-                                        parent: parent.downgrade(),
+                                        parent: dialog_parent
+                                            .as_ref()
+                                            .map(|s| s.downgrade()),
                                         workspace: state.active_ws,
+                                        position: None,
                                     });
                                 } else {
                                     tracing::info!(id = ?surface.id(), "toplevel mapped");
