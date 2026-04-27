@@ -553,13 +553,23 @@ impl State {
         use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
         use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::KeyboardInteractivity;
 
-        // A new toplevel mapping means the user wanted to bring up
-        // another window, which they can't see while one tile is
-        // taking the whole screen. Drop zoom / fullscreen so the
-        // layout reshuffles and the new tile is actually visible.
-        // No-ops when neither mode is active.
-        self.zoomed = None;
-        self.fullscreened = None;
+        // A new TILE mapping means the user wanted to bring up
+        // another window in the layout, which they can't see while
+        // one tile is taking the whole screen — drop zoom /
+        // fullscreen so the layout reshuffles and the new tile is
+        // actually visible. Floats (dialogs, splash screens, etc.)
+        // are explicitly NOT a layout change: a save prompt over a
+        // fullscreened editor should keep the editor fullscreen and
+        // float on top, since the dialog is a continuation of the
+        // user's interaction with that window, not a separate one.
+        let is_float = self
+            .mapped_dialogs
+            .iter()
+            .any(|d| d.surface.upgrade().ok().as_ref() == Some(surface));
+        if !is_float {
+            self.zoomed = None;
+            self.fullscreened = None;
+        }
 
         let screen = Rect {
             x: 0,
