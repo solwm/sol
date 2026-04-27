@@ -278,6 +278,13 @@ pub struct State {
     /// focus or move direction command, and automatically if the
     /// zoomed surface dies.
     pub zoomed: Option<Weak<WlSurface>>,
+    /// If Some, the tile currently fullscreened to the raw output
+    /// rect — no outer gaps, no border, no rounded corners, drawn
+    /// above Top-layer surfaces so it covers waybar etc. Overlay
+    /// layers (lockscreen, OSD) still draw on top. Mutually
+    /// exclusive with `zoomed`: toggling either clears the other.
+    /// Same lifecycle rules as `zoomed`.
+    pub fullscreened: Option<Weak<WlSurface>>,
     /// Keys of texture cache entries the DRM presenter should evict on
     /// the next render tick. Filled by `Dispatch<WlBuffer, _>::Destroy`
     /// handlers when a client tears down a buffer; drained (and acted
@@ -907,6 +914,28 @@ fn apply_layout(state: &mut State, now: Instant) {
 
     let active_ws = state.active_ws;
 
+    // Fullscreen overrides everything else: the focused tile
+    // expands to the raw output rect (no outer gaps, no usable-area
+    // shrink — this is the path that hides waybar). collect_scene
+    // skips other tiles while fullscreen is active. Same workspace
+    // rules as zoom: if the fullscreened surface isn't on the
+    // active workspace, treat fullscreen as cleared.
+    if let Some(fs) = state.fullscreened.as_ref().and_then(|w| w.upgrade().ok()) {
+        let exists = state
+            .mapped_toplevels
+            .iter_mut()
+            .find(|w| {
+                w.workspace == active_ws
+                    && w.surface.upgrade().ok().as_ref() == Some(&fs)
+            })
+            .map(|w| set_target_rect(w, screen, now))
+            .is_some();
+        if exists {
+            return;
+        }
+        state.fullscreened = None;
+    }
+
     // Zoom overrides the tile layout: the zoomed window gets the
     // full inner area and we short-circuit before running
     // master-stack. Other windows keep their last-known rects
@@ -1168,6 +1197,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
     // to whatever intermediate size we ask for — that's what makes
     // the layout transition read as motion rather than a snap.
     let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
+    let fullscreened = state.fullscreened.as_ref().and_then(|w| w.upgrade().ok());
     let crossfade = workspace_anim_alphas(state, now);
     let active_ws = state.active_ws;
     let focused = state.keyboard_focus.clone();
@@ -1185,6 +1215,13 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
             let Ok(surface) = win.surface.upgrade() else { continue };
             if let Some(zs) = &zoomed {
                 if surface != *zs {
+                    continue;
+                }
+            }
+            // Fullscreen tile is drawn separately, above Top-layer
+            // surfaces, so it can cover waybar etc. Skip it here.
+            if let Some(fs) = &fullscreened {
+                if surface == *fs {
                     continue;
                 }
             }
@@ -1262,12 +1299,69 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
         emit_for_ws(&mut out, active_ws, 1.0);
     }
 
-    // 2b. Mapped xdg_popups. Stacked over toplevels in creation
-    // order so a submenu opened from a context menu sits over its
-    // parent. Each popup's screen origin is its parent's render
-    // origin plus the popup's surface-local offset (computed from
-    // xdg_positioner at GetPopup time). Subsurface trees beneath a
-    // popup recurse the same way as toplevels.
+    // 3. Top layer surfaces. Emitted before any fullscreen tile so
+    // a fullscreened toplevel can cover them — taskbars / launchers
+    // belong above tiled toplevels but below a "give me the whole
+    // screen" tile.
+    for ml in &layers {
+        if matches!(ml.layer, Layer::Top) {
+            let vsrc = surface_viewport_src(&ml.surface);
+            let r: RectF = ml.rect.into();
+            out.push(Placed::Buffer {
+                buf: ml.buffer.clone(),
+                rect: r,
+                vsrc,
+                alpha: 1.0,
+                corner_radius: 0.0,
+            });
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
+        }
+    }
+
+    // 4. Fullscreen tile, if any. Drawn above Top-layer surfaces so
+    // it covers them visually, but below Overlay (lockscreen / OSD
+    // stay on top of everything). No backdrop, no rounded corners,
+    // alpha 1.0 — this is the "raw real estate" path. The client
+    // doesn't know it's fullscreen at the protocol level; we just
+    // configured it at screen size.
+    if let Some(fs) = &fullscreened {
+        if let Some(win) = state
+            .mapped_toplevels
+            .iter()
+            .find(|w| w.surface.upgrade().ok().as_ref() == Some(fs))
+        {
+            if let Some(sd_arc) = fs.data::<Arc<Mutex<SurfaceData>>>() {
+                let (buf, vsrc) = {
+                    let sd = sd_arc.lock().unwrap();
+                    (sd.current.buffer.clone(), sd.viewport_src)
+                };
+                if let Some(buf) = buf {
+                    out.push(Placed::Buffer {
+                        buf,
+                        rect: win.render_rect,
+                        vsrc,
+                        alpha: 1.0,
+                        corner_radius: 0.0,
+                    });
+                }
+                emit_subsurface_tree(
+                    &mut out,
+                    fs,
+                    win.render_rect.x,
+                    win.render_rect.y,
+                    1.0,
+                );
+            }
+        }
+    }
+
+    // 5. Mapped xdg_popups. Stacked above tiled toplevels, Top
+    // layers, and any fullscreen tile so a context menu in a
+    // fullscreened browser still appears in front of its content.
+    // Each popup's screen origin is its parent's render origin plus
+    // the popup's surface-local offset (computed from xdg_positioner
+    // at GetPopup time). Subsurface trees beneath a popup recurse
+    // the same way as toplevels.
     for popup in &state.mapped_popups {
         let Ok(surface) = popup.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
@@ -1305,9 +1399,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
         emit_subsurface_tree(&mut out, &surface, popup_x, popup_y, 1.0);
     }
 
-    // 3. Top + Overlay layer surfaces.
+    // 6. Overlay layer surfaces — always on top, even of fullscreen.
     for ml in &layers {
-        if matches!(ml.layer, Layer::Top | Layer::Overlay) {
+        if matches!(ml.layer, Layer::Overlay) {
             let vsrc = surface_viewport_src(&ml.surface);
             let r: RectF = ml.rect.into();
             out.push(Placed::Buffer {
@@ -1946,10 +2040,12 @@ fn focus_direction(state: &mut State, dir: config::Direction) {
     let Ok(target) = state.mapped_toplevels[n].surface.upgrade() else {
         return;
     };
-    // Moving focus while zoomed would leave the user looking at a
-    // hidden tile, so drop zoom before shifting focus. Explicit
-    // Alt+Tab is the only path to re-zoom on the new window.
+    // Moving focus while zoomed/fullscreened would leave the user
+    // looking at a hidden tile, so drop both modes before shifting
+    // focus. Explicit Alt+Tab / Ctrl+Tab is the only path to re-
+    // enter on the new window.
     state.zoomed = None;
+    state.fullscreened = None;
     state.set_keyboard_focus(Some(target));
     // Border follows focus, so trigger a redraw.
     state.needs_render = true;
@@ -1968,8 +2064,10 @@ fn move_direction(state: &mut State, dir: config::Direction) {
         return;
     };
     // Same reasoning as focus_direction: rearranging the tile layout
-    // while zoom hides everything but one tile would be confusing.
+    // while zoom/fullscreen hides everything but one tile would be
+    // confusing.
     state.zoomed = None;
+    state.fullscreened = None;
     state.mapped_toplevels.swap(idx, n);
     state.needs_render = true;
 }
@@ -2019,6 +2117,40 @@ fn toggle_zoom(state: &mut State) {
         .as_ref()
         == Some(focus);
     state.zoomed = if already_zoomed { None } else { Some(focus.downgrade()) };
+    // Zoom and fullscreen are mutually exclusive — entering either
+    // one clears the other so the user only ever has one
+    // "spotlight" mode in flight.
+    state.fullscreened = None;
+    state.needs_render = true;
+}
+
+/// Ctrl+Tab handler (configurable): toggle fullscreen on the
+/// focused tile. Unlike zoom this gives the tile the raw output
+/// rect — no outer gaps, no border, no rounded corners — and
+/// renders it above Top-layer surfaces so it covers waybar etc.
+/// Overlay-layer surfaces (lockscreens, OSD) still draw on top.
+/// We do NOT send `xdg_toplevel.set_fullscreen` to the client, so
+/// it doesn't enter its own fullscreen UI mode (Chrome's controls
+/// stay visible, etc.); the client just receives a screen-sized
+/// configure.
+fn toggle_fullscreen(state: &mut State) {
+    let Some(focus) = state.keyboard_focus.as_ref() else { return };
+    if !state
+        .mapped_toplevels
+        .iter()
+        .any(|w| w.surface.upgrade().ok().as_ref() == Some(focus))
+    {
+        return;
+    }
+    let already = state
+        .fullscreened
+        .as_ref()
+        .and_then(|w| w.upgrade().ok())
+        .as_ref()
+        == Some(focus);
+    state.fullscreened = if already { None } else { Some(focus.downgrade()) };
+    // Mutually exclusive with zoom — see toggle_zoom.
+    state.zoomed = None;
     state.needs_render = true;
 }
 
@@ -2053,6 +2185,7 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
     tracing::info!(from = old, to = n, "workspace switch");
     state.active_ws = n;
     state.zoomed = None;
+    state.fullscreened = None;
     ext_workspace::notify_active_changed(state, old, n);
     // Windows coming back into view get the "first-frame" treatment
     // in `tick_animations` — render_rect.w/h == 0 means "snap to the
@@ -2144,8 +2277,9 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
         // toplevel — nothing to move.
         return;
     }
-    // If the moved window was zoomed, zoom goes with it semantically
-    // (it's cleared on the next switch anyway).
+    // If the moved window was zoomed/fullscreened, the mode
+    // semantically goes with it but is cleared on the next switch
+    // anyway, so just drop it now.
     let was_zoomed = state
         .zoomed
         .as_ref()
@@ -2154,6 +2288,15 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
         == Some(&focus);
     if was_zoomed {
         state.zoomed = None;
+    }
+    let was_fullscreen = state
+        .fullscreened
+        .as_ref()
+        .and_then(|w| w.upgrade().ok())
+        .as_ref()
+        == Some(&focus);
+    if was_fullscreen {
+        state.fullscreened = None;
     }
     // Focus falls to the topmost remaining window on the current
     // (source) workspace.
@@ -2183,6 +2326,18 @@ fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
     let Some(focus) = state.keyboard_focus.as_ref() else {
         return Vec::new();
     };
+    // Fullscreen suppresses the border — the whole point of the mode
+    // is "raw real estate", and a yellow ring around the perimeter
+    // would defeat that.
+    if state
+        .fullscreened
+        .as_ref()
+        .and_then(|w| w.upgrade().ok())
+        .as_ref()
+        == Some(focus)
+    {
+        return Vec::new();
+    }
     let Some(win) = state
         .mapped_toplevels
         .iter()
@@ -2709,6 +2864,7 @@ fn setup_event_loop(
         right_super_down: false,
         config: cfg,
         zoomed: None,
+        fullscreened: None,
         flip_counter: 0,
         flip_counter_reset: None,
         pending_presentation: presentation_time::empty(),
@@ -2999,6 +3155,9 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                         config::Action::MoveDir(dir) => {
                             move_direction(state, dir);
                         }
+                        config::Action::ToggleFullscreen => {
+                            toggle_fullscreen(state);
+                        }
                         config::Action::ToggleZoom => {
                             toggle_zoom(state);
                         }
@@ -3202,20 +3361,45 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         }
     }
 
-    // Pass 1: Overlay > Top. Iterate overlay-first (descending priority).
-    for ml in layers
-        .iter()
-        .filter(|m| matches!(m.layer, Layer::Overlay))
-        .chain(layers.iter().filter(|m| matches!(m.layer, Layer::Top)))
-    {
+    // Pass 1a: Overlay layers. Always topmost (lockscreen / OSD must
+    // catch clicks even with a fullscreened tile underneath).
+    for ml in layers.iter().filter(|m| matches!(m.layer, Layer::Overlay)) {
         if let Some((lx, ly)) = hit_rect(ml.rect) {
             return Some(resolve_hit(ml.surface.clone(), lx, ly));
         }
     }
 
-    // Pass 2: tiled toplevels (top of stack first). Honor zoom: while
-    // zoomed, the non-zoomed tiles don't render and mustn't catch
-    // clicks either.
+    // Pass 1b: a fullscreened tile, if any. Drawn above Top layers
+    // in the render pass, so the click model has to match — clicking
+    // the area where waybar would normally sit must reach the
+    // fullscreen content.
+    let fullscreened = state.fullscreened.as_ref().and_then(|w| w.upgrade().ok());
+    if let Some(fs) = &fullscreened {
+        if let Some(win) = state.mapped_toplevels.iter().find(|w| {
+            w.surface.upgrade().ok().as_ref() == Some(fs)
+                && w.workspace == state.active_ws
+        }) {
+            if let Some((lx, ly)) = hit_rect(win.render_rect.round()) {
+                return Some(resolve_hit(fs.clone(), lx, ly));
+            }
+        }
+    }
+
+    // Pass 1c: Top layers. Skipped while a fullscreen tile is active —
+    // they're visually covered, so clicks on the area where waybar
+    // sits should fall through to the fullscreen tile (handled
+    // above), not the now-invisible bar.
+    if fullscreened.is_none() {
+        for ml in layers.iter().filter(|m| matches!(m.layer, Layer::Top)) {
+            if let Some((lx, ly)) = hit_rect(ml.rect) {
+                return Some(resolve_hit(ml.surface.clone(), lx, ly));
+            }
+        }
+    }
+
+    // Pass 2: tiled toplevels (top of stack first). Honor zoom and
+    // fullscreen: while either is active, only that one tile can
+    // catch clicks; the others aren't rendered.
     let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     for win in state.mapped_toplevels.iter().rev() {
         if win.workspace != state.active_ws {
@@ -3226,6 +3410,12 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
             if surface != *zs {
                 continue;
             }
+        }
+        if fullscreened.is_some() {
+            // Fullscreen was already hit-tested above; skip the
+            // generic tile pass entirely so non-fullscreen tiles
+            // don't catch clicks they can't visually receive.
+            continue;
         }
         let sd_arc = match surface.data::<Arc<Mutex<SurfaceData>>>() {
             Some(s) => s,
