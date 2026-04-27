@@ -184,6 +184,14 @@ pub struct Window {
     /// rather than from a corner.
     pub render_scale: f32,
     pub vel_scale: f32,
+    /// Alpha multiplier for this tile's focus-border ring. Springs
+    /// to `1.0` while the tile is the focused tile (and not
+    /// fullscreened), to `0.0` otherwise — so focus changes
+    /// produce a cross-fade between the old and new border instead
+    /// of an instant swap. Initial `0.0` so newly mapped tiles
+    /// fade their border in alongside the open animation.
+    pub border_alpha: f32,
+    pub vel_border_alpha: f32,
     /// Most recent `(width, height)` configured to the client via
     /// `xdg_toplevel.configure`. Cached so steady-state render
     /// ticks don't re-send configures when the layout target's
@@ -945,6 +953,11 @@ pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
                 vel_alpha: 0.0,
                 render_scale: 1.0,
                 vel_scale: 0.0,
+                // Promoted dialog → tile: skip the open border-fade
+                // for the same reason as alpha/scale (already on
+                // screen).
+                border_alpha: 1.0,
+                vel_border_alpha: 0.0,
                 pending_size: None,
                 pending_layout: false,
                 workspace: dlg.workspace,
@@ -2441,6 +2454,12 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
     const POS_EPS: f32 = 0.5;
     const VEL_EPS: f32 = 0.5;
 
+    // Snapshot focus + fullscreen state for the border-alpha
+    // target lookup inside the loop; doing it once up here means
+    // the per-window check is a couple of cheap pointer compares.
+    let focus = state.keyboard_focus.clone();
+    let fullscreened = state.fullscreened.as_ref().and_then(|w| w.upgrade().ok());
+
     let mut any_active = false;
 
     for win in state.mapped_toplevels.iter_mut() {
@@ -2488,9 +2507,31 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         // values live in [0, 1] — half-a-pixel doesn't translate
         // here.
         const ALPHA_EPS: f32 = 0.005;
+        // Border-alpha target: 1.0 only for the focused, non-
+        // fullscreened tile. Fullscreen suppresses the ring (the
+        // mode is "raw real estate"), and unfocused tiles fade
+        // their ring out. Computed inline because we need access
+        // to the focus / fullscreen snapshots above.
+        let surface_alive = win.surface.upgrade().ok();
+        let is_focused = focus
+            .as_ref()
+            .zip(surface_alive.as_ref())
+            .map(|(f, s)| f == s)
+            .unwrap_or(false);
+        let is_fullscreened = fullscreened
+            .as_ref()
+            .zip(surface_alive.as_ref())
+            .map(|(f, s)| f == s)
+            .unwrap_or(false);
+        let border_target = if is_focused && !is_fullscreened {
+            1.0_f32
+        } else {
+            0.0_f32
+        };
         for (cur, vel, tgt) in [
             (&mut win.render_alpha, &mut win.vel_alpha, 1.0_f32),
             (&mut win.render_scale, &mut win.vel_scale, 1.0_f32),
+            (&mut win.border_alpha, &mut win.vel_border_alpha, border_target),
         ] {
             let force = (tgt - *cur) * stiffness;
             let damp = -*vel * damping;
@@ -2604,10 +2645,17 @@ fn has_active_animation(state: &State) -> bool {
     const POS_EPS: f32 = 0.5;
     const VEL_EPS: f32 = 0.5;
     const A_EPS: f32 = 0.005;
+    let focus = state.keyboard_focus.clone();
+    let fullscreened = state.fullscreened.as_ref().and_then(|w| w.upgrade().ok());
     state.mapped_toplevels.iter().any(|w| {
         let target: RectF = w.rect.into();
         let r = w.render_rect;
         let v = w.velocity;
+        // Border-alpha target, mirroring tick_animations.
+        let surf = w.surface.upgrade().ok();
+        let is_focused = focus.as_ref().zip(surf.as_ref()).map(|(f, s)| f == s).unwrap_or(false);
+        let is_fs = fullscreened.as_ref().zip(surf.as_ref()).map(|(f, s)| f == s).unwrap_or(false);
+        let border_target = if is_focused && !is_fs { 1.0 } else { 0.0 };
         (target.x - r.x).abs() > POS_EPS
             || (target.y - r.y).abs() > POS_EPS
             || (target.w - r.w).abs() > POS_EPS
@@ -2620,6 +2668,8 @@ fn has_active_animation(state: &State) -> bool {
             || w.vel_alpha.abs() > A_EPS
             || (1.0 - w.render_scale).abs() > A_EPS
             || w.vel_scale.abs() > A_EPS
+            || (border_target - w.border_alpha).abs() > A_EPS
+            || w.vel_border_alpha.abs() > A_EPS
     })
 }
 
@@ -3181,58 +3231,52 @@ fn move_focused_to_workspace(state: &mut State, n: u32) {
     tracing::info!(to_ws = n, "moved focused window to workspace");
 }
 
-/// Build four thin rects outlining the keyboard-focused toplevel's
-/// tile — the visual cue for "this is where typing goes." Empty vec
-/// if no toplevel is focused, if the border is disabled
-/// (`border_width = 0`), or if the focused surface isn't a mapped
-/// toplevel (popup focus, layer-surface focus, etc. — those don't
-/// get a tile border).
+/// Emit one rounded-ring border per visible tile, modulated by
+/// each window's `border_alpha` spring. Focus changes show up as
+/// a cross-fade between the old and the new ring instead of an
+/// instant swap; tiles whose alpha has decayed below an invisible
+/// threshold are skipped so the renderer doesn't spend cycles on
+/// fully-transparent quads.
+///
+/// Empty vec if `border_width = 0` (config-disabled) or no tile on
+/// the active workspace currently has a non-zero border alpha
+/// (initial state, or steady-state with focus on a layer surface
+/// / popup / fullscreened tile). Fullscreen is enforced by the
+/// per-tile `border_alpha` target in `tick_animations`, not here:
+/// the spring drives the fullscreened tile's alpha toward 0 so the
+/// transition into and out of fullscreen reads as a fade.
 fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
     let bw = state.config.border_width;
     if bw <= 0 {
         return Vec::new();
     }
-    let Some(focus) = state.keyboard_focus.as_ref() else {
-        return Vec::new();
-    };
-    // Fullscreen suppresses the border — the whole point of the mode
-    // is "raw real estate", and a yellow ring around the perimeter
-    // would defeat that.
-    if state
-        .fullscreened
-        .as_ref()
-        .and_then(|w| w.upgrade().ok())
-        .as_ref()
-        == Some(focus)
-    {
-        return Vec::new();
+    const ALPHA_EPS: f32 = 0.005;
+    let active_ws = state.active_ws;
+    let mut out = Vec::new();
+    for win in state.mapped_toplevels.iter() {
+        if win.workspace != active_ws {
+            continue;
+        }
+        if win.border_alpha <= ALPHA_EPS {
+            continue;
+        }
+        // Same scale-about-center the buffer pass uses, so the
+        // ring tracks the tile's open / fullscreen-toggle scale
+        // animation instead of floating where the tile used to be.
+        let r = scale_about_center(win.render_rect, win.render_scale);
+        let mut rgba = state.config.border_color;
+        rgba[3] *= win.border_alpha;
+        out.push(sol_core::SceneBorder {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+            rgba,
+            corner_radius: state.config.corner_radius as f32,
+            border_width: bw as f32,
+        });
     }
-    let Some(win) = state
-        .mapped_toplevels
-        .iter()
-        .find(|ww| {
-            ww.workspace == state.active_ws
-                && ww.surface.upgrade().ok().as_ref() == Some(focus)
-        })
-    else {
-        return Vec::new();
-    };
-    // Border tracks what's actually on screen, so it uses render_rect
-    // and stays visually glued to the tile during resize transitions.
-    // Sub-pixel rect: the rounded-ring fragment shader does its own
-    // SDF-based AA so we don't need to round. One full-window quad;
-    // the shader masks alpha to just the ring band, with the same
-    // corner_radius as the window content.
-    let r = win.render_rect;
-    vec![sol_core::SceneBorder {
-        x: r.x,
-        y: r.y,
-        w: r.w,
-        h: r.h,
-        rgba: state.config.border_color,
-        corner_radius: state.config.corner_radius as f32,
-        border_width: bw as f32,
-    }]
+    out
 }
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {

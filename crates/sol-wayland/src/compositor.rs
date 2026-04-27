@@ -376,6 +376,8 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                         vel_alpha: 0.0,
                                         render_scale: 0.7,
                                         vel_scale: 0.0,
+                                        border_alpha: 0.0,
+                                        vel_border_alpha: 0.0,
                                         pending_size: None,
                                         pending_layout: false,
                                         workspace: state.active_ws,
