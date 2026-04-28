@@ -532,14 +532,16 @@ fn build_with_fs(
 }
 
 unsafe fn compile(gl: &glow::Context, kind: u32, src: &str) -> Result<glow::NativeShader> {
-    let s = gl.create_shader(kind).map_err(|e| anyhow!("create_shader: {e}"))?;
-    gl.shader_source(s, src);
-    gl.compile_shader(s);
-    if !gl.get_shader_compile_status(s) {
-        let log = gl.get_shader_info_log(s);
-        return Err(anyhow!("shader compile: {log}"));
+    unsafe {
+        let s = gl.create_shader(kind).map_err(|e| anyhow!("create_shader: {e}"))?;
+        gl.shader_source(s, src);
+        gl.compile_shader(s);
+        if !gl.get_shader_compile_status(s) {
+            let log = gl.get_shader_info_log(s);
+            return Err(anyhow!("shader compile: {log}"));
+        }
+        Ok(s)
     }
-    Ok(s)
 }
 
 fn bytes_of_f32(f: &[f32]) -> &[u8] {

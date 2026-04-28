@@ -197,17 +197,13 @@ impl Dispatch<ExtWorkspaceHandleV1, WorkspaceData> for crate::State {
         _dh: &DisplayHandle,
         _init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            ext_workspace_handle_v1::Request::Activate => {
-                // Route through the normal switch path so keyboard
-                // focus, pointer focus, and zoom get the same
-                // treatment as a keybind-driven switch. notify fires
-                // from inside switch_workspace.
-                crate::switch_workspace(state, data.number);
-            }
-            // We don't advertise deactivate/assign/remove caps, so
-            // these requests are per-spec ignored.
-            _ => {}
+        // Route through the normal switch path so keyboard focus,
+        // pointer focus, and zoom get the same treatment as a
+        // keybind-driven switch. notify fires from inside
+        // switch_workspace. Deactivate/assign/remove caps aren't
+        // advertised, so other requests are per-spec ignored.
+        if let ext_workspace_handle_v1::Request::Activate = request {
+            crate::switch_workspace(state, data.number);
         }
     }
 }

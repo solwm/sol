@@ -33,7 +33,7 @@ pub const LAYER_SHELL_VERSION: u32 = 4;
 /// Double-buffered portion of a layer surface's own state. The spec
 /// requires everything set via `set_*` requests to be latched on
 /// `wl_surface.commit`, not on the request itself.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LayerState {
     pub size: (u32, u32),
     /// Anchor bitfield — `top|bottom|left|right` per the anchor enum.
@@ -44,18 +44,6 @@ pub struct LayerState {
     pub layer: u32,
 }
 
-impl Default for LayerState {
-    fn default() -> Self {
-        Self {
-            size: (0, 0),
-            anchor: 0,
-            margin: (0, 0, 0, 0),
-            exclusive_zone: 0,
-            keyboard_interactivity: 0,
-            layer: 0,
-        }
-    }
-}
 
 /// User-data for a live `zwlr_layer_surface_v1` resource.
 pub struct LayerSurfaceData {
@@ -78,8 +66,10 @@ pub struct LayerSurfaceInner {
 
 impl LayerSurfaceInner {
     fn new(initial_layer: u32) -> Self {
-        let mut pending = LayerState::default();
-        pending.layer = initial_layer;
+        let pending = LayerState {
+            layer: initial_layer,
+            ..LayerState::default()
+        };
         let current = pending.clone();
         Self {
             pending,
@@ -301,20 +291,17 @@ pub fn compute_layer_rect(current: &LayerState, screen: crate::Rect) -> crate::R
         screen.h / 4
     };
 
-    // X position: anchor determines which edge drives it; margin offsets
-    // inward from that edge.
-    let x = if a & LEFT != 0 && a & RIGHT != 0 {
-        screen.x + m_l
-    } else if a & LEFT != 0 {
+    // X position: anchor determines which edge drives it; margin
+    // offsets inward from that edge. LEFT (alone or paired with
+    // RIGHT for full-width anchoring) drives from the left edge.
+    let x = if a & LEFT != 0 {
         screen.x + m_l
     } else if a & RIGHT != 0 {
         screen.x + screen.w - w - m_r
     } else {
         screen.x + (screen.w - w) / 2
     };
-    let y = if a & TOP != 0 && a & BOTTOM != 0 {
-        screen.y + m_t
-    } else if a & TOP != 0 {
+    let y = if a & TOP != 0 {
         screen.y + m_t
     } else if a & BOTTOM != 0 {
         screen.y + screen.h - h - m_b

@@ -8,6 +8,8 @@
 //! Must run from a VT where nothing else holds DRM master. Switch to a free
 //! TTY (Ctrl+Alt+F2..F6) before running.
 
+#![allow(clippy::collapsible_if)]
+
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd};

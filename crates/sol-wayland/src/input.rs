@@ -148,7 +148,7 @@ impl InputState {
             tracing::warn!(error = ?e, "libinput dispatch");
             return out;
         }
-        while let Some(ev) = self.li.next() {
+        for ev in self.li.by_ref() {
             match ev {
                 LiEvent::Pointer(p) => match p {
                     PointerEvent::Motion(m) => out.push(InputEvent::PointerMotion {

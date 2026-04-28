@@ -4,6 +4,17 @@
 //! `BackendState` value (software canvas -> PNG for headless, or a
 //! `sol_backend_drm::DrmPresenter` for real hardware).
 
+// `collapsible_if` produces long `&& let Some(x) = ...` chains that
+// hurt readability for the protocol-dispatch style this crate uses.
+// `collapsible_match` rewrites legible nested matches into denser if
+// lets that obscure intent. `too_many_arguments` fires on the few
+// rendering helpers where threading state through is intentional.
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::too_many_arguments
+)]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -867,10 +878,13 @@ impl ClientData for ClientState {
 }
 
 /// Backend-specific render target. Chosen at startup; does not switch at
-/// runtime.
+/// runtime. `DrmPresenter` is boxed because it carries the GBM /
+/// EGL / texture-cache state and is a couple of orders of magnitude
+/// larger than the headless canvas — without the box every
+/// `BackendState`-shaped local would carry that fixed overhead.
 pub enum BackendState {
     Headless { canvas: Canvas, png_path: PathBuf },
-    Drm(DrmPresenter),
+    Drm(Box<DrmPresenter>),
 }
 
 impl BackendState {
@@ -2946,7 +2960,7 @@ fn neighbor_in_direction(
             Direction::Left | Direction::Right => dx.abs() + 2 * dy.abs(),
             Direction::Up | Direction::Down => dy.abs() + 2 * dx.abs(),
         };
-        if best.map_or(true, |(_, s)| score < s) {
+        if best.is_none_or(|(_, s)| score < s) {
             best = Some((i, score));
         }
     }
@@ -4692,10 +4706,13 @@ fn hit_subsurfaces(
     lx: f64,
     ly: f64,
 ) -> Option<(WlSurface, f64, f64)> {
+    // (child surface, parent-relative offset, buffer dims).
+    type Child = (WlSurface, (i32, i32), (i32, i32));
+
     let sd_arc = parent.data::<Arc<Mutex<SurfaceData>>>()?;
     // Snapshot children while holding the parent lock only briefly;
     // recurse outside so child locks don't nest.
-    let children: Vec<(WlSurface, (i32, i32), (i32, i32))> = {
+    let children: Vec<Child> = {
         let sd = sd_arc.lock().ok()?;
         sd.subsurface_children
             .iter()
@@ -5202,7 +5219,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
         }
     };
     setup_event_loop(
-        BackendState::Drm(presenter),
+        BackendState::Drm(Box::new(presenter)),
         w,
         h,
         refresh_mhz,

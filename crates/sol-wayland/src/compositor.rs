@@ -112,9 +112,9 @@ pub struct SurfaceData {
     pub xdg_popup: Option<Weak<XdgPopup>>,
     /// For surfaces with role=XdgPopup: weak ref to the parent surface
     /// the popup is anchored to (a toplevel or another popup). Used to
-    /// compute the popup's screen-space origin (parent's render origin
-    /// + popup_offset) and to walk up the chain when dismissing
-    /// nested popup grabs.
+    /// compute the popup's screen-space origin (parent's render
+    /// origin plus popup_offset) and to walk up the chain when
+    /// dismissing nested popup grabs.
     pub xdg_popup_parent: Option<Weak<WlSurface>>,
     /// Set by `xdg_toplevel.set_parent`. When `Some` at first map
     /// time, this toplevel is treated as a dialog/transient: it
@@ -147,6 +147,7 @@ pub struct SurfaceData {
     ///   adding `(geom.x, geom.y)` to the in-rect offset so the
     ///   client highlights the item the user is actually pointing
     ///   at.
+    ///
     /// `None` → treat as `(0, 0, buffer_w, buffer_h)`.
     pub xdg_window_geometry: Option<(i32, i32, i32, i32)>,
     /// For surfaces with role=Subsurface: weak ref to the parent the
