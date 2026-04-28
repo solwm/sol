@@ -420,6 +420,34 @@ impl DrmPresenter {
         self.card
             .set_property(self.sel.connector, handle, value)
             .context("drm set DPMS")?;
+
+        // On wake, also re-apply the modeset using the last bo that
+        // was on screen. Some monitor / driver combinations (DP +
+        // long DPMS_OFF in particular, especially with nvidia)
+        // don't re-train the link on a bare DPMS=ON; the display
+        // stays at "no signal" until a real modeset re-arms the
+        // CRTC. Without this, the user's only recovery is a VT
+        // round-trip (Ctrl+Alt+F2 → F3), since libseat's
+        // drop-/reacquire-master cycle implicitly re-modesets via
+        // `reacquire_master`. set_crtc with the already-active
+        // mode + connector + fb is idempotent on hardware that
+        // doesn't need it, so adding it costs nothing for the
+        // happy path.
+        if !blank {
+            if let Some(bo) = self.scanned_out.as_ref() {
+                let fb = crate::get_or_add_fb(&self.card, bo, &mut self.fb_cache)?;
+                self.card
+                    .set_crtc(
+                        self.sel.crtc,
+                        Some(fb),
+                        (0, 0),
+                        &[self.sel.connector],
+                        Some(self.sel.mode),
+                    )
+                    .context("re-apply modeset on DPMS wake")?;
+            }
+        }
+
         tracing::info!(dpms_off = blank, "set DPMS");
         Ok(())
     }
