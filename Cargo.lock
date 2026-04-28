@@ -642,7 +642,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "sol"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "sol-wayland",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "sol-backend-drm"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "drm",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "sol-core"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "sol-wayland"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "calloop",

@@ -1,13 +1,13 @@
 # sol
 
-A small Wayland tiling compositor written in Rust. Master-stack layout, vim-like keybinds, animated tile transitions, and a frosted-glass effect for inactive windows.
+A small Wayland tiling compositor written in Rust. Master-stack layout, vim-like keybinds, spring-physics tile animations, frosted-glass dim for inactive windows, and rounded corners.
 
-Status: a working daily driver for the author's setup (DRM/GBM/GLES on Linux). Not packaged, not tested broadly. Expect rough edges.
+Status: working daily driver for the author's setup (DRM/GBM/GLES on Linux). Not packaged, not broadly tested. Expect rough edges.
 
 ## Backends
 
 - **DRM** — real hardware via libseat + libinput + GBM/EGL/GLES2. Run from a free TTY.
-- **Headless** — software canvas that dumps each frame as a PNG. Useful for development and sanity-checking the protocol layer without a graphics stack.
+- **Headless** — software canvas that dumps each frame as a PNG. For development and sanity-checking the protocol layer without a graphics stack.
 
 ## Build
 
@@ -15,11 +15,11 @@ Status: a working daily driver for the author's setup (DRM/GBM/GLES on Linux). N
 cargo build --release
 ```
 
-System libraries needed: `libdrm`, `libinput`, `libxkbcommon`, `libseat`, `libegl1`, `libgbm`. seatd or systemd-logind must be running so the binary can take a session without root.
+System libraries: `libdrm`, `libinput`, `libxkbcommon`, `libseat`, `libegl1`, `libgbm`. seatd or systemd-logind must be running so the binary can take a session without root.
 
 ## Run
 
-DRM, from a free VT (Ctrl+Alt+F3 for example):
+DRM, from a free VT (e.g. Ctrl+Alt+F3):
 
 ```sh
 ./target/release/sol --backend=drm
@@ -35,7 +35,7 @@ VT switching: `Ctrl+Alt+F1`–`F12` is hardcoded and intentionally not overridab
 
 ## Config
 
-`$XDG_CONFIG_HOME/sol/sol.conf` (or `~/.config/sol/sol.conf`). Format and full key list are documented at the top of [`crates/sol-wayland/src/config.rs`](crates/sol-wayland/src/config.rs). The file is watched at runtime — saves re-apply gaps, borders, idle timeout, keybinds, and remaps without a restart.
+`$XDG_CONFIG_HOME/sol/sol.conf` (or `~/.config/sol/sol.conf`). Format and full key list are documented at the top of [`crates/sol-wayland/src/config.rs`](crates/sol-wayland/src/config.rs). The file is watched at runtime — saves re-apply gaps, borders, idle timeout, keybinds, remaps, spring tuning, and the inactive-window blur live, without a restart.
 
 ## Default keybinds
 
@@ -44,13 +44,25 @@ VT switching: `Ctrl+Alt+F1`–`F12` is hardcoded and intentionally not overridab
 | `Alt+Return` | spawn alacritty |
 | `Alt+D` | spawn rofi (drun) |
 | `Alt+H/J/K/L` | move keyboard focus |
-| `Alt+Ctrl+H/J/K/L` | swap the focused tile with its neighbour |
-| `Alt+Tab` | toggle zoom (focused tile fills usable area) |
-| `Alt+Q` | close focused window (`xdg_toplevel.close`) |
-| `Alt+1`…`9` | switch to workspace N |
-| `Alt+Shift+1`…`9` | move focused window to workspace N |
+| `Ctrl+Alt+H/J/K/L` | move the focused tile through the layout |
+| `Alt+Tab` | toggle zoom (focused tile fills the usable area, gaps respected) |
+| `Ctrl+Tab` | toggle fullscreen (covers waybar, no gaps, no border, no rounded corners) |
+| `Alt+R` | modal resize: `H`/`L` adjust the master split, `Esc` exits |
+| `Alt+Q` | close focused window |
+| `Alt+Y/U/I/O/P` | switch to workspace 1..5 |
+| `Ctrl+Alt+Y/U/I/O/P` | move focused window to workspace 1..5 |
+| `Super+Left-drag` | move floating windows that don't implement `xdg_toplevel.move` |
 
-CapsLock is remapped to Escape by default. All of the above is overridable in `sol.conf`.
+Zoom and fullscreen are remembered per workspace — leaving and returning restores the same view. CapsLock is remapped to Escape by default. All bindings are overridable in `sol.conf`.
+
+## Animations
+
+Per-tile motion is spring-driven (no time-based tweens): each of `x`, `y`, `w`, `h`, plus an alpha and scale spring for open / close fades, and a border-alpha spring for focus changes. Knobs in `sol.conf`:
+
+- `spring_stiffness` / `spring_damping` — base layout spring.
+- `spring_stiffness_vertical` / `spring_damping_vertical` — override for the y/h axes (right-stack reorders).
+- `spring_stiffness_swap` / `spring_damping_swap` — dedicated spring while two stack tiles trade places.
+- `spring_stiffness_fade` / `spring_damping_fade` — open / close fade-in-out, plus the maximize crossfade.
 
 ## Implemented protocols
 
@@ -61,7 +73,7 @@ CapsLock is remapped to Escape by default. All of the above is overridable in `s
 - `sol` — binary entry point and CLI.
 - `sol-core` — backend-agnostic scene types (`Scene`, `SceneElement`).
 - `sol-wayland` — protocol dispatch, layout, animation, input, focus.
-- `sol-backend-drm` — DRM/GBM/EGL/GLES2 presenter (textured-quad pipeline, dual-Kawase blur for inactive-window backdrops).
+- `sol-backend-drm` — DRM/GBM/EGL/GLES2 presenter (textured-quad pipeline, dual-Kawase blur for inactive-window backdrops, SDF rounded-corner masking).
 
 ## License
 

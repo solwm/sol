@@ -564,6 +564,19 @@ pub struct State {
     /// Left-from-stack; weak ref so it self-invalidates.
     pub last_master_swap_partner_per_workspace:
         std::collections::HashMap<u32, Weak<WlSurface>>,
+    /// Per-workspace memory of the zoomed tile. `state.zoomed` always
+    /// reflects the active workspace's zoom (so the rest of the code
+    /// doesn't have to thread `active_ws` through every check); on
+    /// `switch_workspace` we save it here under the workspace we're
+    /// leaving and restore the entry for the workspace we're entering,
+    /// so a round-trip preserves zoom instead of dropping back to the
+    /// tile layout.
+    pub zoomed_per_workspace: std::collections::HashMap<u32, Weak<WlSurface>>,
+    /// Per-workspace memory of the fullscreened tile. Same lifecycle
+    /// as `zoomed_per_workspace` — switch saves the leaving
+    /// workspace's mode and restores the arriving workspace's mode.
+    pub fullscreened_per_workspace:
+        std::collections::HashMap<u32, Weak<WlSurface>>,
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -1134,6 +1147,16 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
 
     state
         .last_focus_per_workspace
+        .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
+    // Same hygiene for the per-workspace zoom / fullscreen memory
+    // — without it a workspace would stash a dead weak that the
+    // next round-trip restores into `state.zoomed`, which then
+    // fails to upgrade and falls through to a tile-layout flash.
+    state
+        .zoomed_per_workspace
+        .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
+    state
+        .fullscreened_per_workspace
         .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
 
     // Snapshot the dying tile for the close animation: clone its
@@ -1794,16 +1817,17 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
     let corner_radius = state.config.corner_radius as f32;
 
     let emit_for_ws = |out: &mut Vec<Placed>, ws: u32, ws_alpha: f32| {
-        for win in state.mapped_toplevels.iter() {
+        // Render order: non-promoted tiles first, then the zoomed
+        // tile last so it paints on top of any still-fading peers.
+        // (When zoom isn't active, zoomed_idx stays None and the
+        // single pass walks every tile in mapped_toplevels order.)
+        let mut indices: Vec<usize> = Vec::with_capacity(state.mapped_toplevels.len());
+        let mut zoomed_idx: Option<usize> = None;
+        for (i, win) in state.mapped_toplevels.iter().enumerate() {
             if win.workspace != ws {
                 continue;
             }
             let Ok(surface) = win.surface.upgrade() else { continue };
-            if let Some(zs) = &zoomed {
-                if surface != *zs {
-                    continue;
-                }
-            }
             // Fullscreen tile is drawn separately, above Top-layer
             // surfaces, so it can cover waybar etc. Skip it here.
             if let Some(fs) = &fullscreened {
@@ -1811,6 +1835,21 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                     continue;
                 }
             }
+            if let Some(zs) = &zoomed {
+                if surface == *zs {
+                    zoomed_idx = Some(i);
+                    continue;
+                }
+            }
+            indices.push(i);
+        }
+        if let Some(i) = zoomed_idx {
+            indices.push(i);
+        }
+
+        for i in indices {
+            let win = &state.mapped_toplevels[i];
+            let Ok(surface) = win.surface.upgrade() else { continue };
             let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
                 continue;
             };
@@ -2460,11 +2499,31 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
     const POS_EPS: f32 = 0.5;
     const VEL_EPS: f32 = 0.5;
 
-    // Snapshot focus + fullscreen state for the border-alpha
-    // target lookup inside the loop; doing it once up here means
-    // the per-window check is a couple of cheap pointer compares.
+    // Snapshot focus + zoom + fullscreen state for the border-alpha
+    // and visibility-alpha target lookups inside the loop; doing it
+    // once up here means the per-window check is a couple of cheap
+    // pointer compares.
     let focus = state.keyboard_focus.clone();
+    let active_ws = state.active_ws;
+    let zoomed = state.zoomed.as_ref().and_then(|w| w.upgrade().ok());
     let fullscreened = state.fullscreened.as_ref().and_then(|w| w.upgrade().ok());
+    // Promoted-tile lookup for inactive workspaces. Each workspace
+    // remembers its own zoom / fullscreen mode via the per-workspace
+    // maps; without this lookup, tiles on a workspace where zoom is
+    // active (but the user has switched away) would have their
+    // alpha pulled back to 1.0 by the active workspace's zoom state
+    // — and then yanked to 0.0 again on return, causing a flicker.
+    let promoted_other_ws: std::collections::HashMap<u32, WlSurface> = state
+        .zoomed_per_workspace
+        .iter()
+        .chain(state.fullscreened_per_workspace.iter())
+        .filter_map(|(&ws, w)| {
+            if ws == active_ws {
+                return None;
+            }
+            w.upgrade().ok().map(|s| (ws, s))
+        })
+        .collect();
 
     let mut any_active = false;
 
@@ -2540,6 +2599,18 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
             .zip(surface_alive.as_ref())
             .map(|(f, s)| f == s)
             .unwrap_or(false);
+        // Promoted (zoom OR fullscreen) tile for THIS window's
+        // workspace. Active workspace reads from the live snapshots
+        // above; other workspaces read the per-workspace map.
+        let promoted: Option<&WlSurface> = if win.workspace == active_ws {
+            zoomed.as_ref().or(fullscreened.as_ref())
+        } else {
+            promoted_other_ws.get(&win.workspace)
+        };
+        let is_promoted = promoted
+            .zip(surface_alive.as_ref())
+            .map(|(p, s)| p == s)
+            .unwrap_or(false);
         let is_fullscreened = fullscreened
             .as_ref()
             .zip(surface_alive.as_ref())
@@ -2550,10 +2621,22 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         } else {
             0.0_f32
         };
+        // Visibility-alpha target. While a zoom or fullscreen tile
+        // is "spotlight"-promoted on this window's workspace, every
+        // other tile on that workspace fades out — the promoted one
+        // keeps full opacity, untouched tiles fade to 0 and ride
+        // the fade spring back to 1 once the mode clears. This
+        // replaces the older "instantly skip the others" path in
+        // collect_scene with a smooth crossfade.
+        let alpha_target = if promoted.is_some() {
+            if is_promoted { 1.0 } else { 0.0 }
+        } else {
+            1.0
+        };
         // Fade springs (open animation: alpha + scale → 1.0) use
         // the dedicated fade tuning, border-alpha keeps the base.
         for (cur, vel, tgt, k, c) in [
-            (&mut win.render_alpha, &mut win.vel_alpha, 1.0_f32, fade_k, fade_c),
+            (&mut win.render_alpha, &mut win.vel_alpha, alpha_target, fade_k, fade_c),
             (&mut win.render_scale, &mut win.vel_scale, 1.0_f32, fade_k, fade_c),
             (&mut win.border_alpha, &mut win.vel_border_alpha, border_target, stiffness, damping),
         ] {
@@ -3117,9 +3200,11 @@ fn toggle_fullscreen(state: &mut State) {
     state.needs_render = true;
 }
 
-/// Switch to the given workspace. Zoom doesn't follow the user
-/// across workspaces — it's tied to the window that was zoomed, so
-/// a second Alt+Tab on the new workspace is required to re-zoom.
+/// Switch to the given workspace. Zoom and fullscreen are remembered
+/// per workspace: leaving a zoomed/fullscreened workspace stashes
+/// the mode in `zoomed_per_workspace` / `fullscreened_per_workspace`,
+/// and returning restores it so the user lands back in the same
+/// "spotlight" view they left.
 /// Keyboard focus moves to the topmost (= most recently mapped)
 /// toplevel on the target workspace; if it's empty, focus drops to
 /// None, which means subsequent keystrokes go nowhere until a
@@ -3146,9 +3231,39 @@ pub(crate) fn switch_workspace(state: &mut State, n: u32) {
     }
 
     tracing::info!(from = old, to = n, "workspace switch");
+
+    // Save the leaving workspace's zoom / fullscreen mode so a
+    // round-trip preserves it. `take()` clears the live field; we
+    // either insert under `old` (mode was on) or remove its entry
+    // (mode was off) so the map only carries live state.
+    if let Some(w) = state.zoomed.take() {
+        state.zoomed_per_workspace.insert(old, w);
+    } else {
+        state.zoomed_per_workspace.remove(&old);
+    }
+    if let Some(w) = state.fullscreened.take() {
+        state.fullscreened_per_workspace.insert(old, w);
+    } else {
+        state.fullscreened_per_workspace.remove(&old);
+    }
+
     state.active_ws = n;
-    state.zoomed = None;
-    state.fullscreened = None;
+
+    // Restore the arriving workspace's zoom / fullscreen, dropping
+    // dead weaks (tile closed since last visit). Mutually exclusive
+    // by construction at toggle time, so at most one of the two
+    // ends up Some.
+    state.zoomed = state
+        .zoomed_per_workspace
+        .get(&n)
+        .filter(|w| w.upgrade().is_ok())
+        .cloned();
+    state.fullscreened = state
+        .fullscreened_per_workspace
+        .get(&n)
+        .filter(|w| w.upgrade().is_ok())
+        .cloned();
+
     ext_workspace::notify_active_changed(state, old, n);
     // Windows coming back into view get the "first-frame" treatment
     // in `tick_animations` — render_rect.w/h == 0 means "snap to the
@@ -3863,6 +3978,8 @@ fn setup_event_loop(
         last_focus_per_workspace: std::collections::HashMap::new(),
         last_stack_focus_per_workspace: std::collections::HashMap::new(),
         last_master_swap_partner_per_workspace: std::collections::HashMap::new(),
+        zoomed_per_workspace: std::collections::HashMap::new(),
+        fullscreened_per_workspace: std::collections::HashMap::new(),
     };
     let mut compositor = Compositor {
         state,
@@ -4284,6 +4401,9 @@ fn spawn_exec_once(state: &mut State, program: &str, args: &[&str]) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.current_dir(home);
+    }
     unsafe {
         cmd.pre_exec(|| {
             // New session → new process group with the child as
@@ -4340,12 +4460,19 @@ fn terminate_exec_once(state: &State) {
 
 fn spawn_client(state: &State, program: &str, args: &[&str], label: &str) {
     let socket = state.socket_name.clone();
-    match std::process::Command::new(program)
-        .args(args)
+    // Children inherit our cwd by default, which is wherever the
+    // user launched sol from — not what a freshly-spawned terminal
+    // or app should land in. Chdir to $HOME so Alt+Enter alacritty
+    // opens at ~ regardless of how sol was started.
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.current_dir(home);
+    }
+    match cmd.spawn()
     {
         Ok(child) => tracing::info!(
             pid = child.id(),
