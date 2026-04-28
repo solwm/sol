@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, framebuffer, property};
 use glow::HasContext;
 use khronos_egl as egl;
-use sol_core::{PixelFormat, Scene, SceneContent};
+use sol_core::{PixelFormat, Scene, SceneBorder, SceneContent};
 
 use crate::{
     Card, GlStack, OutputSelection, dmabuf_egl, get_or_add_fb, pick_output,
@@ -638,7 +638,19 @@ impl DrmPresenter {
         }
 
         let mut active_program: Option<u32> = None;
-        for elem in &scene.elements {
+        let border_anchor = scene.border_anchor.min(scene.elements.len());
+        let mut borders_drawn = false;
+        for (idx, elem) in scene.elements.iter().enumerate() {
+            // Inject the border pass at the configured z-anchor —
+            // i.e. right between the tile pass and the dialogs /
+            // popups / cursor that should sit visually above the
+            // focus rings. The shader switch invalidates the
+            // textured-element program tracking, so reset it.
+            if !borders_drawn && idx == border_anchor && !scene.borders.is_empty() {
+                self.draw_solid_borders(&scene.borders, w as f32, h as f32);
+                borders_drawn = true;
+                active_program = None;
+            }
             // Frosted backdrop: capture-and-blur the screen-so-far
             // (lazily, once per frame) and draw the blurred FBO
             // sampled at this element's screen rect. Different
@@ -744,44 +756,13 @@ impl DrmPresenter {
             }
         }
 
-        // Border / overlay pass: flat-colored rects drawn on top of
-        // the textured pass, below the cursor (which gets rendered
-        // inside the textured pass because it's just another scene
-        // element). Separate shader program because u_tex / u_opaque
-        // aren't meaningful here.
-        if !scene.borders.is_empty() {
-            let gl = &self.gl_stack.gl;
-            unsafe {
-                gl.use_program(Some(self.solid.program));
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.solid.vbo));
-                gl.enable_vertex_attrib_array(0);
-                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
-            }
-            for b in &scene.borders {
-                let fb_w = w as f32;
-                let fb_h = h as f32;
-                let x0 = (b.x / fb_w) * 2.0 - 1.0;
-                let y0 = 1.0 - ((b.y + b.h) / fb_h) * 2.0;
-                let rw = b.w / fb_w * 2.0;
-                let rh = b.h / fb_h * 2.0;
-                unsafe {
-                    gl.uniform_4_f32(Some(&self.solid.u_rect), x0, y0, rw, rh);
-                    gl.uniform_4_f32(
-                        Some(&self.solid.u_color),
-                        b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3],
-                    );
-                    gl.uniform_2_f32(Some(&self.solid.u_size), b.w, b.h);
-                    gl.uniform_1_f32(
-                        Some(&self.solid.u_radius),
-                        b.corner_radius.max(0.0),
-                    );
-                    gl.uniform_1_f32(
-                        Some(&self.solid.u_border_width),
-                        b.border_width.max(0.0),
-                    );
-                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-                }
-            }
+        // Border pass fallback: if the anchor was past the last
+        // element (or callers didn't set one — `usize::MAX`), draw
+        // borders here at the very end. Matches the pre-anchor
+        // behaviour for any caller that builds a Scene with default
+        // `border_anchor`.
+        if !borders_drawn && !scene.borders.is_empty() {
+            self.draw_solid_borders(&scene.borders, w as f32, h as f32);
         }
 
         unsafe {
@@ -793,6 +774,50 @@ impl DrmPresenter {
         }
 
         self.submit_flip()
+    }
+
+    /// Draw the solid-color border pass into the currently-bound
+    /// framebuffer. Used at whatever z-anchor the scene specifies
+    /// (between tiles and dialogs, typically) so the focus ring
+    /// doesn't paint over a floating window. Caller is responsible
+    /// for resetting `active_program` after this method returns,
+    /// since it switches shaders.
+    fn draw_solid_borders(
+        &self,
+        borders: &[SceneBorder],
+        fb_w: f32,
+        fb_h: f32,
+    ) {
+        let gl = &self.gl_stack.gl;
+        unsafe {
+            gl.use_program(Some(self.solid.program));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.solid.vbo));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+        }
+        for b in borders {
+            let x0 = (b.x / fb_w) * 2.0 - 1.0;
+            let y0 = 1.0 - ((b.y + b.h) / fb_h) * 2.0;
+            let rw = b.w / fb_w * 2.0;
+            let rh = b.h / fb_h * 2.0;
+            unsafe {
+                gl.uniform_4_f32(Some(&self.solid.u_rect), x0, y0, rw, rh);
+                gl.uniform_4_f32(
+                    Some(&self.solid.u_color),
+                    b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3],
+                );
+                gl.uniform_2_f32(Some(&self.solid.u_size), b.w, b.h);
+                gl.uniform_1_f32(
+                    Some(&self.solid.u_radius),
+                    b.corner_radius.max(0.0),
+                );
+                gl.uniform_1_f32(
+                    Some(&self.solid.u_border_width),
+                    b.border_width.max(0.0),
+                );
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
+        }
     }
 
     /// Draw one textured-quad scene element into the currently-bound

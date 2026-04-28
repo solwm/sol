@@ -35,6 +35,8 @@
 //! spring_damping_vertical   = 22.0         # optional override for the y + h damping; falls back to spring_damping
 //! spring_stiffness_swap     = 500.0        # spring for the dedicated stack vertical-reorder animation (move_dir Up/Down); separate from the layout spring above
 //! spring_damping_swap       = 35.0         # damping for the swap spring
+//! spring_stiffness_fade     = 200.0        # optional override for the alpha + scale springs that drive open/close; falls back to spring_stiffness
+//! spring_damping_fade       = 22.0         # optional override for the fade damping; falls back to spring_damping
 //! workspace_animation   = crossfade        # none|crossfade
 //! workspace_animation_duration_ms = 250    # crossfade duration in ms (cubic-out, hardcoded)
 //! inactive_alpha        = 0.85             # alpha for non-focused toplevels (1.0 = no effect)
@@ -170,6 +172,17 @@ pub struct Config {
     /// base spring's feel). Crank to make the swap crisper, drop
     /// to make it bouncier.
     pub spring_damping_swap: f32,
+    /// Optional override for the alpha + scale springs that drive
+    /// the open / close (fade-and-scale) animation on tiles. Falls
+    /// back to `spring_stiffness` when `None`, so omitting these
+    /// knobs lets fade-in/out track the layout spring exactly. Set
+    /// to taste when the layout feel and the open/close feel want
+    /// to diverge — e.g. snappy layout (high stiffness) but a
+    /// gentler 200ms fade-in for new windows.
+    pub spring_stiffness_fade: Option<f32>,
+    /// Optional override for the fade damping. See
+    /// `spring_stiffness_fade`.
+    pub spring_damping_fade: Option<f32>,
     /// Visual transition for `workspace, N` switches. Default
     /// `Crossfade` — the leaving workspace fades out while the
     /// arriving one fades in. `None` is an instant cut.
@@ -252,6 +265,8 @@ impl Default for Config {
             spring_damping_vertical: None,
             spring_stiffness_swap: 500.0,
             spring_damping_swap: 35.0,
+            spring_stiffness_fade: None,
+            spring_damping_fade: None,
             workspace_animation: WorkspaceAnimation::Crossfade,
             workspace_animation_duration_ms: 250,
             inactive_alpha: 0.85,
@@ -490,6 +505,8 @@ enum Entry {
     SpringDampingVertical(f32),
     SpringStiffnessSwap(f32),
     SpringDampingSwap(f32),
+    SpringStiffnessFade(f32),
+    SpringDampingFade(f32),
     WorkspaceAnimation(WorkspaceAnimation),
     WorkspaceAnimationDurationMs(u32),
     InactiveAlpha(f32),
@@ -536,6 +553,12 @@ pub fn parse(text: &str) -> Config {
             }
             Ok(Some(Entry::SpringStiffnessSwap(v))) => cfg.spring_stiffness_swap = v,
             Ok(Some(Entry::SpringDampingSwap(v))) => cfg.spring_damping_swap = v,
+            Ok(Some(Entry::SpringStiffnessFade(v))) => {
+                cfg.spring_stiffness_fade = Some(v);
+            }
+            Ok(Some(Entry::SpringDampingFade(v))) => {
+                cfg.spring_damping_fade = Some(v);
+            }
             Ok(Some(Entry::WorkspaceAnimation(w))) => cfg.workspace_animation = w,
             Ok(Some(Entry::WorkspaceAnimationDurationMs(v))) => {
                 cfg.workspace_animation_duration_ms = v
@@ -595,6 +618,12 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         }
         "spring_damping_swap" => {
             Ok(Some(Entry::SpringDampingSwap(parse_pos_float(rhs)?)))
+        }
+        "spring_stiffness_fade" => {
+            Ok(Some(Entry::SpringStiffnessFade(parse_pos_float(rhs)?)))
+        }
+        "spring_damping_fade" => {
+            Ok(Some(Entry::SpringDampingFade(parse_pos_float(rhs)?)))
         }
         "workspace_animation" => {
             Ok(Some(Entry::WorkspaceAnimation(parse_workspace_animation(rhs)?)))

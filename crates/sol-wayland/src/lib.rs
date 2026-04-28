@@ -1733,7 +1733,7 @@ enum Placed {
     },
 }
 
-fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
+fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
     let mut out: Vec<Placed> = Vec::new();
     let screen = Rect {
         x: 0,
@@ -1914,6 +1914,14 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
             corner_radius,
         });
     }
+
+    // Border z-anchor: focus rings draw at this point in the scene
+    // — i.e. above tiles + closing tiles, BELOW Top layers,
+    // fullscreen tiles, floating dialogs, popups, Overlay, and the
+    // cursor. Without this anchor the border pass ran after every
+    // textured element and would paint yellow rings over a
+    // floating window underneath, which reads as a glitch.
+    let border_anchor = out.len();
 
     // 3. Top layer surfaces. Emitted before any fullscreen tile so
     // a fullscreened toplevel can cover them — taskbars / launchers
@@ -2127,7 +2135,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize) {
             }
         }
     }
-    (out, background_count)
+    (out, background_count, border_anchor)
 }
 
 fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
@@ -2218,10 +2226,17 @@ fn emit_subsurface_tree(
 fn scene_from_buffers<'a>(
     placed: &'a [Placed],
     background_count: usize,
+    border_anchor: usize,
     cursor: &'a Cursor,
 ) -> Scene<'a> {
     let mut scene = Scene::new();
     scene.background_count = background_count;
+    // border_anchor is in `placed` index space; since we map
+    // Placed → SceneElement 1:1, the index transfers unchanged. The
+    // trailing cursor element is appended after every Placed entry,
+    // so it always lands above the border pass — which is what we
+    // want (cursor on top).
+    scene.border_anchor = border_anchor;
     for p in placed {
         let (buf, rect, vsrc, alpha, corner_radius) = match p {
             Placed::Buffer { buf, rect, vsrc, alpha, corner_radius } => {
@@ -2433,6 +2448,13 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
     // distinct motion from any other layout change.
     let swap_k = state.config.spring_stiffness_swap;
     let swap_c = state.config.spring_damping_swap;
+    // Optional override for the open/close fade springs (alpha +
+    // scale on live tiles, alpha + scale on ClosingWindow). Falls
+    // back to the base when unset, so existing configs see no
+    // change. Use a softer fade than the layout for a "windows
+    // breathe in/out" feel, or match the layout for tightness.
+    let fade_k = state.config.spring_stiffness_fade.unwrap_or(stiffness);
+    let fade_c = state.config.spring_damping_fade.unwrap_or(damping);
     // Settled thresholds: under half a pixel away with sub-pixel-
     // per-second velocity is indistinguishable from a snap.
     const POS_EPS: f32 = 0.5;
@@ -2528,13 +2550,15 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         } else {
             0.0_f32
         };
-        for (cur, vel, tgt) in [
-            (&mut win.render_alpha, &mut win.vel_alpha, 1.0_f32),
-            (&mut win.render_scale, &mut win.vel_scale, 1.0_f32),
-            (&mut win.border_alpha, &mut win.vel_border_alpha, border_target),
+        // Fade springs (open animation: alpha + scale → 1.0) use
+        // the dedicated fade tuning, border-alpha keeps the base.
+        for (cur, vel, tgt, k, c) in [
+            (&mut win.render_alpha, &mut win.vel_alpha, 1.0_f32, fade_k, fade_c),
+            (&mut win.render_scale, &mut win.vel_scale, 1.0_f32, fade_k, fade_c),
+            (&mut win.border_alpha, &mut win.vel_border_alpha, border_target, stiffness, damping),
         ] {
-            let force = (tgt - *cur) * stiffness;
-            let damp = -*vel * damping;
+            let force = (tgt - *cur) * k;
+            let damp = -*vel * c;
             *vel += (force + damp) * dt;
             *cur += *vel * dt;
             if (tgt - *cur).abs() > ALPHA_EPS || vel.abs() > ALPHA_EPS {
@@ -2546,18 +2570,20 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         }
     }
 
-    // Tick closing windows: alpha → 0, scale → 0.7. Drop entries
-    // that have decayed below the visible threshold AND have
-    // damped to a near-stop, since beyond that point further
-    // ticking would just be invisible bookkeeping.
+    // Tick closing windows: alpha → 0, scale → 0.7, using the same
+    // fade spring tuning as the open animation so the close mirrors
+    // the open feel by default. Drop entries that have decayed
+    // below the visible threshold AND have damped to a near-stop,
+    // since beyond that point further ticking is invisible
+    // bookkeeping.
     state.closing_windows.retain_mut(|cw| {
         const ALPHA_EPS: f32 = 0.005;
         for (cur, vel, tgt) in [
             (&mut cw.render_alpha, &mut cw.vel_alpha, 0.0_f32),
             (&mut cw.render_scale, &mut cw.vel_scale, 0.7_f32),
         ] {
-            let force = (tgt - *cur) * stiffness;
-            let damp = -*vel * damping;
+            let force = (tgt - *cur) * fade_k;
+            let damp = -*vel * fade_c;
             *vel += (force + damp) * dt;
             *cur += *vel * dt;
         }
@@ -3364,8 +3390,13 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
         comp.state.needs_render = true;
     }
 
-    let (placed, background_count) = collect_scene(&comp.state, now);
-    let mut scene = scene_from_buffers(&placed, background_count, &comp.state.cursor);
+    let (placed, background_count, border_anchor) = collect_scene(&comp.state, now);
+    let mut scene = scene_from_buffers(
+        &placed,
+        background_count,
+        border_anchor,
+        &comp.state.cursor,
+    );
     scene.borders.extend(focus_border(&comp.state));
     let drawn = scene.elements.len();
 
@@ -4223,6 +4254,10 @@ const KEY_RIGHTMETA: u32 = 126;
 /// `config::key_from_name`.
 const KEY_ESC: u32 = 1;
 const KEY_H: u32 = 35;
+/// Linux evdev BTN_LEFT — the primary mouse button. Used by the
+/// compositor-driven move gesture (Super + left click on a
+/// floating window).
+const BTN_LEFT: u32 = 0x110;
 const KEY_L: u32 = 38;
 
 /// Fork/exec a Wayland client connected to our own socket. Env is
@@ -4820,6 +4855,31 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
             state.needs_render = true;
         }
         return;
+    }
+
+    // Compositor-driven floating-window move: Super + left click
+    // on a floating window starts a drag without the client
+    // having to call `xdg_toplevel.move`. Catches the
+    // no-titlebar / no-CSD case (game windows, lots of native
+    // Rust GUI apps) where the protocol's move request never
+    // fires. The press is swallowed so the click doesn't also
+    // reach the client.
+    let super_held = state.left_super_down || state.right_super_down;
+    if pressed && button == BTN_LEFT && super_held {
+        if let Some(focus) = state.pointer_focus.clone() {
+            let dialog_surface = state.mapped_dialogs.iter().find_map(|d| {
+                let s = d.surface.upgrade().ok()?;
+                if s == focus || surface_in_subtree(&s, &focus) {
+                    Some(s)
+                } else {
+                    None
+                }
+            });
+            if let Some(target) = dialog_surface {
+                start_dialog_drag(state, &target);
+                return;
+            }
+        }
     }
 
     // If a popup is currently grabbing and the press landed outside

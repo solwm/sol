@@ -142,6 +142,14 @@ pub struct Scene<'a> {
     /// the default framebuffer is laid out by GBM/EGL. Everything
     /// from `elements[background_count..]` draws normally on top.
     pub background_count: usize,
+    /// Z-order anchor for the border pass. The presenter draws
+    /// `elements[0..border_anchor]`, then `borders`, then
+    /// `elements[border_anchor..]` — so focus rings sit between
+    /// the tile pass and the dialog/popup/cursor passes instead
+    /// of riding on top of every other surface. `usize::MAX` is
+    /// the "draw borders last" sentinel (matches pre-anchor
+    /// behaviour for callers that don't bother to set it).
+    pub border_anchor: usize,
 }
 
 impl<'a> Scene<'a> {
@@ -150,6 +158,7 @@ impl<'a> Scene<'a> {
             elements: Vec::new(),
             borders: Vec::new(),
             background_count: 0,
+            border_anchor: usize::MAX,
         }
     }
 }
