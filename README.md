@@ -77,4 +77,4 @@ Per-tile motion is spring-driven (no time-based tweens): each of `x`, `y`, `w`, 
 
 ## License
 
-BSD-3-Clause.
+MIT.
