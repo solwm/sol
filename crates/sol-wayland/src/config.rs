@@ -29,8 +29,12 @@
 //! mode         = 3840x2160@240             # output WIDTHxHEIGHT@HZ; SOL_MODE env wins
 //! keyboard_repeat_rate  = 100              # wl_keyboard.repeat_info chars/sec (0 disables)
 //! keyboard_repeat_delay = 200              # wl_keyboard.repeat_info delay, ms
-//! spring_stiffness      = 200.0            # layout spring pull strength; higher = snappier
-//! spring_damping        = 22.0             # layout spring damping; ratio = damping / (2*sqrt(stiffness)). 1.0 = critical (no overshoot), <1 underdamped (overshoots once)
+//! spring_stiffness          = 200.0        # layout spring pull strength; higher = snappier
+//! spring_damping            = 22.0         # layout spring damping; ratio = damping / (2*sqrt(stiffness)). 1.0 = critical (no overshoot), <1 underdamped (overshoots once)
+//! spring_stiffness_vertical = 200.0        # optional override for the y + h axes (right-stack vertical reorders, vertical resizes); falls back to spring_stiffness
+//! spring_damping_vertical   = 22.0         # optional override for the y + h damping; falls back to spring_damping
+//! spring_stiffness_swap     = 500.0        # spring for the dedicated stack vertical-reorder animation (move_dir Up/Down); separate from the layout spring above
+//! spring_damping_swap       = 35.0         # damping for the swap spring
 //! workspace_animation   = crossfade        # none|crossfade
 //! workspace_animation_duration_ms = 250    # crossfade duration in ms (cubic-out, hardcoded)
 //! inactive_alpha        = 0.85             # alpha for non-focused toplevels (1.0 = no effect)
@@ -141,6 +145,31 @@ pub struct Config {
     /// Default 22.0 → ratio ~0.78, slight overshoot for that
     /// "alive" feel without bouncing.
     pub spring_damping: f32,
+    /// Override for the vertical (y + h) component of the layout
+    /// spring. Defaults to `spring_stiffness`. Useful when the
+    /// right-stack column's vertical reorders should feel snappier
+    /// (or softer) than the horizontal master/stack swaps that the
+    /// base spring still drives. `None` falls back to
+    /// `spring_stiffness`; setting either of the `_vertical` knobs
+    /// in config.toml takes effect for both y and h axes.
+    pub spring_stiffness_vertical: Option<f32>,
+    /// Override for the vertical (y + h) damping. See
+    /// `spring_stiffness_vertical`.
+    pub spring_damping_vertical: Option<f32>,
+    /// Stiffness for the dedicated "swap" spring that drives the
+    /// motion of two tiles trading places via `move_dir(Up | Down)`.
+    /// Distinct from the per-axis layout spring above — the swap
+    /// spring describes "how tense two tiles feel each other"
+    /// during a vertical reorder, applied to both involved tiles
+    /// for all four rect components until their springs settle.
+    /// Default 500.0 — noticeably snappier than the base spring so
+    /// stack reorders feel decisive rather than drifting.
+    pub spring_stiffness_swap: f32,
+    /// Damping for the swap spring. Default 35.0 → ratio ~0.78
+    /// at the default stiffness (slight overshoot, matches the
+    /// base spring's feel). Crank to make the swap crisper, drop
+    /// to make it bouncier.
+    pub spring_damping_swap: f32,
     /// Visual transition for `workspace, N` switches. Default
     /// `Crossfade` — the leaving workspace fades out while the
     /// arriving one fades in. `None` is an instant cut.
@@ -219,6 +248,10 @@ impl Default for Config {
             keyboard_repeat_delay: 200,
             spring_stiffness: 200.0,
             spring_damping: 22.0,
+            spring_stiffness_vertical: None,
+            spring_damping_vertical: None,
+            spring_stiffness_swap: 500.0,
+            spring_damping_swap: 35.0,
             workspace_animation: WorkspaceAnimation::Crossfade,
             workspace_animation_duration_ms: 250,
             inactive_alpha: 0.85,
@@ -453,6 +486,10 @@ enum Entry {
     KeyboardRepeatDelay(i32),
     SpringStiffness(f32),
     SpringDamping(f32),
+    SpringStiffnessVertical(f32),
+    SpringDampingVertical(f32),
+    SpringStiffnessSwap(f32),
+    SpringDampingSwap(f32),
     WorkspaceAnimation(WorkspaceAnimation),
     WorkspaceAnimationDurationMs(u32),
     InactiveAlpha(f32),
@@ -491,6 +528,14 @@ pub fn parse(text: &str) -> Config {
             Ok(Some(Entry::KeyboardRepeatDelay(v))) => cfg.keyboard_repeat_delay = v,
             Ok(Some(Entry::SpringStiffness(v))) => cfg.spring_stiffness = v,
             Ok(Some(Entry::SpringDamping(v))) => cfg.spring_damping = v,
+            Ok(Some(Entry::SpringStiffnessVertical(v))) => {
+                cfg.spring_stiffness_vertical = Some(v);
+            }
+            Ok(Some(Entry::SpringDampingVertical(v))) => {
+                cfg.spring_damping_vertical = Some(v);
+            }
+            Ok(Some(Entry::SpringStiffnessSwap(v))) => cfg.spring_stiffness_swap = v,
+            Ok(Some(Entry::SpringDampingSwap(v))) => cfg.spring_damping_swap = v,
             Ok(Some(Entry::WorkspaceAnimation(w))) => cfg.workspace_animation = w,
             Ok(Some(Entry::WorkspaceAnimationDurationMs(v))) => {
                 cfg.workspace_animation_duration_ms = v
@@ -539,6 +584,18 @@ fn parse_line(line: &str) -> Result<Option<Entry>> {
         "keyboard_repeat_delay" => Ok(Some(Entry::KeyboardRepeatDelay(parse_int(rhs)?))),
         "spring_stiffness" => Ok(Some(Entry::SpringStiffness(parse_pos_float(rhs)?))),
         "spring_damping" => Ok(Some(Entry::SpringDamping(parse_pos_float(rhs)?))),
+        "spring_stiffness_vertical" => {
+            Ok(Some(Entry::SpringStiffnessVertical(parse_pos_float(rhs)?)))
+        }
+        "spring_damping_vertical" => {
+            Ok(Some(Entry::SpringDampingVertical(parse_pos_float(rhs)?)))
+        }
+        "spring_stiffness_swap" => {
+            Ok(Some(Entry::SpringStiffnessSwap(parse_pos_float(rhs)?)))
+        }
+        "spring_damping_swap" => {
+            Ok(Some(Entry::SpringDampingSwap(parse_pos_float(rhs)?)))
+        }
         "workspace_animation" => {
             Ok(Some(Entry::WorkspaceAnimation(parse_workspace_animation(rhs)?)))
         }

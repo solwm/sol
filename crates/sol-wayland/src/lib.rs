@@ -192,6 +192,16 @@ pub struct Window {
     /// fade their border in alongside the open animation.
     pub border_alpha: f32,
     pub vel_border_alpha: f32,
+    /// Set on both tiles involved in a `move_dir(Up | Down)` swap.
+    /// While true, `tick_animations` overrides the layout spring
+    /// with the dedicated swap spring (`spring_stiffness_swap` /
+    /// `spring_damping_swap`) for all four rect components, so a
+    /// vertical reorder of two stacked tiles has its own feel
+    /// distinct from horizontal master/stack swaps and from
+    /// resize-driven motion. Cleared once the tile's springs
+    /// settle, so a follow-up non-swap motion uses the regular
+    /// (per-axis) layout spring.
+    pub swap_active: bool,
     /// Most recent `(width, height)` configured to the client via
     /// `xdg_toplevel.configure`. Cached so steady-state render
     /// ticks don't re-send configures when the layout target's
@@ -958,6 +968,7 @@ pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
                 // screen).
                 border_alpha: 1.0,
                 vel_border_alpha: 0.0,
+                swap_active: false,
                 pending_size: None,
                 pending_layout: false,
                 workspace: dlg.workspace,
@@ -2408,6 +2419,20 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
 
     let stiffness = state.config.spring_stiffness;
     let damping = state.config.spring_damping;
+    // Per-axis overrides for the y + h springs. Default: same
+    // values as the base. Lets the user tune right-stack vertical
+    // reorders independently of horizontal master/stack swaps.
+    let stiffness_v = state
+        .config
+        .spring_stiffness_vertical
+        .unwrap_or(stiffness);
+    let damping_v = state.config.spring_damping_vertical.unwrap_or(damping);
+    // Dedicated swap spring used while a tile is mid-Up/Down
+    // reorder (`swap_active`). Lives outside the per-axis split so
+    // the user can dial in "two stack tiles trading places" as a
+    // distinct motion from any other layout change.
+    let swap_k = state.config.spring_stiffness_swap;
+    let swap_c = state.config.spring_damping_swap;
     // Settled thresholds: under half a pixel away with sub-pixel-
     // per-second velocity is indistinguishable from a snap.
     const POS_EPS: f32 = 0.5;
@@ -2442,25 +2467,41 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         }
 
         // Step the four rect springs (x, y, w, h) plus alpha and
-        // scale for the open animation. Alpha/scale targets are
-        // hard-coded to 1.0 — once the window has opened they stay
-        // settled and add no work to the loop.
-        for (cur, vel, tgt) in [
-            (&mut win.render_rect.x, &mut win.velocity.x, target.x),
-            (&mut win.render_rect.y, &mut win.velocity.y, target.y),
-            (&mut win.render_rect.w, &mut win.velocity.w, target.w),
-            (&mut win.render_rect.h, &mut win.velocity.h, target.h),
+        // scale for the open animation. While `swap_active` is set
+        // (the tile is in flight from a vertical Up/Down reorder),
+        // every component uses the dedicated swap spring; otherwise
+        // y + h pick up the `_vertical` overrides if set, x + w
+        // run the base spring.
+        let (k_x, c_x, k_y, c_y) = if win.swap_active {
+            (swap_k, swap_c, swap_k, swap_c)
+        } else {
+            (stiffness, damping, stiffness_v, damping_v)
+        };
+        let mut win_active = false;
+        for (cur, vel, tgt, k, c) in [
+            (&mut win.render_rect.x, &mut win.velocity.x, target.x, k_x, c_x),
+            (&mut win.render_rect.y, &mut win.velocity.y, target.y, k_y, c_y),
+            (&mut win.render_rect.w, &mut win.velocity.w, target.w, k_x, c_x),
+            (&mut win.render_rect.h, &mut win.velocity.h, target.h, k_y, c_y),
         ] {
-            let force = (tgt - *cur) * stiffness;
-            let damp = -*vel * damping;
+            let force = (tgt - *cur) * k;
+            let damp = -*vel * c;
             *vel += (force + damp) * dt;
             *cur += *vel * dt;
             if (tgt - *cur).abs() > POS_EPS || vel.abs() > VEL_EPS {
                 any_active = true;
+                win_active = true;
             } else {
                 *cur = tgt;
                 *vel = 0.0;
             }
+        }
+        // Clear the swap flag once the rect springs settle so a
+        // subsequent non-swap motion (resize, master ↔ stack swap)
+        // uses the regular layout spring tuning instead of the
+        // swap one.
+        if win.swap_active && !win_active {
+            win.swap_active = false;
         }
         // Alpha + scale springs use tighter epsilons since their
         // values live in [0, 1] — half-a-pixel doesn't translate
@@ -2918,6 +2959,19 @@ fn move_direction(state: &mut State, dir: config::Direction) {
             state
                 .last_master_swap_partner_per_workspace
                 .insert(active_ws, prev_master.downgrade());
+        }
+    }
+
+    // Up/Down stack reorders run a dedicated "swap" spring with
+    // its own stiffness/damping — see `tick_animations`. Mark both
+    // tiles so the next animation tick picks up the override; the
+    // flag self-clears on settle.
+    if matches!(dir, config::Direction::Up | config::Direction::Down) {
+        if let Some(w) = state.mapped_toplevels.get_mut(idx) {
+            w.swap_active = true;
+        }
+        if let Some(w) = state.mapped_toplevels.get_mut(n) {
+            w.swap_active = true;
         }
     }
 
