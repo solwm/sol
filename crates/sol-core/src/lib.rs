@@ -3,6 +3,16 @@
 
 pub const NAME: &str = "sol";
 
+/// Sentinel `SceneElement::buffer_key` for the compositor's default
+/// cursor sprite. The sprite is allocated once at startup and never
+/// mutated, so backends can fast-path "skip the per-frame
+/// glTexSubImage2D for this key" without worrying about staleness.
+/// Picked to fall outside the monotonic range that
+/// `next_buffer_cache_key` produces; backends that don't special-case
+/// this just treat it as any other key and re-upload every frame
+/// (correct, just wasteful).
+pub const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
+
 /// Wayland SHM pixel formats we know how to sample. Both store 32-bit little
 /// endian words; the difference is whether the alpha byte is meaningful.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

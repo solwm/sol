@@ -14,7 +14,9 @@ use glow::HasContext;
 use khronos_egl as egl;
 use std::time::Instant;
 
-use sol_core::{PixelFormat, RenderTiming, Scene, SceneBorder, SceneContent};
+use sol_core::{
+    CURSOR_SCENE_KEY, PixelFormat, RenderTiming, Scene, SceneBorder, SceneContent,
+};
 
 use crate::{
     Card, GlStack, OutputSelection, dmabuf_egl, get_or_add_fb, pick_output,
@@ -1276,18 +1278,25 @@ fn upload_shm_texture(
         }
     };
 
-    // Hot path: if the cached texture already covers this seq, the GPU
-    // copy is current and we skip the entire upload (including the
-    // tight-row repack below). This is the cursor / static-waybar /
-    // wallpaper case at idle, where the per-frame glTexSubImage2D was
-    // burning ~2.4ms of textures phase per frame at 4K@240.
-    if let Some(entry) = textures.get(&elem.buffer_key) {
-        if entry.egl_image.is_none()
-            && entry.width == elem.width
-            && entry.height == elem.height
-            && entry.uploaded_seq == upload_seq
-        {
-            return Ok(());
+    // Restricted skip: only the synthetic cursor key takes this fast
+    // path. The cursor sprite is allocated once at startup and never
+    // mutated, so reusing the cached GPU texture is provably safe.
+    //
+    // The same skip for client-supplied SHM buffers stuttered Chrome
+    // on YouTube even with the seq bump moved to every commit, which
+    // means something about Chrome's SHM repaint cadence violates the
+    // assumption that "no commit since last upload" implies "pixels
+    // unchanged since last upload." Until that's understood, the
+    // skip stays gated on the sentinel.
+    if elem.buffer_key == CURSOR_SCENE_KEY {
+        if let Some(entry) = textures.get(&elem.buffer_key) {
+            if entry.egl_image.is_none()
+                && entry.width == elem.width
+                && entry.height == elem.height
+                && entry.uploaded_seq == upload_seq
+            {
+                return Ok(());
+            }
         }
     }
 

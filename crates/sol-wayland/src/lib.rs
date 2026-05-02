@@ -2562,10 +2562,10 @@ fn compute_uv(
     }
 }
 
-/// Stable key the DRM renderer uses to avoid re-uploading the cursor
-/// sprite every frame. Anything outside the range of real BufferData
-/// pointers works; pick something unlikely to collide.
-const CURSOR_SCENE_KEY: u64 = 0xC0FFEE_C0FFEE;
+/// Re-export of the shared sentinel so the rest of this file can keep
+/// using the unqualified name. The canonical definition lives in
+/// `sol-core` since the DRM backend needs to recognise it too.
+const CURSOR_SCENE_KEY: u64 = sol_core::CURSOR_SCENE_KEY;
 /// Sentinel buffer_key for `BlurredBackdrop` scene elements. The
 /// backdrop branch in the presenter's draw loop returns before any
 /// texture lookup happens, but a value is required by the struct
