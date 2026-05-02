@@ -183,15 +183,6 @@ pub struct SurfaceData {
     /// clients that render into a larger buffer than they want
     /// displayed.
     pub viewport_src: Option<(f64, f64, f64, f64)>,
-    /// Bumped on every commit that promoted a pending buffer (i.e.
-    /// `pending_attach` was true). The DRM presenter's texture
-    /// cache compares this against the version it last uploaded
-    /// for the same `buffer_key` — same value means the bytes
-    /// haven't been touched since, so the per-frame
-    /// `glTexSubImage2D` re-upload can be skipped. Without this we
-    /// were paying ~2.5 ms/frame to push static SHM pixels
-    /// (wallpaper, waybar) onto the GPU on every render.
-    pub commit_seq: u64,
 }
 
 impl GlobalDispatch<WlCompositor, ()> for State {
@@ -281,14 +272,6 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     let old = sd.current.buffer.take();
                     sd.current.buffer = sd.pending.buffer.take();
                     sd.pending_attach = false;
-                    // Bump the per-surface commit version so the
-                    // presenter's texture cache knows the bytes may
-                    // have changed since its last upload. Per-attach
-                    // (rather than per-damage) is conservative: a
-                    // client that re-attaches the same buffer with
-                    // unchanged content will trigger a redundant
-                    // re-upload — but never miss a real change.
-                    sd.commit_seq = sd.commit_seq.wrapping_add(1);
                     Some(old)
                 } else {
                     // Still drain pending.buffer so a stale pending

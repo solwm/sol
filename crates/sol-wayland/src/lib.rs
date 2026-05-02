@@ -309,11 +309,6 @@ pub struct ClosingWindow {
     /// Optional viewport src — preserved so the same crop the live
     /// window had keeps working through the fade.
     pub vsrc: Option<(f64, f64, f64, f64)>,
-    /// Frozen `commit_seq` from the source surface at the moment of
-    /// close — the surface itself is gone, so this never bumps
-    /// again. Lets the texture cache see the same version every
-    /// frame of the close animation and skip re-uploads.
-    pub commit_seq: u64,
 }
 
 /// In-flight workspace crossfade. While set, both the outgoing and
@@ -624,11 +619,6 @@ pub struct State {
 pub struct Metrics {
     pub frames_rendered: u64,
     pub ticks_skipped: u64,
-    /// Frames where `render_scene` early-returned because the scene
-    /// digest matched the last successfully-flipped one. No GPU
-    /// work, no page flip. Counter-intuitively this is GOOD: every
-    /// entry here is a ~2 ms `lock_front_buffer` we skipped.
-    pub flips_skipped: u64,
     pub page_flips: u64,
     pub render_tick_total_ns: u64,
     pub render_tick_max_ns: u64,
@@ -651,14 +641,6 @@ pub struct Metrics {
     pub phase_render_blur_ns: u64,
     pub phase_render_draw_ns: u64,
     pub phase_render_present_ns: u64,
-    /// Sub-breakdown of `phase_render_present_ns`. The four parts
-    /// should sum to ≈ phase_render_present_ns. Lets us see which
-    /// of swap_buffers / lock_front_buffer / add_fb / page_flip is
-    /// actually eating present-phase time on a given driver.
-    pub phase_render_present_swap_ns: u64,
-    pub phase_render_present_lock_ns: u64,
-    pub phase_render_present_addfb_ns: u64,
-    pub phase_render_present_pageflip_ns: u64,
     pub texture_uploads: u64,
     pub texture_evictions: u64,
     pub spring_ticks: u64,
@@ -1287,11 +1269,10 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
                     let sd = arc.lock().ok()?;
                     let buf = sd.current.buffer.clone()?;
                     let vsrc = sd.viewport_src;
-                    let commit_seq = sd.commit_seq;
-                    Some((buf, vsrc, commit_seq))
+                    Some((buf, vsrc))
                 })
             });
-        if let Some((buffer, vsrc, commit_seq)) = buffer {
+        if let Some((buffer, vsrc)) = buffer {
             state.closing_windows.push(ClosingWindow {
                 buffer,
                 render_rect: win.render_rect,
@@ -1301,7 +1282,6 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
                 render_scale: win.render_scale,
                 vel_scale: win.vel_scale,
                 vsrc,
-                commit_seq,
             });
         }
     }
@@ -1859,13 +1839,6 @@ enum Placed {
         /// to the parent's rounded shape would require a stencil
         /// pass we don't have yet.
         corner_radius: f32,
-        /// Source surface's `commit_seq` at scene-collection time.
-        /// Plumbs into `SceneElement::content_version` so the DRM
-        /// texture cache can skip re-uploading SHM pixels that
-        /// haven't changed. Closing-window snapshots and the cursor
-        /// (which uses static pixels) pass `0` — they hit the cache
-        /// after the first frame.
-        content_version: u64,
     },
     Backdrop {
         rect: RectF,
@@ -1901,7 +1874,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                content_version: surface_commit_seq(&ml.surface),
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -2032,7 +2004,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                     vsrc,
                     alpha: win_alpha,
                     corner_radius,
-                    content_version: surface_commit_seq(&surface),
                 });
             }
             emit_subsurface_tree(
@@ -2073,7 +2044,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             vsrc: cw.vsrc,
             alpha: cw.render_alpha,
             corner_radius,
-            content_version: cw.commit_seq,
         });
     }
 
@@ -2099,7 +2069,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                content_version: surface_commit_seq(&ml.surface),
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -2118,9 +2087,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             .find(|w| w.surface.upgrade().ok().as_ref() == Some(fs))
         {
             if let Some(sd_arc) = fs.data::<Arc<Mutex<SurfaceData>>>() {
-                let (buf, vsrc, commit_seq) = {
+                let (buf, vsrc) = {
                     let sd = sd_arc.lock().unwrap();
-                    (sd.current.buffer.clone(), sd.viewport_src, sd.commit_seq)
+                    (sd.current.buffer.clone(), sd.viewport_src)
                 };
                 // Honor open animation in fullscreen too — popping
                 // up scaled and fading in still reads natural even
@@ -2133,7 +2102,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: win.render_alpha,
                         corner_radius: 0.0,
-                        content_version: commit_seq,
                     });
                 }
                 emit_subsurface_tree(
@@ -2161,13 +2129,12 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
         let Ok(surface) = dlg.surface.upgrade() else { continue };
         let Some((dx, dy)) = dialog_render_origin(state, idx) else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (buf, vsrc, logical, commit_seq) = {
+        let (buf, vsrc, logical) = {
             let sd = sd_arc.lock().unwrap();
             (
                 sd.current.buffer.clone(),
                 sd.viewport_src,
                 surface_logical_size(&sd),
-                sd.commit_seq,
             )
         };
         let Some((dw, dh)) = logical else { continue };
@@ -2180,7 +2147,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius,
-                content_version: commit_seq,
             });
         }
         emit_subsurface_tree(&mut out, &surface, dx, dy, 1.0);
@@ -2203,21 +2169,14 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
     for popup in &state.mapped_popups {
         let Ok(surface) = popup.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (offset, buf, vsrc, geom, buf_dims, commit_seq) = {
+        let (offset, buf, vsrc, geom, buf_dims) = {
             let sd = sd_arc.lock().unwrap();
             let SurfaceRole::XdgPopup { mapped: true, offset, .. } = sd.role else {
                 continue;
             };
             let buf = sd.current.buffer.clone();
             let buf_dims = buf.as_ref().and_then(surface_buffer_dims);
-            (
-                offset,
-                buf,
-                sd.viewport_src,
-                sd.xdg_window_geometry,
-                buf_dims,
-                sd.commit_seq,
-            )
+            (offset, buf, sd.viewport_src, sd.xdg_window_geometry, buf_dims)
         };
         let Some((origin_x, origin_y)) = popup_screen_origin(state, &surface) else {
             continue;
@@ -2245,7 +2204,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                content_version: commit_seq,
             });
         }
         emit_subsurface_tree(&mut out, &surface, buffer_x, buffer_y, 1.0);
@@ -2262,7 +2220,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                content_version: surface_commit_seq(&ml.surface),
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -2282,11 +2239,11 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             .and_then(|w| w.upgrade().ok())
         {
             if let Some(sd_arc) = cur.data::<Arc<Mutex<SurfaceData>>>() {
-                let (buf, vsrc, dims, commit_seq) = {
+                let (buf, vsrc, dims) = {
                     let sd = sd_arc.lock().unwrap();
                     let buf = sd.current.buffer.clone();
                     let dims = buf.as_ref().and_then(surface_buffer_dims);
-                    (buf, sd.viewport_src, dims, sd.commit_seq)
+                    (buf, sd.viewport_src, dims)
                 };
                 if let (Some(buf), Some((w, h))) = (buf, dims) {
                     let cx = state.cursor.pos_x as f32
@@ -2304,7 +2261,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: 1.0,
                         corner_radius: 0.0,
-                        content_version: commit_seq,
                     });
                     emit_subsurface_tree(&mut out, &cur, cx, cy, 1.0);
                 }
@@ -2319,17 +2275,6 @@ fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
         .lock()
         .ok()?
         .viewport_src
-}
-
-/// Read the surface's `commit_seq` for use as a SceneElement's
-/// `content_version`. Falls back to `0` for surfaces missing
-/// `SurfaceData` (shouldn't happen for anything we emit, but
-/// defensive — `0` just means "always treat as cache hit", which
-/// is correct for content that never changes).
-fn surface_commit_seq(s: &WlSurface) -> u64 {
-    s.data::<Arc<Mutex<SurfaceData>>>()
-        .and_then(|sd| sd.lock().ok().map(|g| g.commit_seq))
-        .unwrap_or(0)
 }
 
 /// Walk a surface's subsurface_children recursively, pushing each mapped
@@ -2362,7 +2307,7 @@ fn emit_subsurface_tree(
         let Some(child_sd_arc) = child.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let (buf_opt, child_x, child_y, vsrc, logical, commit_seq) = {
+        let (buf_opt, child_x, child_y, vsrc, logical) = {
             let sd = child_sd_arc.lock().unwrap();
             let (ox, oy) = sd.subsurface_offset;
             let buf = sd.current.buffer.clone();
@@ -2372,7 +2317,6 @@ fn emit_subsurface_tree(
                 parent_y + oy as f32,
                 sd.viewport_src,
                 surface_logical_size(&sd),
-                sd.commit_seq,
             )
         };
         if let Some(buf) = buf_opt {
@@ -2405,7 +2349,6 @@ fn emit_subsurface_tree(
                 // reasoning. Rounded clipping inside the parent
                 // would need a stencil pass.
                 corner_radius: 0.0,
-                content_version: commit_seq,
             });
         }
         emit_subsurface_tree(out, &child, child_x, child_y, alpha);
@@ -2427,9 +2370,9 @@ fn scene_from_buffers<'a>(
     // want (cursor on top).
     scene.border_anchor = border_anchor;
     for p in placed {
-        let (buf, rect, vsrc, alpha, corner_radius, content_version) = match p {
-            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius, content_version } => {
-                (buf, rect, vsrc, alpha, corner_radius, content_version)
+        let (buf, rect, vsrc, alpha, corner_radius) = match p {
+            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius } => {
+                (buf, rect, vsrc, alpha, corner_radius)
             }
             Placed::Backdrop {
                 rect,
@@ -2457,7 +2400,6 @@ fn scene_from_buffers<'a>(
                     uv_h: 1.0,
                     alpha: *alpha,
                     corner_radius: *corner_radius,
-                    content_version: 0,
                     content: SceneContent::BlurredBackdrop {
                         passes: *passes,
                         radius: *radius,
@@ -2485,7 +2427,6 @@ fn scene_from_buffers<'a>(
                 uv_h: uh,
                 alpha: *alpha,
                 corner_radius: *corner_radius,
-                content_version: *content_version,
                 content: SceneContent::Shm {
                     pixels: bytes,
                     stride: bd.stride,
@@ -2512,7 +2453,6 @@ fn scene_from_buffers<'a>(
                 uv_h: uh,
                 alpha: *alpha,
                 corner_radius: *corner_radius,
-                content_version: *content_version,
                 content: SceneContent::Dmabuf {
                     fd: p0.fd.as_raw_fd(),
                     fourcc: db.format,
@@ -2545,9 +2485,6 @@ fn scene_from_buffers<'a>(
             uv_h: 1.0,
             alpha: 1.0,
             corner_radius: 0.0,
-            // The cursor sprite never changes after first upload —
-            // any version constant works, the cache hits forever.
-            content_version: 0,
             content: SceneContent::Shm {
                 pixels: &cursor.pixels,
                 stride: cursor.width * 4,
@@ -3630,29 +3567,10 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     // get freed via Drop), drop dead weak refs from the mapped
     // collections, and rebalance focus if it pointed at a now-dead
     // surface.
-    //
-    // Texture eviction is bounded per tick: each `eglDestroyImage`
-    // on NVIDIA is a kernel/driver round-trip (~1-2 ms), and
-    // resize-heavy workloads (master-stack swaps, repeated
-    // configures) can queue dozens at once. Draining all of them
-    // synchronously inside a render tick blew the frame budget;
-    // taking the first N per tick and re-queueing the rest spreads
-    // the cost across multiple frames. Animations are running in
-    // those frames anyway, so `needs_render` is already true and
-    // the deferred work catches up within milliseconds.
-    const EVICT_PER_TICK: usize = 4;
     let phase_prune_t = Instant::now();
     if let BackendState::Drm(presenter) = &mut comp.backend {
-        let queue = &mut comp.state.pending_texture_evictions;
-        let take = queue.len().min(EVICT_PER_TICK);
-        for key in queue.drain(..take) {
+        for key in std::mem::take(&mut comp.state.pending_texture_evictions) {
             presenter.evict_texture(key);
-        }
-        let still_pending = !queue.is_empty();
-        if still_pending {
-            // Re-arm so the rest get drained next tick even if no
-            // other event fires in the meantime.
-            comp.state.needs_render = true;
         }
     } else {
         comp.state.pending_texture_evictions.clear();
@@ -3791,25 +3709,6 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             comp.state.metrics.phase_render_blur_ns += t.blur_ns;
             comp.state.metrics.phase_render_draw_ns += t.draw_ns;
             comp.state.metrics.phase_render_present_ns += t.present_ns;
-            comp.state.metrics.phase_render_present_swap_ns += t.present_swap_ns;
-            comp.state.metrics.phase_render_present_lock_ns += t.present_lock_ns;
-            comp.state.metrics.phase_render_present_addfb_ns += t.present_addfb_ns;
-            comp.state.metrics.phase_render_present_pageflip_ns += t.present_pageflip_ns;
-            if t.skipped {
-                comp.state.metrics.flips_skipped += 1;
-                // Skipped flips don't fire flip-complete events, so
-                // the page-flip handler that normally drains
-                // pending_frame_callbacks won't run for this tick.
-                // Fire them inline with the current timestamp —
-                // wl_surface.frame is a throttle ("you may render
-                // again"), and skipping is precisely the case
-                // where the client's previous content is already
-                // on screen, so callback semantics are satisfied.
-                let ts = comp.state.elapsed_ms();
-                for cb in std::mem::take(&mut comp.state.pending_frame_callbacks) {
-                    cb.done(ts);
-                }
-            }
             if r.is_ok() {
                 tracing::debug!(drawn, "drm frame");
             }

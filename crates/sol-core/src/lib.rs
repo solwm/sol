@@ -96,16 +96,6 @@ pub struct SceneElement<'a> {
     /// transition) and preserves correct blending against whatever
     /// is behind the window.
     pub corner_radius: f32,
-    /// Compositor-side version of the buffer's content. Bumps each
-    /// time the source surface commits a (possibly-rewritten) buffer
-    /// — same `buffer_key` with a new `content_version` means the
-    /// pixels may differ from what the GPU has cached. Backends that
-    /// hold a per-`buffer_key` texture cache compare this against
-    /// the version they last uploaded, and skip the re-upload (and
-    /// the GPU sync that comes with it) when the values match.
-    /// Static elements (cursor sprite, blurred backdrop) pass `0`
-    /// — they never change after their first upload.
-    pub content_version: u64,
     pub content: SceneContent<'a>,
 }
 
@@ -191,17 +181,9 @@ impl<'a> Default for Scene<'a> {
 ///   the cache is valid for this frame).
 /// - `draw_ns`: the main back-to-front textured-quad loop + the
 ///   border pass.
-/// - `present_ns`: total of the four `present_*_ns` fields below —
-///   kept so the Wayland-side `phase_render_ns` accounting stays
-///   exact even if a future tweak adds more sub-fields here.
-///
-/// `present_*_ns` are the further breakdown of `present_ns`:
-///   - `present_swap_ns`: `eglSwapBuffers`. On NVIDIA this is the
-///     usual fence-wait long pole.
-///   - `present_lock_ns`: `gbm_surface_lock_front_buffer`.
-///   - `present_addfb_ns`: framebuffer-object lookup (cached
-///     `drmModeAddFB`).
-///   - `present_pageflip_ns`: `drmModePageFlip` ioctl.
+/// - `present_ns`: framebuffer lookup + page-flip schedule (the
+///   GBM `lock_front_buffer` + `add_fb` + `drmModePageFlip`
+///   sequence).
 ///
 /// Values are cumulative *for this single render call*; the Wayland
 /// side accumulates across frames before exporting via debug-ctl.
@@ -211,13 +193,4 @@ pub struct RenderTiming {
     pub blur_ns: u64,
     pub draw_ns: u64,
     pub present_ns: u64,
-    pub present_swap_ns: u64,
-    pub present_lock_ns: u64,
-    pub present_addfb_ns: u64,
-    pub present_pageflip_ns: u64,
-    /// True when `render_scene` early-returned because the incoming
-    /// scene's digest matched the previously-flipped one. Lets the
-    /// caller account "frames skipped to save a redundant flip"
-    /// separately from frames that actually drew.
-    pub skipped: bool,
 }

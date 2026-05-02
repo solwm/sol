@@ -109,20 +109,6 @@ pub struct DrmPresenter {
     /// connector properties) and reused for every subsequent call,
     /// so blank/unblank transitions are a single ioctl.
     dpms_prop: Option<property::Handle>,
-    /// Hash of the most recently *flipped* scene. Compared against
-    /// the digest of the incoming Scene at the top of `render_scene`
-    /// — equal means the previous frame's contents are still on
-    /// screen and would be identical to this one, so we skip the
-    /// entire render+flip path and let the kernel keep scanning out
-    /// the BO that's already up there. Eliminates the ~2 ms
-    /// `lock_front_buffer` cost on otherwise-redundant frames.
-    /// `None` until the first successful flip — we always flip
-    /// frame zero so there's something on screen.
-    last_flipped_digest: Option<u64>,
-    /// Bumped each time `render_scene` early-returned because the
-    /// digest matched. Surfaced via metrics so a benchmark can tell
-    /// how many wakeups the optimisation absorbed.
-    pub flips_skipped: u64,
 }
 
 /// Three FBOs at half output resolution used by the inactive-window
@@ -264,12 +250,6 @@ struct TextureEntry {
     /// GL texture target this entry is bound to. SHM uploads use
     /// GL_TEXTURE_2D; dmabuf imports use GL_TEXTURE_EXTERNAL_OES.
     target: u32,
-    /// `SceneElement.content_version` of the bytes currently uploaded
-    /// into `tex`. Compared against the incoming element's version on
-    /// each render — equal means no re-upload needed. Initialised to
-    /// `u64::MAX` for fresh entries so the first frame always uploads
-    /// (matches what version every real bump produces).
-    uploaded_version: u64,
 }
 
 impl DrmPresenter {
@@ -350,8 +330,6 @@ impl DrmPresenter {
             height,
             saved_crtc,
             dpms_prop: None,
-            last_flipped_digest: None,
-            flips_skipped: 0,
         };
         presenter.initial_modeset()?;
         Ok(presenter)
@@ -541,22 +519,6 @@ impl DrmPresenter {
         timing: &mut RenderTiming,
     ) -> Result<()> {
         if self.pending_flip {
-            return Ok(());
-        }
-        // Skip-flip optimisation: if the scene we'd produce is
-        // byte-identical to the one currently scanning out, drop
-        // the entire render+flip path. The kernel keeps showing the
-        // previous BO; we save ~2 ms of `lock_front_buffer` plus
-        // the draw + swap. First frame after startup has no
-        // baseline, so it always renders. Frame callbacks aren't
-        // fired here — when no flip happens the client's content
-        // (which IS already on screen from a prior flip) shouldn't
-        // be re-throttled, the flip-complete handler already did
-        // its job.
-        let digest = compute_scene_digest(scene);
-        if Some(digest) == self.last_flipped_digest {
-            self.flips_skipped += 1;
-            timing.skipped = true;
             return Ok(());
         }
         let w = self.width as i32;
@@ -824,14 +786,8 @@ impl DrmPresenter {
         }
         timing.draw_ns += t_draw.elapsed().as_nanos() as u64;
         let t_present = Instant::now();
-        let r = self.submit_flip(timing);
+        let r = self.submit_flip();
         timing.present_ns += t_present.elapsed().as_nanos() as u64;
-        if r.is_ok() {
-            // Only record the digest on success — a half-failed
-            // submit_flip leaves the previous BO on screen, and
-            // we want the next render to retry rather than skip.
-            self.last_flipped_digest = Some(digest);
-        }
         r
     }
 
@@ -1165,29 +1121,17 @@ impl DrmPresenter {
     /// the event loop as soon as the flip is submitted, and the
     /// flip-complete event arrives on the DRM fd and is handled by
     /// the calloop source in the main loop.
-    fn submit_flip(&mut self, timing: &mut RenderTiming) -> Result<()> {
-        let t_swap = Instant::now();
+    fn submit_flip(&mut self) -> Result<()> {
         self.gl_stack
             .egl
             .swap_buffers(self.gl_stack.display, self.gl_stack.surface)
             .map_err(|e| anyhow!("swap_buffers: {e:?}"))?;
-        timing.present_swap_ns += t_swap.elapsed().as_nanos() as u64;
-
-        let t_lock = Instant::now();
         let next_bo = unsafe { self.gl_stack.gbm_surface.lock_front_buffer() }
             .context("lock_front_buffer in present")?;
-        timing.present_lock_ns += t_lock.elapsed().as_nanos() as u64;
-
-        let t_addfb = Instant::now();
         let next_fb = get_or_add_fb(&self.card, &next_bo, &mut self.fb_cache)?;
-        timing.present_addfb_ns += t_addfb.elapsed().as_nanos() as u64;
-
-        let t_pageflip = Instant::now();
         self.card
             .page_flip(self.sel.crtc, next_fb, PageFlipFlags::EVENT, None)
             .context("page_flip")?;
-        timing.present_pageflip_ns += t_pageflip.elapsed().as_nanos() as u64;
-
         self.pending_bo = Some(next_bo);
         self.pending_flip = true;
         Ok(())
@@ -1304,64 +1248,6 @@ fn compute_bg_signature(elems: &[sol_core::SceneElement<'_>]) -> u64 {
     h.finish()
 }
 
-/// Hash of every input that would affect the rendered pixels for
-/// this Scene. Compared across frames at the top of `render_scene`:
-/// match means the previous frame's pixels would render identically,
-/// so we can skip the entire render+flip path. Captures every
-/// SceneElement field the shaders read (rect, alpha, UV, corner
-/// radius, content-version), every SceneBorder field, and the
-/// background_count / border_anchor positions so a z-order change
-/// also invalidates.
-///
-/// Backdrop elements include their `passes` and `radius` since
-/// those drive the blur output. The implicit assumption: when a
-/// backdrop's source background hasn't changed (its
-/// `background_count` slice is byte-identical, captured by the
-/// hashed elements), a cached blur output produces the same
-/// pixels — `compute_bg_signature` already reaches that conclusion
-/// for the blur-FBO cache, so this digest does too transitively.
-fn compute_scene_digest(scene: &sol_core::Scene<'_>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    scene.elements.len().hash(&mut h);
-    scene.borders.len().hash(&mut h);
-    scene.background_count.hash(&mut h);
-    scene.border_anchor.hash(&mut h);
-    for e in &scene.elements {
-        e.buffer_key.hash(&mut h);
-        e.content_version.hash(&mut h);
-        e.x.to_bits().hash(&mut h);
-        e.y.to_bits().hash(&mut h);
-        e.dst_width.to_bits().hash(&mut h);
-        e.dst_height.to_bits().hash(&mut h);
-        e.alpha.to_bits().hash(&mut h);
-        e.corner_radius.to_bits().hash(&mut h);
-        e.uv_x.to_bits().hash(&mut h);
-        e.uv_y.to_bits().hash(&mut h);
-        e.uv_w.to_bits().hash(&mut h);
-        e.uv_h.to_bits().hash(&mut h);
-        // Backdrop params affect the blur output; SHM/dmabuf
-        // variants don't carry pixel-affecting state beyond
-        // (buffer_key, content_version) which are already hashed.
-        if let SceneContent::BlurredBackdrop { passes, radius } = &e.content {
-            passes.hash(&mut h);
-            radius.to_bits().hash(&mut h);
-        }
-    }
-    for b in &scene.borders {
-        b.x.to_bits().hash(&mut h);
-        b.y.to_bits().hash(&mut h);
-        b.w.to_bits().hash(&mut h);
-        b.h.to_bits().hash(&mut h);
-        for c in b.rgba {
-            c.to_bits().hash(&mut h);
-        }
-        b.corner_radius.to_bits().hash(&mut h);
-        b.border_width.to_bits().hash(&mut h);
-    }
-    h.finish()
-}
-
 /// Upload (or re-upload) a SHM-backed scene element to a GL texture.
 /// Keeps a per-`buffer_key` cache so subsequent frames use glTexSubImage2D.
 fn upload_shm_texture(
@@ -1404,23 +1290,9 @@ fn upload_shm_texture(
     // Reuse an existing texture only if it's SHM-backed AND the same size.
     // A dmabuf->SHM transition on the same buffer_key (rare but possible
     // if a wl_buffer is re-imported) must rebuild the texture.
-    //
-    // When the cache hit also matches the incoming `content_version`,
-    // the pixels currently in the texture are still current — no
-    // commit has happened since the last upload — so we can skip the
-    // glTexSubImage2D entirely. That's the dominant case for static
-    // SHM clients (wallpaper, idle waybar, cursor) and was costing
-    // ~2.5 ms/frame in re-uploads of unchanged bytes before this.
-    let cached = textures.get(&elem.buffer_key);
-    let cache_compatible = cached.is_some_and(|e| {
-        e.egl_image.is_none() && e.width == elem.width && e.height == elem.height
+    let needs_new = textures.get(&elem.buffer_key).is_none_or(|e| {
+        e.egl_image.is_some() || e.width != elem.width || e.height != elem.height
     });
-    if cache_compatible
-        && cached.unwrap().uploaded_version == elem.content_version
-    {
-        return Ok(());
-    }
-    let needs_new = !cache_compatible;
 
     unsafe {
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
@@ -1469,11 +1341,10 @@ fn upload_shm_texture(
                     height: elem.height,
                     egl_image: None,
                     target: glow::TEXTURE_2D,
-                    uploaded_version: elem.content_version,
                 },
             );
         } else {
-            let entry = textures.get_mut(&elem.buffer_key).unwrap();
+            let entry = textures.get(&elem.buffer_key).unwrap();
             gl.bind_texture(glow::TEXTURE_2D, Some(entry.tex));
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
@@ -1486,7 +1357,6 @@ fn upload_shm_texture(
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(pixels),
             );
-            entry.uploaded_version = elem.content_version;
         }
     }
     Ok(())
@@ -1641,13 +1511,6 @@ fn import_dmabuf_texture(
             height: elem.height,
             egl_image: Some(image),
             target: GL_TEXTURE_EXTERNAL_OES,
-            // dmabuf textures sample directly from the imported
-            // EGLImage; the byte path that `uploaded_version`
-            // tracks doesn't apply here, so we never read this
-            // field for dmabuf entries (the cache-hit short-
-            // circuit at the top of `import_dmabuf_texture`
-            // already handles re-import skipping).
-            uploaded_version: 0,
         },
     );
     Ok(())
