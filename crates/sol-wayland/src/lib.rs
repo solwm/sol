@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use sol_backend_drm::DrmPresenter;
 use std::os::fd::AsRawFd;
 use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
@@ -348,6 +348,12 @@ pub struct State {
     /// nothing actually paces off it there.
     pub screen_refresh_mhz: i32,
     pub needs_render: bool,
+    /// Owned fence FD produced by the most recent DRM render, parked
+    /// here in transit between `render_tick_inner` (which can't
+    /// register a calloop source while it holds `&mut comp.backend`)
+    /// and the source-registration pass that runs immediately after.
+    /// Always `None` outside of `render_tick_inner`.
+    pub pending_fence_fd: Option<std::os::fd::OwnedFd>,
     pub started: Instant,
     pub next_serial: u32,
     pub cursor: Cursor,
@@ -1032,6 +1038,12 @@ pub struct Compositor {
     pub state: State,
     pub display: Display<State>,
     pub backend: BackendState,
+    /// Loop handle for inserting / removing event sources from
+    /// dispatch contexts that don't see calloop directly. Concretely:
+    /// each render produces a GPU-completion fence FD that has to be
+    /// registered with the loop, and the source removes itself once
+    /// it fires. None on backends that never need this (headless).
+    pub loop_handle: Option<LoopHandle<'static, Compositor>>,
 }
 
 /// True when this surface declared a non-zero, equal min/max size
@@ -3771,11 +3783,72 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             if r.is_ok() {
                 tracing::debug!(drawn, "drm frame");
             }
-            r
+            // Strip the Option<OwnedFd> off the Result here so the
+            // surrounding Result<()> shape is preserved; the FD is
+            // routed back to the caller via a side channel because
+            // we can't register a calloop source while still holding
+            // `&mut comp.backend`.
+            r.map(|fd| {
+                if let Some(fd) = fd {
+                    comp.state.pending_fence_fd = Some(fd);
+                }
+            })
         }
     };
     comp.state.metrics.phase_render_ns += phase_render_t.elapsed().as_nanos() as u64;
     render_result?;
+
+    // Hand off any GPU-completion fence FD produced by the DRM render
+    // to a calloop source. The source fires once when the FD becomes
+    // readable (GPU finished the queued work), at which point the
+    // deferred `lock_front_buffer + page_flip` runs.
+    if let Some(fd) = comp.state.pending_fence_fd.take() {
+        if let Some(handle) = comp.loop_handle.clone() {
+            // OneShot semantics: we want the source to fire exactly
+            // once and then take itself out of the loop. Level mode
+            // matches what other one-shot fd sources in the codebase
+            // use; since we PostAction::Remove on first fire it
+            // doesn't loop.
+            let res = handle.insert_source(
+                Generic::new(fd, Interest::READ, Mode::Level),
+                |_ready, _fd, comp| {
+                    if let BackendState::Drm(p) = &mut comp.backend {
+                        match p.submit_flip_after_fence() {
+                            Ok(t) => {
+                                // Fold the deferred-phase lock + flip
+                                // costs into the same metrics the
+                                // synchronous path uses so the bench
+                                // sees a consistent attribution.
+                                comp.state.metrics.phase_render_present_lock_front_ns +=
+                                    t.present_lock_front_ns;
+                                comp.state.metrics.phase_render_present_add_fb_ns +=
+                                    t.present_add_fb_ns;
+                                comp.state.metrics.phase_render_present_page_flip_ns +=
+                                    t.present_page_flip_ns;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "submit_flip_after_fence");
+                            }
+                        }
+                    }
+                    Ok(PostAction::Remove)
+                },
+            );
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "insert fence source");
+                // Couldn't register the source — fall back to the
+                // synchronous path inline so the frame doesn't hang
+                // forever. submit_flip_after_fence works fine even
+                // when called before the GPU is done; it'll just
+                // block inside `lock_front_buffer` like the old code.
+                if let BackendState::Drm(p) = &mut comp.backend {
+                    if let Err(e) = p.submit_flip_after_fence() {
+                        tracing::warn!(error = %e, "fallback submit_flip");
+                    }
+                }
+            }
+        }
+    }
 
     // Don't release buffers here — release fires once, when a client
     // attaches a new buffer that replaces this one (handled in the
@@ -4142,6 +4215,7 @@ fn setup_event_loop(
         screen_height,
         screen_refresh_mhz,
         needs_render: false,
+        pending_fence_fd: None,
         started: Instant::now(),
         next_serial: 0,
         cursor,
@@ -4197,6 +4271,7 @@ fn setup_event_loop(
         state,
         display,
         backend,
+        loop_handle: Some(event_loop.handle()),
     };
     let _ = compositor.display.flush_clients();
 

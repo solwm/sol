@@ -288,6 +288,12 @@ pub struct GlStack {
     /// rendered and we log a warning on first use.
     pub gl_egl_image_target_texture_2d_oes:
         Option<unsafe extern "C" fn(target: u32, image: *mut std::ffi::c_void)>,
+    /// Function pointer for `eglDupNativeFenceFDANDROID`. `None` when
+    /// the driver doesn't advertise `EGL_ANDROID_native_fence_sync`,
+    /// in which case the presenter falls back to a synchronous
+    /// `lock_front_buffer` (CPU blocks on the GPU's implicit fence).
+    /// On Mesa+modern GPUs this is always available.
+    pub egl_dup_native_fence_fd_android: Option<fence_egl::DupNativeFenceFdAndroid>,
 }
 
 impl GlStack {
@@ -391,6 +397,33 @@ impl GlStack {
             );
         }
 
+        // Fence-export entry point. Used to take an EGL fence sync we
+        // create after each render and pull a pollable FD out of it.
+        // The FD becomes readable when the GPU has finished the work
+        // queued before the sync — i.e. when the BO is safe to flip —
+        // letting calloop wake us instead of blocking the render
+        // thread inside `gbm_surface_lock_front_buffer`.
+        let egl_dup_native_fence_fd_android: Option<fence_egl::DupNativeFenceFdAndroid> =
+            egl
+                .get_proc_address("eglDupNativeFenceFDANDROID")
+                .map(|p| unsafe { std::mem::transmute(p) });
+        let egl_exts = egl
+            .query_string(Some(display), egl::EXTENSIONS)
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if egl_dup_native_fence_fd_android.is_none()
+            || !egl_exts.contains("EGL_ANDROID_native_fence_sync")
+        {
+            tracing::warn!(
+                exts = %egl_exts,
+                "EGL_ANDROID_native_fence_sync unavailable; falling back to synchronous lock_front_buffer (≈2-3ms CPU block per frame at 4K@240)"
+            );
+        } else {
+            tracing::info!(
+                "EGL_ANDROID_native_fence_sync available; lock_front_buffer will be deferred until GPU done"
+            );
+        }
+
         // Verify the GLES2 extensions we actually depend on are present.
         // Mesa almost always has these on DRM-backed EGL; if they're
         // missing (e.g. exotic vendor driver), dmabuf clients would
@@ -419,8 +452,76 @@ impl GlStack {
             gbm,
             gbm_surface,
             gl_egl_image_target_texture_2d_oes,
+            egl_dup_native_fence_fd_android,
         })
     }
+
+    /// Insert a GPU fence after the currently-queued GL commands and
+    /// dup out an FD that becomes readable when those commands have
+    /// completed on the GPU. Returns `None` if the driver doesn't
+    /// support `EGL_ANDROID_native_fence_sync`, the sync object
+    /// couldn't be created, or the FD couldn't be exported — caller
+    /// is expected to fall back to a synchronous wait in any of those
+    /// cases.
+    ///
+    /// `eglCreateSync` for `EGL_SYNC_NATIVE_FENCE_ANDROID` may need a
+    /// `glFlush` before it to be sure the queued work is in the GPU
+    /// command stream; we pair it with the `swap_buffers` that
+    /// happens immediately before this call (swap_buffers always
+    /// implies glFlush).
+    pub fn create_fence_sync_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let dup = self.egl_dup_native_fence_fd_android?;
+        // SAFETY: create_sync / destroy_sync are marked unsafe by
+        // khronos_egl because the type/attribs combination has to
+        // match what the driver expects. We pass
+        // EGL_SYNC_NATIVE_FENCE_ANDROID with an empty attrib list,
+        // which is exactly the form the spec calls out for "create a
+        // fence in the current command stream and let me dup its
+        // FD." Any other use of these calls would need its own
+        // safety justification.
+        let sync = unsafe {
+            self.egl.create_sync(
+                self.display,
+                fence_egl::EGL_SYNC_NATIVE_FENCE_ANDROID,
+                &[egl::ATTRIB_NONE],
+            )
+        }
+        .ok()?;
+        let raw_fd = unsafe { dup(self.display.as_ptr(), sync.as_ptr()) };
+        // Destroying the sync object is independent of the dup'd FD —
+        // the FD owns its own kernel reference to the underlying
+        // fence. Failure here is logged but doesn't invalidate the FD
+        // we already pulled out.
+        if let Err(e) = unsafe { self.egl.destroy_sync(self.display, sync) } {
+            tracing::warn!(error = ?e, "destroy_sync after fence dup");
+        }
+        if raw_fd == fence_egl::EGL_NO_NATIVE_FENCE_FD_ANDROID {
+            return None;
+        }
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) })
+    }
+}
+
+/// EGL extension tokens for `EGL_ANDROID_native_fence_sync`. Lets us
+/// create a sync object backed by an exportable native fence — the FD
+/// becomes readable when the GPU has finished the work that was queued
+/// at sync-creation time. Not in khronos_egl, so we spell out what we
+/// need.
+pub mod fence_egl {
+    /// `EGL_SYNC_NATIVE_FENCE_ANDROID`. Pass to `eglCreateSyncKHR` (or
+    /// `eglCreateSync` in EGL 1.5) as the sync type.
+    pub const EGL_SYNC_NATIVE_FENCE_ANDROID: khronos_egl::Enum = 0x3144;
+    /// Returned by `eglDupNativeFenceFDANDROID` to mean "no fence FD
+    /// could be exported." We map it to `None`.
+    pub const EGL_NO_NATIVE_FENCE_FD_ANDROID: i32 = -1;
+    /// FFI signature of `eglDupNativeFenceFDANDROID`. Returns a new
+    /// owned FD on success, `EGL_NO_NATIVE_FENCE_FD_ANDROID` on
+    /// failure.
+    pub type DupNativeFenceFdAndroid = unsafe extern "C" fn(
+        display: khronos_egl::EGLDisplay,
+        sync: khronos_egl::EGLSync,
+    ) -> i32;
 }
 
 /// EGL extension tokens for dmabuf import (EGL_EXT_image_dma_buf_import +

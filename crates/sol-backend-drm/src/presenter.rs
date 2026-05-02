@@ -53,6 +53,18 @@ pub struct DrmPresenter {
     /// we'd rather just drop the extra frame than error out of the
     /// render loop.
     pending_flip: bool,
+    /// Set after `render_scene` has issued GL commands + swap_buffers
+    /// + extracted a GPU-completion fence, and is now waiting for the
+    /// fence to signal so the deferred `lock_front_buffer + page_flip`
+    /// can fire. The fence FD itself lives in the wayland-side calloop
+    /// source registered for this frame; this flag is the
+    /// presenter-side mirror that gates a new render (combined with
+    /// `pending_flip` via `is_busy`). Cleared by
+    /// `submit_flip_after_fence`. Always `false` on the synchronous
+    /// fallback path (no fence support) — the lock + flip happens
+    /// inline at the end of `render_scene` and we go straight to
+    /// `pending_flip`.
+    pending_render: bool,
     /// Shader program for SHM textures: `sampler2D` on `GL_TEXTURE_2D`.
     quad: QuadProgram,
     /// Shader program for dmabuf textures: `samplerExternalOES` on
@@ -324,6 +336,7 @@ impl DrmPresenter {
             scanned_out: None,
             pending_bo: None,
             pending_flip: false,
+            pending_render: false,
             quad,
             quad_external,
             solid,
@@ -521,13 +534,19 @@ impl DrmPresenter {
     /// flight when this is called, we silently drop the frame rather
     /// than error — the client will get a frame callback once the
     /// current flip completes and can submit again then.
+    /// Returns `Ok(Some(fd))` when the deferred-flip fast path was
+    /// taken and the caller must register `fd` for readiness — once
+    /// it's readable, call `submit_flip_after_fence` to complete the
+    /// frame. Returns `Ok(None)` when the inline path was taken (no
+    /// fence support, or the presenter was already busy and dropped
+    /// the frame).
     pub fn render_scene(
         &mut self,
         scene: &Scene,
         timing: &mut RenderTiming,
-    ) -> Result<()> {
-        if self.pending_flip {
-            return Ok(());
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
+        if self.is_busy() {
+            return Ok(None);
         }
         let w = self.width as i32;
         let h = self.height as i32;
@@ -794,7 +813,7 @@ impl DrmPresenter {
         }
         timing.draw_ns += t_draw.elapsed().as_nanos() as u64;
         let t_present = Instant::now();
-        let r = self.submit_flip(timing);
+        let r = self.submit_render(timing);
         timing.present_ns += t_present.elapsed().as_nanos() as u64;
         r
     }
@@ -1123,13 +1142,19 @@ impl DrmPresenter {
         Ok(())
     }
 
-    /// Swap EGL front/back, lock the resulting GBM buffer, register a
-    /// drm framebuffer for it, and ask DRM to page-flip to it on the
-    /// next vblank. Non-blocking: the caller (render_tick) returns to
-    /// the event loop as soon as the flip is submitted, and the
-    /// flip-complete event arrives on the DRM fd and is handled by
-    /// the calloop source in the main loop.
-    fn submit_flip(&mut self, timing: &mut RenderTiming) -> Result<()> {
+    /// Finish a frame: swap_buffers, then either return a fence FD so
+    /// the caller can defer `lock_front_buffer + page_flip` until the
+    /// GPU has finished (the fast path) or do everything inline if the
+    /// driver doesn't support fence export (the fallback). Returns
+    /// `Ok(Some(fd))` when the deferred path is in effect — caller
+    /// must register the FD with its event loop and call
+    /// `submit_flip_after_fence` once it becomes readable. Returns
+    /// `Ok(None)` when the inline path ran and the page flip is
+    /// already submitted (`pending_flip == true`).
+    fn submit_render(
+        &mut self,
+        timing: &mut RenderTiming,
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
         let t_swap = Instant::now();
         self.gl_stack
             .egl
@@ -1137,9 +1162,21 @@ impl DrmPresenter {
             .map_err(|e| anyhow!("swap_buffers: {e:?}"))?;
         timing.present_swap_buffers_ns += t_swap.elapsed().as_nanos() as u64;
 
+        // Fast path: pull a GPU-completion fence out of EGL and hand
+        // it back to the caller. The deferred lock + flip happens in
+        // `submit_flip_after_fence` once the FD is readable.
+        if let Some(fd) = self.gl_stack.create_fence_sync_fd() {
+            self.pending_render = true;
+            return Ok(Some(fd));
+        }
+
+        // Fallback: driver didn't give us a fence FD. Block on
+        // lock_front_buffer here, same as before the fence work.
+        // Recorded in `present_lock_front_ns` so the bench still
+        // attributes the wait correctly.
         let t_lock = Instant::now();
         let next_bo = unsafe { self.gl_stack.gbm_surface.lock_front_buffer() }
-            .context("lock_front_buffer in present")?;
+            .context("lock_front_buffer in present (fallback)")?;
         timing.present_lock_front_ns += t_lock.elapsed().as_nanos() as u64;
 
         let t_fb = Instant::now();
@@ -1154,11 +1191,71 @@ impl DrmPresenter {
 
         self.pending_bo = Some(next_bo);
         self.pending_flip = true;
-        Ok(())
+        Ok(None)
     }
 
+    /// Deferred half of the fast-path render: the GPU is finished, the
+    /// fence FD has signalled, and now we can call `lock_front_buffer`
+    /// without blocking. Wraps the BO in a framebuffer and submits the
+    /// page flip. Caller (the calloop fence source on the wayland
+    /// side) is responsible for closing the FD it was registered with;
+    /// this method only touches presenter state.
+    ///
+    /// On success the presenter transitions
+    /// `pending_render → pending_flip`. The kernel will fire a normal
+    /// page-flip-complete event on the DRM fd; the existing
+    /// `drain_events` handler clears `pending_flip` from there.
+    ///
+    /// Returns the lock + add_fb + page_flip wall-clock breakdown so
+    /// the caller can attribute the deferred-phase cost to the right
+    /// metrics — the bench wants to see that lock_front_buffer
+    /// dropped from ~2-3ms (synchronous) to <100µs (fence-deferred).
+    /// On any error we clear `pending_render` regardless so the next
+    /// render can proceed; sticky state would deadlock the presenter.
+    pub fn submit_flip_after_fence(&mut self) -> Result<RenderTiming> {
+        let mut t = RenderTiming::default();
+        if !self.pending_render {
+            return Ok(t);
+        }
+        let result = (|| -> Result<()> {
+            let t_lock = Instant::now();
+            let next_bo = unsafe { self.gl_stack.gbm_surface.lock_front_buffer() }
+                .context("lock_front_buffer after fence signal")?;
+            t.present_lock_front_ns = t_lock.elapsed().as_nanos() as u64;
+
+            let t_fb = Instant::now();
+            let next_fb = get_or_add_fb(&self.card, &next_bo, &mut self.fb_cache)?;
+            t.present_add_fb_ns = t_fb.elapsed().as_nanos() as u64;
+
+            let t_flip = Instant::now();
+            self.card
+                .page_flip(self.sel.crtc, next_fb, PageFlipFlags::EVENT, None)
+                .context("page_flip after fence signal")?;
+            t.present_page_flip_ns = t_flip.elapsed().as_nanos() as u64;
+
+            self.pending_bo = Some(next_bo);
+            self.pending_flip = true;
+            Ok(())
+        })();
+        // Always exit `pending_render` — either we transitioned to
+        // `pending_flip` (success) or we failed and the next render
+        // tick gets to retry from idle.
+        self.pending_render = false;
+        result.map(|_| t)
+    }
+
+    /// Combined state guard for `render_tick`. We're "busy" — must not
+    /// start a new render — when either a flip is queued in the kernel
+    /// (`pending_flip`) or a render's GPU work is still finishing and
+    /// we're waiting on the fence FD (`pending_render`).
+    pub fn is_busy(&self) -> bool {
+        self.pending_flip || self.pending_render
+    }
+
+    /// Back-compat alias kept so `render_tick` keeps reading the way
+    /// it always has. Returns `is_busy()` semantics.
     pub fn is_pending_flip(&self) -> bool {
-        self.pending_flip
+        self.is_busy()
     }
 
     /// Drain outstanding DRM events from the card's fd and, for each

@@ -146,11 +146,15 @@ The trick worth noting: zoom and fullscreen don't have a special render path for
 3. **Background pre-pass.** If the cache check failed, the background slice is rendered into a presenter-owned capture FBO so the blur pipeline samples a render target we wrote into (not the GBM-backed default FB, which on at least one Mesa configuration produces zero-RGB readbacks).
 4. **Blur passes.** `inactive_blur_passes` rounds of dual-Kawase blur, ping-ponging between two half-resolution FBOs. Cheap (a few fullscreen quads at 1080p / 4K) and cached across frames.
 5. **Main draw loop.** Walk the scene back-to-front. Each textured element gets a quad in NDC, the textured-quad fragment shader samples its texture, applies an SDF-based rounded-corner alpha mask if `corner_radius > 0`, multiplies in the per-element alpha, blends over what's there. Backdrops sample from the final-blur FBO instead of a buffer texture. Solid borders (the focus ring) use a separate solid-rounded-rect shader and draw at the `border_anchor` index, between tiles and top-layer.
-6. **Page flip.** `gbm_surface_lock_front_buffer` to grab the just-rendered BO, `drm.add_fb` (cached) to wrap it in a framebuffer object, `drm.page_flip` to schedule it for the next vblank. We set `pending_flip = true` and return.
+6. **Render → fence → deferred flip.** After the GL draw loop finishes, `submit_render` issues `eglSwapBuffers` (which queues commands and returns) and creates an `EGL_SYNC_NATIVE_FENCE_ANDROID` sync object. `eglDupNativeFenceFDANDROID` extracts a pollable FD from that sync — readable when the GPU has finished the work the swap kicked off. The presenter sets `pending_render = true` and returns the FD up to the wayland-side; the wayland-side registers it as a one-shot `Generic` calloop source. Nothing has called `lock_front_buffer` yet — that's the point. The render thread returns to the event loop while the GPU is still working, freeing it to handle other client traffic.
 
-The page flip is **not** waited on synchronously — that was the old model. Now the kernel wakes us via a readable event on the DRM fd; calloop's source callback drains the events, calls our `drain_events`, which clears `pending_flip` and releases the previous BO back to GBM. If anything was animating, we set `needs_render = true` and the loop schedules the next tick.
+When the fence FD signals (GPU done), the calloop source fires and `submit_flip_after_fence` runs: `lock_front_buffer` (now cheap because the implicit fence is already signalled), `add_fb` (cached), `page_flip(EVENT)`. State transitions `pending_render → pending_flip`. The kernel queues the flip for the next vblank.
 
-This async-flip model is what keeps the compositor responsive when a render takes longer than expected: nothing piles up, the next tick simply notices `pending_flip` and bails early.
+The fallback path (driver doesn't advertise `EGL_ANDROID_native_fence_sync`) keeps the old synchronous order — `submit_render` calls lock + add_fb + page_flip inline, blocking on the implicit fence — and skips the calloop dance entirely. A startup log line tells you which path you're on.
+
+The page flip is **not** waited on synchronously — that was the old model. The kernel wakes us via a readable event on the DRM fd; calloop's source callback drains the events, calls our `drain_events`, which clears `pending_flip` and releases the previous BO back to GBM. If anything was animating, we set `needs_render = true` and the loop schedules the next tick.
+
+`is_busy()` covers both `pending_flip` and `pending_render` so a re-entry into `render_tick` doesn't try to start a second frame on top of an in-flight one.
 
 ## 10. Input
 
