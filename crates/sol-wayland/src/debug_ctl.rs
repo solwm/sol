@@ -223,6 +223,10 @@ struct MetricsDump {
     /// many wakeups while we were waiting for vblank, which is
     /// usually a sign of `needs_render` being set redundantly.
     ticks_skipped: u64,
+    /// Frames that early-returned because the scene digest matched
+    /// the last successfully-flipped one. Each entry here is a
+    /// ~2 ms `lock_front_buffer` we avoided.
+    flips_skipped: u64,
     page_flips: u64,
     render_tick_total_ns: u64,
     render_tick_max_ns: u64,
@@ -337,6 +341,7 @@ fn snapshot_response(comp: &Compositor) -> String {
         uptime_ms: comp.state.started.elapsed().as_millis() as u64,
         frames_rendered: m.frames_rendered,
         ticks_skipped: m.ticks_skipped,
+        flips_skipped: m.flips_skipped,
         page_flips: m.page_flips,
         render_tick_total_ns: m.render_tick_total_ns,
         render_tick_max_ns: m.render_tick_max_ns,

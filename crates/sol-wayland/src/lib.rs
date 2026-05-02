@@ -624,6 +624,11 @@ pub struct State {
 pub struct Metrics {
     pub frames_rendered: u64,
     pub ticks_skipped: u64,
+    /// Frames where `render_scene` early-returned because the scene
+    /// digest matched the last successfully-flipped one. No GPU
+    /// work, no page flip. Counter-intuitively this is GOOD: every
+    /// entry here is a ~2 ms `lock_front_buffer` we skipped.
+    pub flips_skipped: u64,
     pub page_flips: u64,
     pub render_tick_total_ns: u64,
     pub render_tick_max_ns: u64,
@@ -3790,6 +3795,21 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             comp.state.metrics.phase_render_present_lock_ns += t.present_lock_ns;
             comp.state.metrics.phase_render_present_addfb_ns += t.present_addfb_ns;
             comp.state.metrics.phase_render_present_pageflip_ns += t.present_pageflip_ns;
+            if t.skipped {
+                comp.state.metrics.flips_skipped += 1;
+                // Skipped flips don't fire flip-complete events, so
+                // the page-flip handler that normally drains
+                // pending_frame_callbacks won't run for this tick.
+                // Fire them inline with the current timestamp —
+                // wl_surface.frame is a throttle ("you may render
+                // again"), and skipping is precisely the case
+                // where the client's previous content is already
+                // on screen, so callback semantics are satisfied.
+                let ts = comp.state.elapsed_ms();
+                for cb in std::mem::take(&mut comp.state.pending_frame_callbacks) {
+                    cb.done(ts);
+                }
+            }
             if r.is_ok() {
                 tracing::debug!(drawn, "drm frame");
             }

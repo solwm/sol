@@ -109,6 +109,20 @@ pub struct DrmPresenter {
     /// connector properties) and reused for every subsequent call,
     /// so blank/unblank transitions are a single ioctl.
     dpms_prop: Option<property::Handle>,
+    /// Hash of the most recently *flipped* scene. Compared against
+    /// the digest of the incoming Scene at the top of `render_scene`
+    /// — equal means the previous frame's contents are still on
+    /// screen and would be identical to this one, so we skip the
+    /// entire render+flip path and let the kernel keep scanning out
+    /// the BO that's already up there. Eliminates the ~2 ms
+    /// `lock_front_buffer` cost on otherwise-redundant frames.
+    /// `None` until the first successful flip — we always flip
+    /// frame zero so there's something on screen.
+    last_flipped_digest: Option<u64>,
+    /// Bumped each time `render_scene` early-returned because the
+    /// digest matched. Surfaced via metrics so a benchmark can tell
+    /// how many wakeups the optimisation absorbed.
+    pub flips_skipped: u64,
 }
 
 /// Three FBOs at half output resolution used by the inactive-window
@@ -336,6 +350,8 @@ impl DrmPresenter {
             height,
             saved_crtc,
             dpms_prop: None,
+            last_flipped_digest: None,
+            flips_skipped: 0,
         };
         presenter.initial_modeset()?;
         Ok(presenter)
@@ -525,6 +541,22 @@ impl DrmPresenter {
         timing: &mut RenderTiming,
     ) -> Result<()> {
         if self.pending_flip {
+            return Ok(());
+        }
+        // Skip-flip optimisation: if the scene we'd produce is
+        // byte-identical to the one currently scanning out, drop
+        // the entire render+flip path. The kernel keeps showing the
+        // previous BO; we save ~2 ms of `lock_front_buffer` plus
+        // the draw + swap. First frame after startup has no
+        // baseline, so it always renders. Frame callbacks aren't
+        // fired here — when no flip happens the client's content
+        // (which IS already on screen from a prior flip) shouldn't
+        // be re-throttled, the flip-complete handler already did
+        // its job.
+        let digest = compute_scene_digest(scene);
+        if Some(digest) == self.last_flipped_digest {
+            self.flips_skipped += 1;
+            timing.skipped = true;
             return Ok(());
         }
         let w = self.width as i32;
@@ -794,6 +826,12 @@ impl DrmPresenter {
         let t_present = Instant::now();
         let r = self.submit_flip(timing);
         timing.present_ns += t_present.elapsed().as_nanos() as u64;
+        if r.is_ok() {
+            // Only record the digest on success — a half-failed
+            // submit_flip leaves the previous BO on screen, and
+            // we want the next render to retry rather than skip.
+            self.last_flipped_digest = Some(digest);
+        }
         r
     }
 
@@ -1262,6 +1300,64 @@ fn compute_bg_signature(elems: &[sol_core::SceneElement<'_>]) -> u64 {
         e.y.to_bits().hash(&mut h);
         e.dst_width.to_bits().hash(&mut h);
         e.dst_height.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Hash of every input that would affect the rendered pixels for
+/// this Scene. Compared across frames at the top of `render_scene`:
+/// match means the previous frame's pixels would render identically,
+/// so we can skip the entire render+flip path. Captures every
+/// SceneElement field the shaders read (rect, alpha, UV, corner
+/// radius, content-version), every SceneBorder field, and the
+/// background_count / border_anchor positions so a z-order change
+/// also invalidates.
+///
+/// Backdrop elements include their `passes` and `radius` since
+/// those drive the blur output. The implicit assumption: when a
+/// backdrop's source background hasn't changed (its
+/// `background_count` slice is byte-identical, captured by the
+/// hashed elements), a cached blur output produces the same
+/// pixels — `compute_bg_signature` already reaches that conclusion
+/// for the blur-FBO cache, so this digest does too transitively.
+fn compute_scene_digest(scene: &sol_core::Scene<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    scene.elements.len().hash(&mut h);
+    scene.borders.len().hash(&mut h);
+    scene.background_count.hash(&mut h);
+    scene.border_anchor.hash(&mut h);
+    for e in &scene.elements {
+        e.buffer_key.hash(&mut h);
+        e.content_version.hash(&mut h);
+        e.x.to_bits().hash(&mut h);
+        e.y.to_bits().hash(&mut h);
+        e.dst_width.to_bits().hash(&mut h);
+        e.dst_height.to_bits().hash(&mut h);
+        e.alpha.to_bits().hash(&mut h);
+        e.corner_radius.to_bits().hash(&mut h);
+        e.uv_x.to_bits().hash(&mut h);
+        e.uv_y.to_bits().hash(&mut h);
+        e.uv_w.to_bits().hash(&mut h);
+        e.uv_h.to_bits().hash(&mut h);
+        // Backdrop params affect the blur output; SHM/dmabuf
+        // variants don't carry pixel-affecting state beyond
+        // (buffer_key, content_version) which are already hashed.
+        if let SceneContent::BlurredBackdrop { passes, radius } = &e.content {
+            passes.hash(&mut h);
+            radius.to_bits().hash(&mut h);
+        }
+    }
+    for b in &scene.borders {
+        b.x.to_bits().hash(&mut h);
+        b.y.to_bits().hash(&mut h);
+        b.w.to_bits().hash(&mut h);
+        b.h.to_bits().hash(&mut h);
+        for c in b.rgba {
+            c.to_bits().hash(&mut h);
+        }
+        b.corner_radius.to_bits().hash(&mut h);
+        b.border_width.to_bits().hash(&mut h);
     }
     h.finish()
 }

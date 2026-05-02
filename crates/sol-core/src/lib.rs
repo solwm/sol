@@ -215,4 +215,9 @@ pub struct RenderTiming {
     pub present_lock_ns: u64,
     pub present_addfb_ns: u64,
     pub present_pageflip_ns: u64,
+    /// True when `render_scene` early-returned because the incoming
+    /// scene's digest matched the previously-flipped one. Lets the
+    /// caller account "frames skipped to save a redundant flip"
+    /// separately from frames that actually drew.
+    pub skipped: bool,
 }
