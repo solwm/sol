@@ -96,6 +96,16 @@ pub struct SceneElement<'a> {
     /// transition) and preserves correct blending against whatever
     /// is behind the window.
     pub corner_radius: f32,
+    /// Compositor-side version of the buffer's content. Bumps each
+    /// time the source surface commits a (possibly-rewritten) buffer
+    /// — same `buffer_key` with a new `content_version` means the
+    /// pixels may differ from what the GPU has cached. Backends that
+    /// hold a per-`buffer_key` texture cache compare this against
+    /// the version they last uploaded, and skip the re-upload (and
+    /// the GPU sync that comes with it) when the values match.
+    /// Static elements (cursor sprite, blurred backdrop) pass `0`
+    /// — they never change after their first upload.
+    pub content_version: u64,
     pub content: SceneContent<'a>,
 }
 

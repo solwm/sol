@@ -309,6 +309,11 @@ pub struct ClosingWindow {
     /// Optional viewport src — preserved so the same crop the live
     /// window had keeps working through the fade.
     pub vsrc: Option<(f64, f64, f64, f64)>,
+    /// Frozen `commit_seq` from the source surface at the moment of
+    /// close — the surface itself is gone, so this never bumps
+    /// again. Lets the texture cache see the same version every
+    /// frame of the close animation and skip re-uploads.
+    pub commit_seq: u64,
 }
 
 /// In-flight workspace crossfade. While set, both the outgoing and
@@ -1269,10 +1274,11 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
                     let sd = arc.lock().ok()?;
                     let buf = sd.current.buffer.clone()?;
                     let vsrc = sd.viewport_src;
-                    Some((buf, vsrc))
+                    let commit_seq = sd.commit_seq;
+                    Some((buf, vsrc, commit_seq))
                 })
             });
-        if let Some((buffer, vsrc)) = buffer {
+        if let Some((buffer, vsrc, commit_seq)) = buffer {
             state.closing_windows.push(ClosingWindow {
                 buffer,
                 render_rect: win.render_rect,
@@ -1282,6 +1288,7 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
                 render_scale: win.render_scale,
                 vel_scale: win.vel_scale,
                 vsrc,
+                commit_seq,
             });
         }
     }
@@ -1839,6 +1846,13 @@ enum Placed {
         /// to the parent's rounded shape would require a stencil
         /// pass we don't have yet.
         corner_radius: f32,
+        /// Source surface's `commit_seq` at scene-collection time.
+        /// Plumbs into `SceneElement::content_version` so the DRM
+        /// texture cache can skip re-uploading SHM pixels that
+        /// haven't changed. Closing-window snapshots and the cursor
+        /// (which uses static pixels) pass `0` — they hit the cache
+        /// after the first frame.
+        content_version: u64,
     },
     Backdrop {
         rect: RectF,
@@ -1874,6 +1888,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                content_version: surface_commit_seq(&ml.surface),
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -2004,6 +2019,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                     vsrc,
                     alpha: win_alpha,
                     corner_radius,
+                    content_version: surface_commit_seq(&surface),
                 });
             }
             emit_subsurface_tree(
@@ -2044,6 +2060,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             vsrc: cw.vsrc,
             alpha: cw.render_alpha,
             corner_radius,
+            content_version: cw.commit_seq,
         });
     }
 
@@ -2069,6 +2086,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                content_version: surface_commit_seq(&ml.surface),
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -2087,9 +2105,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             .find(|w| w.surface.upgrade().ok().as_ref() == Some(fs))
         {
             if let Some(sd_arc) = fs.data::<Arc<Mutex<SurfaceData>>>() {
-                let (buf, vsrc) = {
+                let (buf, vsrc, commit_seq) = {
                     let sd = sd_arc.lock().unwrap();
-                    (sd.current.buffer.clone(), sd.viewport_src)
+                    (sd.current.buffer.clone(), sd.viewport_src, sd.commit_seq)
                 };
                 // Honor open animation in fullscreen too — popping
                 // up scaled and fading in still reads natural even
@@ -2102,6 +2120,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: win.render_alpha,
                         corner_radius: 0.0,
+                        content_version: commit_seq,
                     });
                 }
                 emit_subsurface_tree(
@@ -2129,12 +2148,13 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
         let Ok(surface) = dlg.surface.upgrade() else { continue };
         let Some((dx, dy)) = dialog_render_origin(state, idx) else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (buf, vsrc, logical) = {
+        let (buf, vsrc, logical, commit_seq) = {
             let sd = sd_arc.lock().unwrap();
             (
                 sd.current.buffer.clone(),
                 sd.viewport_src,
                 surface_logical_size(&sd),
+                sd.commit_seq,
             )
         };
         let Some((dw, dh)) = logical else { continue };
@@ -2147,6 +2167,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius,
+                content_version: commit_seq,
             });
         }
         emit_subsurface_tree(&mut out, &surface, dx, dy, 1.0);
@@ -2169,14 +2190,21 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
     for popup in &state.mapped_popups {
         let Ok(surface) = popup.upgrade() else { continue };
         let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (offset, buf, vsrc, geom, buf_dims) = {
+        let (offset, buf, vsrc, geom, buf_dims, commit_seq) = {
             let sd = sd_arc.lock().unwrap();
             let SurfaceRole::XdgPopup { mapped: true, offset, .. } = sd.role else {
                 continue;
             };
             let buf = sd.current.buffer.clone();
             let buf_dims = buf.as_ref().and_then(surface_buffer_dims);
-            (offset, buf, sd.viewport_src, sd.xdg_window_geometry, buf_dims)
+            (
+                offset,
+                buf,
+                sd.viewport_src,
+                sd.xdg_window_geometry,
+                buf_dims,
+                sd.commit_seq,
+            )
         };
         let Some((origin_x, origin_y)) = popup_screen_origin(state, &surface) else {
             continue;
@@ -2204,6 +2232,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                content_version: commit_seq,
             });
         }
         emit_subsurface_tree(&mut out, &surface, buffer_x, buffer_y, 1.0);
@@ -2220,6 +2249,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                content_version: surface_commit_seq(&ml.surface),
             });
             emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
@@ -2239,11 +2269,11 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             .and_then(|w| w.upgrade().ok())
         {
             if let Some(sd_arc) = cur.data::<Arc<Mutex<SurfaceData>>>() {
-                let (buf, vsrc, dims) = {
+                let (buf, vsrc, dims, commit_seq) = {
                     let sd = sd_arc.lock().unwrap();
                     let buf = sd.current.buffer.clone();
                     let dims = buf.as_ref().and_then(surface_buffer_dims);
-                    (buf, sd.viewport_src, dims)
+                    (buf, sd.viewport_src, dims, sd.commit_seq)
                 };
                 if let (Some(buf), Some((w, h))) = (buf, dims) {
                     let cx = state.cursor.pos_x as f32
@@ -2261,6 +2291,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: 1.0,
                         corner_radius: 0.0,
+                        content_version: commit_seq,
                     });
                     emit_subsurface_tree(&mut out, &cur, cx, cy, 1.0);
                 }
@@ -2275,6 +2306,17 @@ fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
         .lock()
         .ok()?
         .viewport_src
+}
+
+/// Read the surface's `commit_seq` for use as a SceneElement's
+/// `content_version`. Falls back to `0` for surfaces missing
+/// `SurfaceData` (shouldn't happen for anything we emit, but
+/// defensive — `0` just means "always treat as cache hit", which
+/// is correct for content that never changes).
+fn surface_commit_seq(s: &WlSurface) -> u64 {
+    s.data::<Arc<Mutex<SurfaceData>>>()
+        .and_then(|sd| sd.lock().ok().map(|g| g.commit_seq))
+        .unwrap_or(0)
 }
 
 /// Walk a surface's subsurface_children recursively, pushing each mapped
@@ -2307,7 +2349,7 @@ fn emit_subsurface_tree(
         let Some(child_sd_arc) = child.data::<Arc<Mutex<SurfaceData>>>() else {
             continue;
         };
-        let (buf_opt, child_x, child_y, vsrc, logical) = {
+        let (buf_opt, child_x, child_y, vsrc, logical, commit_seq) = {
             let sd = child_sd_arc.lock().unwrap();
             let (ox, oy) = sd.subsurface_offset;
             let buf = sd.current.buffer.clone();
@@ -2317,6 +2359,7 @@ fn emit_subsurface_tree(
                 parent_y + oy as f32,
                 sd.viewport_src,
                 surface_logical_size(&sd),
+                sd.commit_seq,
             )
         };
         if let Some(buf) = buf_opt {
@@ -2349,6 +2392,7 @@ fn emit_subsurface_tree(
                 // reasoning. Rounded clipping inside the parent
                 // would need a stencil pass.
                 corner_radius: 0.0,
+                content_version: commit_seq,
             });
         }
         emit_subsurface_tree(out, &child, child_x, child_y, alpha);
@@ -2370,9 +2414,9 @@ fn scene_from_buffers<'a>(
     // want (cursor on top).
     scene.border_anchor = border_anchor;
     for p in placed {
-        let (buf, rect, vsrc, alpha, corner_radius) = match p {
-            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius } => {
-                (buf, rect, vsrc, alpha, corner_radius)
+        let (buf, rect, vsrc, alpha, corner_radius, content_version) = match p {
+            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius, content_version } => {
+                (buf, rect, vsrc, alpha, corner_radius, content_version)
             }
             Placed::Backdrop {
                 rect,
@@ -2400,6 +2444,7 @@ fn scene_from_buffers<'a>(
                     uv_h: 1.0,
                     alpha: *alpha,
                     corner_radius: *corner_radius,
+                    content_version: 0,
                     content: SceneContent::BlurredBackdrop {
                         passes: *passes,
                         radius: *radius,
@@ -2427,6 +2472,7 @@ fn scene_from_buffers<'a>(
                 uv_h: uh,
                 alpha: *alpha,
                 corner_radius: *corner_radius,
+                content_version: *content_version,
                 content: SceneContent::Shm {
                     pixels: bytes,
                     stride: bd.stride,
@@ -2453,6 +2499,7 @@ fn scene_from_buffers<'a>(
                 uv_h: uh,
                 alpha: *alpha,
                 corner_radius: *corner_radius,
+                content_version: *content_version,
                 content: SceneContent::Dmabuf {
                     fd: p0.fd.as_raw_fd(),
                     fourcc: db.format,
@@ -2485,6 +2532,9 @@ fn scene_from_buffers<'a>(
             uv_h: 1.0,
             alpha: 1.0,
             corner_radius: 0.0,
+            // The cursor sprite never changes after first upload —
+            // any version constant works, the cache hits forever.
+            content_version: 0,
             content: SceneContent::Shm {
                 pixels: &cursor.pixels,
                 stride: cursor.width * 4,
