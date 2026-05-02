@@ -226,7 +226,7 @@ struct MetricsDump {
     page_flips: u64,
     render_tick_total_ns: u64,
     render_tick_max_ns: u64,
-    frame_time_ms_buckets: [u64; 6],
+    frame_time_ms_buckets: [u64; 8],
     /// Per-phase wall-clock totals over every real render. Compare
     /// across snapshots to see which phase a particular workload
     /// hit hardest. Phases: prune, layout, animations, scene

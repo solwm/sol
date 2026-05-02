@@ -58,7 +58,7 @@ One JSON object on stdout — the cumulative metrics over sol's lifetime up to s
   "page_flips": 311,
   "render_tick_total_ns": 184_000_000,
   "render_tick_max_ns": 4_500_000,
-  "frame_time_ms_buckets": [298, 12, 2, 0, 0, 0],
+  "frame_time_ms_buckets": [40, 120, 110, 28, 12, 2, 0, 0],
   "spring_ticks": 312,
   "input_events": 0,
   "ctl_commands": 372,
@@ -68,7 +68,7 @@ One JSON object on stdout — the cumulative metrics over sol's lifetime up to s
 }
 ```
 
-Buckets are frame-time histogram in ms: `[<8, <16, <33, <50, <100, >=100]`.
+Buckets are frame-time histogram in ms: `[<2, <3, <4, <5, <8, <16, <33, >=33]`. Tuned for 240Hz (4.16ms) and 144Hz (6.94ms) — buckets 0-3 fit the 240Hz budget, bucket 4 fits 144Hz, buckets 5+ are budget overruns.
 
 ## What's exercised, what isn't
 

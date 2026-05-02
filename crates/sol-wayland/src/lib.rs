@@ -632,8 +632,13 @@ pub struct Metrics {
     pub page_flips: u64,
     pub render_tick_total_ns: u64,
     pub render_tick_max_ns: u64,
-    /// Buckets (in ms): [<8, <16, <33, <50, <100, >=100].
-    pub frame_time_ms_buckets: [u64; 6],
+    /// Frame-time histogram tuned for high-refresh analysis. Boundaries
+    /// (in ms): [<2, <3, <4, <5, <8, <16, <33, >=33]. The fine cluster
+    /// at the low end is what makes 240Hz (4.16ms budget) and 144Hz
+    /// (6.94ms) regressions visible — the previous `[<8, <16, …]`
+    /// scheme parked every healthy frame in one bucket and erased
+    /// the signal.
+    pub frame_time_ms_buckets: [u64; 8],
     /// Per-phase wall-clock totals, summed over every real render.
     /// Pin which sub-step is eating the frame budget without
     /// resorting to perf / flamegraph — divide by frames_rendered
@@ -669,12 +674,14 @@ impl Metrics {
             self.render_tick_max_ns = dur_ns;
         }
         let ms = dur_ns / 1_000_000;
-        let idx = if ms < 8 { 0 }
-            else if ms < 16 { 1 }
-            else if ms < 33 { 2 }
-            else if ms < 50 { 3 }
-            else if ms < 100 { 4 }
-            else { 5 };
+        let idx = if ms < 2 { 0 }
+            else if ms < 3 { 1 }
+            else if ms < 4 { 2 }
+            else if ms < 5 { 3 }
+            else if ms < 8 { 4 }
+            else if ms < 16 { 5 }
+            else if ms < 33 { 6 }
+            else { 7 };
         self.frame_time_ms_buckets[idx] += 1;
     }
 }
@@ -691,6 +698,12 @@ pub struct Cursor {
     pub height: i32,
     pub hot_x: i32,
     pub hot_y: i32,
+    /// Same role as `BufferData::upload_seq`: lets the renderer skip
+    /// re-uploading the cursor sprite when its bitmap hasn't changed.
+    /// The default sprite is loaded once and never mutated, so this
+    /// stays at 1 forever and the GPU texture is uploaded exactly
+    /// once per process.
+    pub upload_seq: u64,
     /// Set when the focused client called `wl_pointer.set_cursor`
     /// during the current pointer-enter. Cleared on the next focus
     /// change because per spec the cursor association expires the
@@ -723,6 +736,7 @@ impl Cursor {
             client_surface: None,
             client_hot_x: 0,
             client_hot_y: 0,
+            upload_seq: 1,
         }
     }
 }
@@ -2455,6 +2469,9 @@ fn scene_from_buffers<'a>(
                     pixels: bytes,
                     stride: bd.stride,
                     format,
+                    upload_seq: bd
+                        .upload_seq
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 },
             });
         } else if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
@@ -2513,6 +2530,7 @@ fn scene_from_buffers<'a>(
                 pixels: &cursor.pixels,
                 stride: cursor.width * 4,
                 format: sol_core::PixelFormat::Argb8888,
+                upload_seq: cursor.upload_seq,
             },
         });
     }
@@ -3675,6 +3693,7 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
                         pixels,
                         stride,
                         format,
+                        upload_seq: _,
                     } => {
                         canvas.blit_argb(
                             e.x.round() as i32,

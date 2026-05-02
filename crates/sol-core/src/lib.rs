@@ -20,6 +20,15 @@ pub enum SceneContent<'a> {
         pixels: &'a [u8],
         stride: i32,
         format: PixelFormat,
+        /// Monotonic counter bumped each time the source buffer is
+        /// re-committed. Backends compare it against the version they
+        /// last uploaded for `buffer_key`; if equal, the existing GPU
+        /// texture is current and the per-frame `glTexSubImage2D` can
+        /// be skipped. Was the dominant idle cost at 240Hz — cursor /
+        /// waybar / static layer surfaces were re-uploading every
+        /// vblank because the renderer had no way to tell their
+        /// pixels hadn't changed.
+        upload_seq: u64,
     },
     Dmabuf {
         /// Raw dmabuf fd. Borrowed from the wl_buffer's user-data for one

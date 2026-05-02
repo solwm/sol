@@ -8,6 +8,7 @@
 //! buffers allocate against the new, larger mapping.
 
 use std::os::fd::OwnedFd;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use memmap2::{Mmap, MmapOptions};
@@ -39,7 +40,6 @@ pub struct PoolInner {
 
 /// User data attached to a wl_buffer. Buffers clone the pool's `Arc<Mmap>` so
 /// they outlive the wl_shm_pool resource if needed.
-#[derive(Clone)]
 pub struct BufferData {
     pub mmap: Arc<Mmap>,
     pub offset: i32,
@@ -56,6 +56,12 @@ pub struct BufferData {
     /// texture. Symptom of that aliasing: two windows briefly render
     /// the same content during rapid resize/move churn.
     pub cache_key: u64,
+    /// Bumped on each wl_surface.commit that promotes this buffer
+    /// from pending to current. Backends compare against their cached
+    /// per-key value to decide whether the SHM upload is redundant.
+    /// Starts at 1 so first-frame uploads (which see a default-zero
+    /// cached value) always run.
+    pub upload_seq: AtomicU64,
 }
 
 impl BufferData {
@@ -172,6 +178,7 @@ impl Dispatch<WlShmPool, PoolData> for State {
                     stride,
                     format,
                     cache_key: crate::next_buffer_cache_key(),
+                    upload_seq: AtomicU64::new(1),
                 };
                 let _ = init.init(id, buf);
                 tracing::trace!(width, height, stride, ?format, "wl_shm_pool.create_buffer");

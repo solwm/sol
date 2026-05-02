@@ -250,6 +250,12 @@ struct TextureEntry {
     /// GL texture target this entry is bound to. SHM uploads use
     /// GL_TEXTURE_2D; dmabuf imports use GL_TEXTURE_EXTERNAL_OES.
     target: u32,
+    /// Last `SceneContent::Shm::upload_seq` we uploaded for this key.
+    /// When the next frame's element carries the same value we skip
+    /// the `glTexSubImage2D` — the GPU texture is already current.
+    /// Unused for dmabuf entries (the EGLImage import is once-only
+    /// regardless).
+    uploaded_seq: u64,
 }
 
 impl DrmPresenter {
@@ -1255,8 +1261,13 @@ fn upload_shm_texture(
     textures: &mut HashMap<u64, TextureEntry>,
     elem: &sol_core::SceneElement<'_>,
 ) -> Result<()> {
-    let (pixels_in, stride) = match &elem.content {
-        SceneContent::Shm { pixels, stride, .. } => (*pixels, *stride),
+    let (pixels_in, stride, upload_seq) = match &elem.content {
+        SceneContent::Shm {
+            pixels,
+            stride,
+            upload_seq,
+            ..
+        } => (*pixels, *stride, *upload_seq),
         SceneContent::Dmabuf { .. } => {
             unreachable!("upload_shm_texture called with dmabuf content")
         }
@@ -1264,6 +1275,22 @@ fn upload_shm_texture(
             unreachable!("upload_shm_texture called with backdrop content")
         }
     };
+
+    // Hot path: if the cached texture already covers this seq, the GPU
+    // copy is current and we skip the entire upload (including the
+    // tight-row repack below). This is the cursor / static-waybar /
+    // wallpaper case at idle, where the per-frame glTexSubImage2D was
+    // burning ~2.4ms of textures phase per frame at 4K@240.
+    if let Some(entry) = textures.get(&elem.buffer_key) {
+        if entry.egl_image.is_none()
+            && entry.width == elem.width
+            && entry.height == elem.height
+            && entry.uploaded_seq == upload_seq
+        {
+            return Ok(());
+        }
+    }
+
     let expected_bytes = (stride as usize).saturating_mul(elem.height as usize);
     if pixels_in.len() < expected_bytes {
         tracing::warn!("scene element buffer shorter than stride*height; skipping");
@@ -1341,10 +1368,11 @@ fn upload_shm_texture(
                     height: elem.height,
                     egl_image: None,
                     target: glow::TEXTURE_2D,
+                    uploaded_seq: upload_seq,
                 },
             );
         } else {
-            let entry = textures.get(&elem.buffer_key).unwrap();
+            let entry = textures.get_mut(&elem.buffer_key).unwrap();
             gl.bind_texture(glow::TEXTURE_2D, Some(entry.tex));
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
@@ -1357,6 +1385,7 @@ fn upload_shm_texture(
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(pixels),
             );
+            entry.uploaded_seq = upload_seq;
         }
     }
     Ok(())
@@ -1511,6 +1540,9 @@ fn import_dmabuf_texture(
             height: elem.height,
             egl_image: Some(image),
             target: GL_TEXTURE_EXTERNAL_OES,
+            // Unused for dmabuf — the EGLImage import is the upload;
+            // there's no per-frame `glTexSubImage2D` to skip.
+            uploaded_seq: 0,
         },
     );
     Ok(())
