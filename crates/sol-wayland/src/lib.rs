@@ -39,6 +39,8 @@ mod compositor;
 mod config;
 mod cursor;
 mod data_device;
+#[cfg(feature = "debug-ctl")]
+mod debug_ctl;
 mod ext_workspace;
 mod fractional_scale;
 mod idle_inhibit;
@@ -588,6 +590,59 @@ pub struct State {
     /// workspace's mode and restores the arriving workspace's mode.
     pub fullscreened_per_workspace:
         std::collections::HashMap<u32, Weak<WlSurface>>,
+    /// Cumulative compositor metrics. Always populated (overhead is
+    /// a handful of integer adds per frame); the `debug-ctl` feature
+    /// surfaces these via the control socket so a benchmark harness
+    /// can read them out without scraping log lines.
+    pub metrics: Metrics,
+    /// Control-socket state when sol is built with `--features
+    /// debug-ctl`. Bench harness writes line-delimited JSON commands
+    /// here; sol writes line-delimited responses back. None in
+    /// normal release builds (the field stays for type uniformity
+    /// but never gets populated).
+    #[cfg(feature = "debug-ctl")]
+    pub debug_ctl: Option<debug_ctl::DebugCtl>,
+}
+
+/// Cumulative counters covering one sol process's lifetime. Reset
+/// only on restart. The `frame_time_ms_buckets` histogram is
+/// intentionally coarse — six buckets is enough to spot regressions
+/// (everything under 8ms vs everything spilling into 33ms+) without
+/// turning the dump into a CSV.
+#[derive(Debug, Default, Clone)]
+pub struct Metrics {
+    pub frames_rendered: u64,
+    pub page_flips: u64,
+    pub render_tick_total_ns: u64,
+    pub render_tick_max_ns: u64,
+    /// Buckets (in ms): [<8, <16, <33, <50, <100, >=100].
+    pub frame_time_ms_buckets: [u64; 6],
+    pub texture_uploads: u64,
+    pub texture_evictions: u64,
+    pub spring_ticks: u64,
+    pub input_events: u64,
+    pub ctl_commands: u64,
+    pub clients_connected: u64,
+}
+
+impl Metrics {
+    /// Slot a render-tick wall-clock duration into the histogram +
+    /// total. Caller measures around `render_tick`.
+    pub fn record_frame(&mut self, dur_ns: u64) {
+        self.frames_rendered += 1;
+        self.render_tick_total_ns = self.render_tick_total_ns.saturating_add(dur_ns);
+        if dur_ns > self.render_tick_max_ns {
+            self.render_tick_max_ns = dur_ns;
+        }
+        let ms = dur_ns / 1_000_000;
+        let idx = if ms < 8 { 0 }
+            else if ms < 16 { 1 }
+            else if ms < 33 { 2 }
+            else if ms < 50 { 3 }
+            else if ms < 100 { 4 }
+            else { 5 };
+        self.frame_time_ms_buckets[idx] += 1;
+    }
 }
 
 /// Software cursor: a fixed-size ARGB sprite whose top-left in screen space
@@ -2475,6 +2530,7 @@ const BACKDROP_SCENE_KEY: u64 = 0xB10B1B_DEADBEEF;
 /// - slight overshoot (we run sub-critically damped) reads as
 ///   "alive" rather than scripted.
 fn tick_animations(state: &mut State, now: Instant) -> bool {
+    state.metrics.spring_ticks += 1;
     // dt for the integrator. Cap at ~33 ms so a frame missed for
     // 200 ms (e.g. a stall, VT switch, suspend) doesn't catapult
     // the spring across the screen on resume — clamp keeps each
@@ -3452,6 +3508,14 @@ fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
 }
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
+    let tick_started = Instant::now();
+    let result = render_tick_inner(comp);
+    let elapsed_ns = tick_started.elapsed().as_nanos() as u64;
+    comp.state.metrics.record_frame(elapsed_ns);
+    result
+}
+
+fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     // If a page flip is already in flight, skip this tick and re-arm
     // `needs_render` so the next loop iteration retries once the flip
     // lands. Pre-idle-skip the page-flip handler set `needs_render`
@@ -3706,7 +3770,10 @@ fn setup_event_loop(
                         .display_handle
                         .insert_client(stream, Arc::new(ClientState))
                     {
-                        Ok(_) => comp.state.clients_seen += 1,
+                        Ok(_) => {
+                            comp.state.clients_seen += 1;
+                            comp.state.metrics.clients_connected += 1;
+                        }
                         Err(e) => tracing::warn!(error = %e, "insert_client failed"),
                     }
                 }
@@ -3821,6 +3888,7 @@ fn setup_event_loop(
                         return Ok(PostAction::Continue);
                     };
                     if saw_flip {
+                        comp.state.metrics.page_flips += 1;
                         let ts = comp.state.elapsed_ms();
                         for cb in std::mem::take(
                             &mut comp.state.pending_frame_callbacks,
@@ -3994,6 +4062,9 @@ fn setup_event_loop(
         last_master_swap_partner_per_workspace: std::collections::HashMap::new(),
         zoomed_per_workspace: std::collections::HashMap::new(),
         fullscreened_per_workspace: std::collections::HashMap::new(),
+        metrics: Metrics::default(),
+        #[cfg(feature = "debug-ctl")]
+        debug_ctl: None,
     };
     let mut compositor = Compositor {
         state,
@@ -4068,6 +4139,20 @@ fn setup_event_loop(
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_STOP: AtomicU64 = AtomicU64::new(0);
     let loop_signal = event_loop.get_signal();
+    // Debug control socket — only present when sol was built with
+    // `--features debug-ctl`. Bench harness reads the path off
+    // $XDG_RUNTIME_DIR/sol-ctl-<wayland-display>.sock.
+    #[cfg(feature = "debug-ctl")]
+    {
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let ctl_path = runtime_dir.join(format!("sol-ctl-{}.sock", socket_name));
+        match debug_ctl::install(&event_loop.handle(), loop_signal.clone(), ctl_path) {
+            Ok(ctl) => compositor.state.debug_ctl = Some(ctl),
+            Err(e) => tracing::warn!(error = %e, "debug-ctl install failed"),
+        }
+    }
     if let Err(e) = ctrlc::set_handler(move || {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4168,6 +4253,7 @@ fn handle_session_event(comp: &mut Compositor, ev: libseat::SeatEvent) {
 /// sets `needs_render`, and forwards pointer/key events to the right
 /// Wayland client based on current focus.
 fn apply_input(state: &mut State, ev: InputEvent) {
+    state.metrics.input_events += 1;
     // Drop dead resources so we don't try to send to them.
     state.pointers.retain(|p| p.is_alive());
     state.keyboards.retain(|k| k.is_alive());

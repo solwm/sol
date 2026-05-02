@@ -13,3 +13,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 sol-wayland.workspace = true
+
+[features]
+# Forwards to sol-wayland — the actual scaffolding lives there.
+debug-ctl = ["sol-wayland/debug-ctl"]

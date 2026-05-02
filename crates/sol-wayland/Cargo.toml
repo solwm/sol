@@ -23,3 +23,12 @@ xkbcommon.workspace = true
 ctrlc.workspace = true
 libseat.workspace = true
 xcursor = "0.3"
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# Enables the debug control socket + scriptable command dispatch
+# for the `sol-bench` harness. Off in normal release builds; turn
+# it on with `cargo build --release --features debug-ctl` for
+# benchmarking and regression-testing the compositor end-to-end.
+debug-ctl = ["dep:serde", "dep:serde_json"]

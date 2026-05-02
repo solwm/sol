@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""sol-bench — drive a running sol via debug-ctl, collect metrics.
+
+Usage:
+    sol-bench --script SCRIPT [--socket PATH]
+
+The script is a JSON file: a list of commands, each one a dict with at
+least `cmd`. Special primitives recognised here (not by sol):
+
+    {"sleep_ms": 50}              # wait — lets sol settle / animate
+    {"repeat": N, "do": [ ... ]}  # nest a block of commands N times
+
+Anything else is forwarded to sol as one line of JSON. Final
+{"cmd": "shutdown"} is recommended so sol exits cleanly and dumps
+metrics; if absent we send one ourselves at the end.
+
+Examples:
+    sol-bench --script bench/scripts/spawn_focus_close.json
+    SOL_CTL_SOCKET=/run/user/1000/sol-ctl-wayland-1.sock sol-bench --script ...
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+
+def find_socket(explicit):
+    if explicit:
+        return explicit
+    env = os.environ.get("SOL_CTL_SOCKET")
+    if env:
+        return env
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    candidates = sorted(Path(runtime).glob("sol-ctl-*.sock"))
+    if not candidates:
+        sys.exit(f"no sol-ctl-*.sock found in {runtime} (is sol running with --features debug-ctl?)")
+    if len(candidates) > 1:
+        print(f"multiple sockets, picking newest: {candidates[-1]}", file=sys.stderr)
+    return str(candidates[-1])
+
+
+def connect(path, retries=20):
+    """Try repeatedly while sol is still starting up."""
+    last = None
+    for _ in range(retries):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(path)
+            return s
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            last = e
+            time.sleep(0.1)
+    sys.exit(f"connect {path}: {last}")
+
+
+def send_cmd(sock, buf, cmd):
+    """Write one line, read one line. `buf` accumulates partial reads."""
+    sock.sendall((json.dumps(cmd) + "\n").encode())
+    while b"\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("sol closed the connection")
+        buf += chunk
+    line, _, rest = buf.partition(b"\n")
+    return json.loads(line.decode()), rest
+
+
+def run_script(sock, items, buf):
+    for item in items:
+        if "sleep_ms" in item:
+            time.sleep(item["sleep_ms"] / 1000.0)
+            continue
+        if "repeat" in item:
+            for _ in range(int(item["repeat"])):
+                buf = run_script(sock, item["do"], buf)
+            continue
+        resp, buf = send_cmd(sock, buf, item)
+        if not resp.get("ok", False):
+            print(f"  ! {item}  →  {resp}", file=sys.stderr)
+        else:
+            sys.stderr.write(".")
+            sys.stderr.flush()
+    return buf
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--script", required=True)
+    ap.add_argument("--socket")
+    ap.add_argument("--no-shutdown", action="store_true",
+                    help="leave sol running after the script finishes")
+    args = ap.parse_args()
+
+    items = json.loads(Path(args.script).read_text())
+    if not isinstance(items, list):
+        sys.exit("script must be a JSON list of commands")
+
+    path = find_socket(args.socket)
+    sock = connect(path)
+    buf = b""
+    try:
+        buf = run_script(sock, items, buf)
+        sys.stderr.write("\n")
+        # Always end with a snapshot to capture metrics, then either
+        # shutdown (default) or leave it running.
+        cmd = {"cmd": "shutdown"} if not args.no_shutdown else {"cmd": "snapshot"}
+        resp, _ = send_cmd(sock, buf, cmd)
+        if resp.get("metrics"):
+            print(json.dumps(resp["metrics"], indent=2))
+        else:
+            print(json.dumps(resp, indent=2))
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    main()

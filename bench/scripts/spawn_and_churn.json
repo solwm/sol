@@ -1,0 +1,42 @@
+[
+  {"cmd": "spawn", "program": "alacritty"},
+  {"sleep_ms": 400},
+  {"cmd": "spawn", "program": "alacritty"},
+  {"sleep_ms": 400},
+  {"cmd": "spawn", "program": "alacritty"},
+  {"sleep_ms": 400},
+  {"cmd": "spawn", "program": "alacritty"},
+  {"sleep_ms": 600},
+
+  {"comment": "100 master-stack swaps — exercises the layout spring"},
+  {"repeat": 100, "do": [
+    {"cmd": "move", "dir": "right"},
+    {"sleep_ms": 30},
+    {"cmd": "move", "dir": "left"},
+    {"sleep_ms": 30}
+  ]},
+
+  {"comment": "50 focus cycles — pure focus border + alpha animation"},
+  {"repeat": 50, "do": [
+    {"cmd": "focus", "dir": "down"},
+    {"sleep_ms": 16},
+    {"cmd": "focus", "dir": "up"},
+    {"sleep_ms": 16}
+  ]},
+
+  {"comment": "20 workspace switches — crossfade + per-workspace state"},
+  {"repeat": 20, "do": [
+    {"cmd": "workspace", "n": 2},
+    {"sleep_ms": 250},
+    {"cmd": "workspace", "n": 1},
+    {"sleep_ms": 250}
+  ]},
+
+  {"comment": "10 zoom toggles — alpha fade for non-promoted tiles"},
+  {"repeat": 10, "do": [
+    {"cmd": "toggle_zoom"},
+    {"sleep_ms": 200},
+    {"cmd": "toggle_zoom"},
+    {"sleep_ms": 200}
+  ]}
+]
