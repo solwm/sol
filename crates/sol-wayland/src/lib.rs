@@ -646,6 +646,14 @@ pub struct Metrics {
     pub phase_render_blur_ns: u64,
     pub phase_render_draw_ns: u64,
     pub phase_render_present_ns: u64,
+    /// Sub-breakdown of `phase_render_present_ns`. The four parts
+    /// should sum to ≈ phase_render_present_ns. Lets us see which
+    /// of swap_buffers / lock_front_buffer / add_fb / page_flip is
+    /// actually eating present-phase time on a given driver.
+    pub phase_render_present_swap_ns: u64,
+    pub phase_render_present_lock_ns: u64,
+    pub phase_render_present_addfb_ns: u64,
+    pub phase_render_present_pageflip_ns: u64,
     pub texture_uploads: u64,
     pub texture_evictions: u64,
     pub spring_ticks: u64,
@@ -3617,10 +3625,29 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     // get freed via Drop), drop dead weak refs from the mapped
     // collections, and rebalance focus if it pointed at a now-dead
     // surface.
+    //
+    // Texture eviction is bounded per tick: each `eglDestroyImage`
+    // on NVIDIA is a kernel/driver round-trip (~1-2 ms), and
+    // resize-heavy workloads (master-stack swaps, repeated
+    // configures) can queue dozens at once. Draining all of them
+    // synchronously inside a render tick blew the frame budget;
+    // taking the first N per tick and re-queueing the rest spreads
+    // the cost across multiple frames. Animations are running in
+    // those frames anyway, so `needs_render` is already true and
+    // the deferred work catches up within milliseconds.
+    const EVICT_PER_TICK: usize = 4;
     let phase_prune_t = Instant::now();
     if let BackendState::Drm(presenter) = &mut comp.backend {
-        for key in std::mem::take(&mut comp.state.pending_texture_evictions) {
+        let queue = &mut comp.state.pending_texture_evictions;
+        let take = queue.len().min(EVICT_PER_TICK);
+        for key in queue.drain(..take) {
             presenter.evict_texture(key);
+        }
+        let still_pending = !queue.is_empty();
+        if still_pending {
+            // Re-arm so the rest get drained next tick even if no
+            // other event fires in the meantime.
+            comp.state.needs_render = true;
         }
     } else {
         comp.state.pending_texture_evictions.clear();
@@ -3759,6 +3786,10 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             comp.state.metrics.phase_render_blur_ns += t.blur_ns;
             comp.state.metrics.phase_render_draw_ns += t.draw_ns;
             comp.state.metrics.phase_render_present_ns += t.present_ns;
+            comp.state.metrics.phase_render_present_swap_ns += t.present_swap_ns;
+            comp.state.metrics.phase_render_present_lock_ns += t.present_lock_ns;
+            comp.state.metrics.phase_render_present_addfb_ns += t.present_addfb_ns;
+            comp.state.metrics.phase_render_present_pageflip_ns += t.present_pageflip_ns;
             if r.is_ok() {
                 tracing::debug!(drawn, "drm frame");
             }

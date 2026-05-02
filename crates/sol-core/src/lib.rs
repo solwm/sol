@@ -191,9 +191,17 @@ impl<'a> Default for Scene<'a> {
 ///   the cache is valid for this frame).
 /// - `draw_ns`: the main back-to-front textured-quad loop + the
 ///   border pass.
-/// - `present_ns`: framebuffer lookup + page-flip schedule (the
-///   GBM `lock_front_buffer` + `add_fb` + `drmModePageFlip`
-///   sequence).
+/// - `present_ns`: total of the four `present_*_ns` fields below —
+///   kept so the Wayland-side `phase_render_ns` accounting stays
+///   exact even if a future tweak adds more sub-fields here.
+///
+/// `present_*_ns` are the further breakdown of `present_ns`:
+///   - `present_swap_ns`: `eglSwapBuffers`. On NVIDIA this is the
+///     usual fence-wait long pole.
+///   - `present_lock_ns`: `gbm_surface_lock_front_buffer`.
+///   - `present_addfb_ns`: framebuffer-object lookup (cached
+///     `drmModeAddFB`).
+///   - `present_pageflip_ns`: `drmModePageFlip` ioctl.
 ///
 /// Values are cumulative *for this single render call*; the Wayland
 /// side accumulates across frames before exporting via debug-ctl.
@@ -203,4 +211,8 @@ pub struct RenderTiming {
     pub blur_ns: u64,
     pub draw_ns: u64,
     pub present_ns: u64,
+    pub present_swap_ns: u64,
+    pub present_lock_ns: u64,
+    pub present_addfb_ns: u64,
+    pub present_pageflip_ns: u64,
 }
