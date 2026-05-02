@@ -609,14 +609,30 @@ pub struct State {
 /// intentionally coarse — six buckets is enough to spot regressions
 /// (everything under 8ms vs everything spilling into 33ms+) without
 /// turning the dump into a CSV.
+///
+/// `frames_rendered` counts only ticks where real work happened —
+/// `ticks_skipped` covers the early-bail path where a page flip was
+/// still pending and we re-armed `needs_render`. Without this split
+/// the histogram was diluted by sub-microsecond no-ops in the `<8ms`
+/// bucket, hiding the real distribution.
 #[derive(Debug, Default, Clone)]
 pub struct Metrics {
     pub frames_rendered: u64,
+    pub ticks_skipped: u64,
     pub page_flips: u64,
     pub render_tick_total_ns: u64,
     pub render_tick_max_ns: u64,
     /// Buckets (in ms): [<8, <16, <33, <50, <100, >=100].
     pub frame_time_ms_buckets: [u64; 6],
+    /// Per-phase wall-clock totals, summed over every real render.
+    /// Pin which sub-step is eating the frame budget without
+    /// resorting to perf / flamegraph — divide by frames_rendered
+    /// for an average, or take a snapshot diff across script phases.
+    pub phase_prune_ns: u64,
+    pub phase_layout_ns: u64,
+    pub phase_animations_ns: u64,
+    pub phase_collect_scene_ns: u64,
+    pub phase_render_ns: u64,
     pub texture_uploads: u64,
     pub texture_evictions: u64,
     pub spring_ticks: u64,
@@ -3508,14 +3524,6 @@ fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
 }
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
-    let tick_started = Instant::now();
-    let result = render_tick_inner(comp);
-    let elapsed_ns = tick_started.elapsed().as_nanos() as u64;
-    comp.state.metrics.record_frame(elapsed_ns);
-    result
-}
-
-fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     // If a page flip is already in flight, skip this tick and re-arm
     // `needs_render` so the next loop iteration retries once the flip
     // lands. Pre-idle-skip the page-flip handler set `needs_render`
@@ -3527,27 +3535,38 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     // callback clears it on the way into `render_tick`, we bail here on
     // the still-pending blink/cursor flip, and nothing re-arms us until
     // an unrelated event (next blink, input, etc.) ticks the loop.
+    //
+    // Counted as `ticks_skipped` so the histogram below only reflects
+    // real renders. Mixing the two diluted the `<8ms` bucket with
+    // sub-microsecond no-ops and made the tail unreadable.
     if let BackendState::Drm(presenter) = &comp.backend {
         if presenter.is_pending_flip() {
+            comp.state.metrics.ticks_skipped += 1;
             comp.state.needs_render = true;
             return Ok(());
         }
     }
+    let tick_started = Instant::now();
+    let result = render_tick_inner(comp);
+    let elapsed_ns = tick_started.elapsed().as_nanos() as u64;
+    comp.state.metrics.record_frame(elapsed_ns);
+    result
+}
 
-    // Free GPU-side resources for buffers clients destroyed since the
-    // last tick. Dmabuf-backed entries hold EGLImages that don't get
-    // freed via Drop; they'd otherwise accumulate per client-resize.
+fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
+    // Phase 1 — prune. Free GPU resources for buffers clients
+    // destroyed since the last tick (dmabuf-backed EGLImages don't
+    // get freed via Drop), drop dead weak refs from the mapped
+    // collections, and rebalance focus if it pointed at a now-dead
+    // surface.
+    let phase_prune_t = Instant::now();
     if let BackendState::Drm(presenter) = &mut comp.backend {
         for key in std::mem::take(&mut comp.state.pending_texture_evictions) {
             presenter.evict_texture(key);
         }
     } else {
-        // Headless has no per-buffer GPU state; just discard the list.
         comp.state.pending_texture_evictions.clear();
     }
-
-    // Prune dead weak refs, recompute tile rects, then push fresh configures
-    // to any client whose tile size has changed since the last we told them.
     comp.state
         .mapped_toplevels
         .retain(|w| w.surface.upgrade().is_ok());
@@ -3569,20 +3588,35 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
         }
     });
     rebalance_keyboard_focus(&mut comp.state);
+    comp.state.metrics.phase_prune_ns += phase_prune_t.elapsed().as_nanos() as u64;
+
+    // Phase 2 — layout. Recompute every tile's target rect from
+    // master-stack (or zoom / fullscreen overrides), then push
+    // configures to any client whose tile size has changed.
+    let phase_layout_t = Instant::now();
     let now = Instant::now();
     apply_layout(&mut comp.state, now);
     send_pending_configures(&mut comp.state);
-    // Step animations (lerp render_rect toward rect with cubic ease).
-    // If anything is still mid-tween, keep the render loop firing —
-    // page-flip-complete normally drives needs_render in DRM mode, so
-    // this is a belt-and-braces guard for headless and for ticks
+    comp.state.metrics.phase_layout_ns += phase_layout_t.elapsed().as_nanos() as u64;
+
+    // Phase 3 — animations. Step springs (rect, alpha, scale,
+    // border, swap, fade), advance the workspace crossfade. If
+    // anything is still moving keep the loop firing — DRM page-flip
+    // does this normally, this guard covers headless and ticks
     // where no other event is pending.
+    let phase_anim_t = Instant::now();
     let animating = tick_animations(&mut comp.state, now);
     let ws_animating = tick_workspace_animation(&mut comp.state, now);
     if animating || ws_animating {
         comp.state.needs_render = true;
     }
+    comp.state.metrics.phase_animations_ns += phase_anim_t.elapsed().as_nanos() as u64;
 
+    // Phase 4 — scene collection. Walk State and produce the flat
+    // Scene the backend will draw — subsurface trees, popups,
+    // dialogs, layers, cursor. The borrow-the-buffers step inside
+    // `scene_from_buffers` is part of this phase.
+    let phase_scene_t = Instant::now();
     let (placed, background_count, border_anchor) = collect_scene(&comp.state, now);
     let mut scene = scene_from_buffers(
         &placed,
@@ -3592,8 +3626,15 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     );
     scene.borders.extend(focus_border(&comp.state));
     let drawn = scene.elements.len();
+    comp.state.metrics.phase_collect_scene_ns +=
+        phase_scene_t.elapsed().as_nanos() as u64;
 
-    match &mut comp.backend {
+    // Phase 5 — render. Hand the Scene to the backend (PNG dump for
+    // headless; DRM presenter does texture upload, blur, draw, page
+    // flip schedule for real hardware). Capture the wall-clock time
+    // even on error so a failing frame still attributes correctly.
+    let phase_render_t = Instant::now();
+    let render_result: Result<()> = match &mut comp.backend {
         BackendState::Headless { canvas, png_path } => {
             canvas.clear();
             for e in &scene.elements {
@@ -3640,16 +3681,24 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
                     b.rgba,
                 );
             }
-            canvas
+            let r = canvas
                 .write_png(png_path)
-                .with_context(|| format!("write {}", png_path.display()))?;
-            tracing::info!(drawn, path = %png_path.display(), "headless frame");
+                .with_context(|| format!("write {}", png_path.display()));
+            if r.is_ok() {
+                tracing::info!(drawn, path = %png_path.display(), "headless frame");
+            }
+            r
         }
         BackendState::Drm(presenter) => {
-            presenter.render_scene(&scene).context("drm render_scene")?;
-            tracing::debug!(drawn, "drm frame");
+            let r = presenter.render_scene(&scene).context("drm render_scene");
+            if r.is_ok() {
+                tracing::debug!(drawn, "drm frame");
+            }
+            r
         }
-    }
+    };
+    comp.state.metrics.phase_render_ns += phase_render_t.elapsed().as_nanos() as u64;
+    render_result?;
 
     // Don't release buffers here — release fires once, when a client
     // attaches a new buffer that replaces this one (handled in the

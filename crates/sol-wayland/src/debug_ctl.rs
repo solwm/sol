@@ -217,10 +217,25 @@ struct Response {
 struct MetricsDump {
     uptime_ms: u64,
     frames_rendered: u64,
+    /// Render-tick calls that early-bailed because a page flip was
+    /// still in flight. Cheap (sub-microsecond) so they don't show
+    /// up in `frame_time_ms_buckets` — but high counts here mean
+    /// many wakeups while we were waiting for vblank, which is
+    /// usually a sign of `needs_render` being set redundantly.
+    ticks_skipped: u64,
     page_flips: u64,
     render_tick_total_ns: u64,
     render_tick_max_ns: u64,
     frame_time_ms_buckets: [u64; 6],
+    /// Per-phase wall-clock totals over every real render. Compare
+    /// across snapshots to see which phase a particular workload
+    /// hit hardest. Phases: prune, layout, animations, scene
+    /// collection, render (backend handoff).
+    phase_prune_ns: u64,
+    phase_layout_ns: u64,
+    phase_animations_ns: u64,
+    phase_collect_scene_ns: u64,
+    phase_render_ns: u64,
     spring_ticks: u64,
     input_events: u64,
     ctl_commands: u64,
@@ -313,10 +328,16 @@ fn snapshot_response(comp: &Compositor) -> String {
     let dump = MetricsDump {
         uptime_ms: comp.state.started.elapsed().as_millis() as u64,
         frames_rendered: m.frames_rendered,
+        ticks_skipped: m.ticks_skipped,
         page_flips: m.page_flips,
         render_tick_total_ns: m.render_tick_total_ns,
         render_tick_max_ns: m.render_tick_max_ns,
         frame_time_ms_buckets: m.frame_time_ms_buckets,
+        phase_prune_ns: m.phase_prune_ns,
+        phase_layout_ns: m.phase_layout_ns,
+        phase_animations_ns: m.phase_animations_ns,
+        phase_collect_scene_ns: m.phase_collect_scene_ns,
+        phase_render_ns: m.phase_render_ns,
         spring_ticks: m.spring_ticks,
         input_events: m.input_events,
         ctl_commands: m.ctl_commands,

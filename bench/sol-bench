@@ -68,21 +68,39 @@ def send_cmd(sock, buf, cmd):
     return json.loads(line.decode()), rest
 
 
-def run_script(sock, items, buf):
+def run_script(sock, items, buf, ctx):
+    """ctx: {"snapshots": [(label, dict), ...], "label": str}"""
     for item in items:
+        # Harness-local primitives.
         if "sleep_ms" in item:
             time.sleep(item["sleep_ms"] / 1000.0)
             continue
         if "repeat" in item:
             for _ in range(int(item["repeat"])):
-                buf = run_script(sock, item["do"], buf)
+                buf = run_script(sock, item["do"], buf, ctx)
             continue
+        if "label" in item:
+            ctx["label"] = item["label"]
+            sys.stderr.write(f"\n[{ctx['label']}] ")
+            sys.stderr.flush()
+            continue
+        if "comment" in item:
+            # Pure documentation — silently dropped, never sent to sol.
+            continue
+
+        # Anything else gets forwarded to sol.
         resp, buf = send_cmd(sock, buf, item)
         if not resp.get("ok", False):
             print(f"  ! {item}  →  {resp}", file=sys.stderr)
         else:
             sys.stderr.write(".")
             sys.stderr.flush()
+        # `snapshot` is a sol command, but we want to capture each
+        # one keyed by the most recent label so the user can see how
+        # phases compare.
+        if isinstance(item, dict) and item.get("cmd") == "snapshot":
+            if resp.get("metrics"):
+                ctx["snapshots"].append((ctx["label"], resp["metrics"]))
     return buf
 
 
@@ -101,17 +119,42 @@ def main():
     path = find_socket(args.socket)
     sock = connect(path)
     buf = b""
+    ctx = {"snapshots": [], "label": "start"}
     try:
-        buf = run_script(sock, items, buf)
+        buf = run_script(sock, items, buf, ctx)
         sys.stderr.write("\n")
-        # Always end with a snapshot to capture metrics, then either
-        # shutdown (default) or leave it running.
-        cmd = {"cmd": "shutdown"} if not args.no_shutdown else {"cmd": "snapshot"}
-        resp, _ = send_cmd(sock, buf, cmd)
-        if resp.get("metrics"):
-            print(json.dumps(resp["metrics"], indent=2))
-        else:
-            print(json.dumps(resp, indent=2))
+        # Always end with shutdown (or snapshot if --no-shutdown) so
+        # we capture the final cumulative metrics.
+        final_cmd = {"cmd": "shutdown"} if not args.no_shutdown else {"cmd": "snapshot"}
+        resp, _ = send_cmd(sock, buf, final_cmd)
+        final = resp.get("metrics") or resp
+        ctx["snapshots"].append((ctx["label"] + " (final)", final))
+
+        # Print all snapshots collected during the run, with deltas
+        # so the user can read each phase as a standalone slice.
+        # Deltas are computed against the previous snapshot in
+        # capture order.
+        out = {"snapshots": []}
+        prev = None
+        for label, snap in ctx["snapshots"]:
+            entry = {"label": label, "cumulative": snap}
+            if prev is not None:
+                entry["delta_from_prev"] = {
+                    k: snap[k] - prev[k]
+                    for k in snap.keys()
+                    if isinstance(snap.get(k), int)
+                    and isinstance(prev.get(k), int)
+                } | {
+                    "frame_time_ms_buckets": [
+                        a - b for a, b in zip(
+                            snap["frame_time_ms_buckets"],
+                            prev["frame_time_ms_buckets"],
+                        )
+                    ],
+                }
+            out["snapshots"].append(entry)
+            prev = snap
+        print(json.dumps(out, indent=2))
     finally:
         sock.close()
 
