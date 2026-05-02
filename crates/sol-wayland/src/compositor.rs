@@ -272,19 +272,6 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     let old = sd.current.buffer.take();
                     sd.current.buffer = sd.pending.buffer.take();
                     sd.pending_attach = false;
-                    // Mark the newly-promoted buffer as having fresh
-                    // pixels so the renderer knows to re-upload.
-                    // Without this the SHM upload path would hit
-                    // glTexSubImage2D every frame regardless of whether
-                    // the client had committed since.
-                    if let Some(buf) = sd.current.buffer.as_ref() {
-                        if let Some(bd) = buf.data::<crate::shm::BufferData>() {
-                            bd.upload_seq.fetch_add(
-                                1,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                    }
                     Some(old)
                 } else {
                     // Still drain pending.buffer so a stale pending
@@ -293,6 +280,29 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                     None
                 };
                 sd.current.damage = std::mem::take(&mut sd.pending.damage);
+
+                // Mark whatever buffer is now current as having fresh
+                // pixels so the renderer's SHM upload path knows to
+                // re-upload. Bumped on EVERY commit-with-buffer (not
+                // just commit-with-attach) — clients are allowed to
+                // write new pixels into a previously-attached SHM
+                // region and signal it via wl_surface.damage without
+                // re-issuing wl_surface.attach. Chrome on Wayland
+                // does this, and the prior attach-only gate stranded
+                // those frames on the cached texture, producing
+                // ~per-vsync UI glitches and YouTube video stutter
+                // in tile mode. Surfaces that are not committing —
+                // the cursor, static layer surfaces, idle clients —
+                // still skip the upload because no commit fires for
+                // them, which is the actual win we're after.
+                if let Some(buf) = sd.current.buffer.as_ref() {
+                    if let Some(bd) = buf.data::<crate::shm::BufferData>() {
+                        bd.upload_seq.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
 
                 // Subsurface position is double-buffered too: commits
                 // promote the pending offset recorded by
