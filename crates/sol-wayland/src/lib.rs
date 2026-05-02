@@ -386,6 +386,16 @@ pub struct State {
     pub right_shift_down: bool,
     pub left_super_down: bool,
     pub right_super_down: bool,
+    /// Currently-pressed evdev keycodes (post-`config.remap`). Mirrors
+    /// xkb's internal key-state and gets passed to `wl_keyboard.enter`
+    /// so a newly-focused client knows what's *physically* held.
+    /// Without this, a client receiving `enter(keys=[])` followed by
+    /// `modifiers(depressed=Alt)` sees those two events as
+    /// contradictory and may treat Alt as sticky/latched —
+    /// symptomatically, hovering rofi after Alt+D and pressing Enter
+    /// got interpreted as Alt+Enter, firing the alacritty bind
+    /// instead of selecting in rofi.
+    pub pressed_keys: std::collections::HashSet<u32>,
     /// User config loaded once at startup. Drives which evdev
     /// keycodes get remapped (e.g. CapsLock→Escape) and which
     /// (mod, key) combos dispatch `exec` actions instead of being
@@ -796,6 +806,18 @@ impl State {
         self.set_keyboard_focus(Some(surface.clone()));
     }
 
+    /// Serialise `pressed_keys` for `wl_keyboard.enter`. Each evdev
+    /// keycode goes out as 4 native-endian bytes — the wire format
+    /// for Wayland `array<u32>`. Order is unspecified by the spec
+    /// (the client just needs the set), so we don't sort.
+    pub(crate) fn pressed_keys_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.pressed_keys.len() * 4);
+        for &k in &self.pressed_keys {
+            bytes.extend_from_slice(&k.to_ne_bytes());
+        }
+        bytes
+    }
+
     pub fn set_keyboard_focus(&mut self, new: Option<WlSurface>) {
         if surface_eq(self.keyboard_focus.as_ref(), new.as_ref()) {
             return;
@@ -812,9 +834,10 @@ impl State {
         }
         if let Some(new) = new.as_ref() {
             let serial = self.next_serial();
+            let keys = self.pressed_keys_bytes();
             for kb in &self.keyboards {
                 if same_client(kb, new) {
-                    kb.enter(serial, new, Vec::new());
+                    kb.enter(serial, new, keys.clone());
                     // Send current modifier state so the client starts with
                     // a correct shift/ctrl/etc view of the world.
                     if let Some(km) = self.keymap.as_ref() {
@@ -908,9 +931,10 @@ impl State {
             return;
         }
         let serial = self.next_serial();
+        let keys = self.pressed_keys_bytes();
         for kb in &self.keyboards {
             if same_client(kb, &focus) {
-                kb.enter(serial, &focus, Vec::new());
+                kb.enter(serial, &focus, keys.clone());
             }
         }
         if let Some(km) = self.keymap.as_ref() {
@@ -4097,6 +4121,7 @@ fn setup_event_loop(
         socket_name: socket_name.clone(),
         left_alt_down: false,
         right_alt_down: false,
+        pressed_keys: std::collections::HashSet::new(),
         left_ctrl_down: false,
         right_ctrl_down: false,
         left_shift_down: false,
@@ -4372,6 +4397,18 @@ fn apply_input(state: &mut State, ev: InputEvent) {
                 KEY_LEFTMETA => state.left_super_down = pressed,
                 KEY_RIGHTMETA => state.right_super_down = pressed,
                 _ => {}
+            }
+            // Track pressed keys so wl_keyboard.enter can hand the new
+            // client the actually-held keycodes (per spec). Updated for
+            // every key (modifier or not) so the set is exhaustive.
+            // Bind-eaten keys are still tracked here — the bind handler
+            // returns before send_keyboard_key, but the user still
+            // physically pressed the key, and the *next* focused client
+            // shouldn't be told otherwise.
+            if pressed {
+                state.pressed_keys.insert(keycode);
+            } else {
+                state.pressed_keys.remove(&keycode);
             }
             let alt = state.left_alt_down || state.right_alt_down;
             let ctrl = state.left_ctrl_down || state.right_ctrl_down;

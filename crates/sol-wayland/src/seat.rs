@@ -87,7 +87,11 @@ impl Dispatch<WlSeat, ()> for State {
                     .cloned();
                 if let Some(focus) = focus_clone {
                     let serial = state.next_serial();
-                    keyboard.enter(serial, &focus, Vec::new());
+                    // Pass the actually-held keycodes so the client's
+                    // xkb stays in sync with the modifiers event we
+                    // send right after — see `pressed_keys_bytes`.
+                    let keys = state.pressed_keys_bytes();
+                    keyboard.enter(serial, &focus, keys);
                     if let Some(m) = state.keymap.as_ref().map(|km| {
                         use xkbcommon::xkb as x;
                         crate::xkb::ModifiersSnapshot {
