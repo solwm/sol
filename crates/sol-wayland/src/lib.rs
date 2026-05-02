@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
 use sol_backend_drm::DrmPresenter;
 use std::os::fd::AsRawFd;
-use sol_core::{Scene, SceneContent, SceneElement};
+use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
@@ -633,6 +633,14 @@ pub struct Metrics {
     pub phase_animations_ns: u64,
     pub phase_collect_scene_ns: u64,
     pub phase_render_ns: u64,
+    /// Sub-breakdown of `phase_render_ns` for the DRM backend. The
+    /// four parts should sum to ≈ phase_render_ns; the gap (typically
+    /// microseconds) is bookkeeping the presenter does outside any
+    /// of the four blocks. Headless leaves all four at zero.
+    pub phase_render_textures_ns: u64,
+    pub phase_render_blur_ns: u64,
+    pub phase_render_draw_ns: u64,
+    pub phase_render_present_ns: u64,
     pub texture_uploads: u64,
     pub texture_evictions: u64,
     pub spring_ticks: u64,
@@ -3690,7 +3698,17 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             r
         }
         BackendState::Drm(presenter) => {
-            let r = presenter.render_scene(&scene).context("drm render_scene");
+            let mut t = RenderTiming::default();
+            let r = presenter
+                .render_scene(&scene, &mut t)
+                .context("drm render_scene");
+            // Fold sub-phase totals into the cumulative metrics so
+            // bench snapshots can show whether the time goes into
+            // texture upload vs blur vs draw vs page-flip schedule.
+            comp.state.metrics.phase_render_textures_ns += t.textures_ns;
+            comp.state.metrics.phase_render_blur_ns += t.blur_ns;
+            comp.state.metrics.phase_render_draw_ns += t.draw_ns;
+            comp.state.metrics.phase_render_present_ns += t.present_ns;
             if r.is_ok() {
                 tracing::debug!(drawn, "drm frame");
             }

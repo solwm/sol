@@ -12,7 +12,9 @@ use anyhow::{Context, Result, anyhow};
 use drm::control::{Device as ControlDevice, Mode, PageFlipFlags, framebuffer, property};
 use glow::HasContext;
 use khronos_egl as egl;
-use sol_core::{PixelFormat, Scene, SceneBorder, SceneContent};
+use std::time::Instant;
+
+use sol_core::{PixelFormat, RenderTiming, Scene, SceneBorder, SceneContent};
 
 use crate::{
     Card, GlStack, OutputSelection, dmabuf_egl, get_or_add_fb, pick_output,
@@ -511,12 +513,17 @@ impl DrmPresenter {
     /// flight when this is called, we silently drop the frame rather
     /// than error — the client will get a frame callback once the
     /// current flip completes and can submit again then.
-    pub fn render_scene(&mut self, scene: &Scene) -> Result<()> {
+    pub fn render_scene(
+        &mut self,
+        scene: &Scene,
+        timing: &mut RenderTiming,
+    ) -> Result<()> {
         if self.pending_flip {
             return Ok(());
         }
         let w = self.width as i32;
         let h = self.height as i32;
+        let t_textures = Instant::now();
         // Blur cache check: if the bg slice and the blur params
         // haven't changed since last frame, the blur FBOs from the
         // previous render still hold the right result — short-circuit
@@ -577,6 +584,8 @@ impl DrmPresenter {
                 tracing::warn!(error = %e, "scene element skipped");
             }
         }
+        timing.textures_ns += t_textures.elapsed().as_nanos() as u64;
+        let t_blur = Instant::now();
 
         // Pre-pass: render the background slice (wallpaper + bottom
         // layer-shell + their subsurfaces) into the blur capture FBO
@@ -623,6 +632,9 @@ impl DrmPresenter {
                 }
             }
         }
+
+        timing.blur_ns += t_blur.elapsed().as_nanos() as u64;
+        let t_draw = Instant::now();
 
         // Pass 2: draw. SHM and dmabuf elements use different shader
         // programs + texture targets; switch between them per element.
@@ -772,8 +784,11 @@ impl DrmPresenter {
             gl.use_program(None);
             gl.disable(glow::BLEND);
         }
-
-        self.submit_flip()
+        timing.draw_ns += t_draw.elapsed().as_nanos() as u64;
+        let t_present = Instant::now();
+        let r = self.submit_flip();
+        timing.present_ns += t_present.elapsed().as_nanos() as u64;
+        r
     }
 
     /// Draw the solid-color border pass into the currently-bound

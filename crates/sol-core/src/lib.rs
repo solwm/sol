@@ -168,3 +168,29 @@ impl<'a> Default for Scene<'a> {
         Self::new()
     }
 }
+
+/// Per-frame wall-clock breakdown of the backend render pass. The
+/// presenter populates the four sub-phase fields inside
+/// `render_scene`; the Wayland side adds them into its cumulative
+/// `Metrics` so a benchmark harness can attribute time *inside* the
+/// render phase, not just total it.
+///
+/// Sub-phases:
+/// - `textures_ns`: SHM uploads + dmabuf imports + cache-key checks.
+/// - `blur_ns`: blur capture pre-pass + ping/pong passes (zero when
+///   the cache is valid for this frame).
+/// - `draw_ns`: the main back-to-front textured-quad loop + the
+///   border pass.
+/// - `present_ns`: framebuffer lookup + page-flip schedule (the
+///   GBM `lock_front_buffer` + `add_fb` + `drmModePageFlip`
+///   sequence).
+///
+/// Values are cumulative *for this single render call*; the Wayland
+/// side accumulates across frames before exporting via debug-ctl.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct RenderTiming {
+    pub textures_ns: u64,
+    pub blur_ns: u64,
+    pub draw_ns: u64,
+    pub present_ns: u64,
+}
