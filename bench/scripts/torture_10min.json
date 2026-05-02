@@ -1,0 +1,108 @@
+[
+  {"label": "torture: spawn baseline (3 alacritty)"},
+  {"cmd": "spawn", "program": "alacritty"},
+  {"sleep_ms": 400},
+  {"cmd": "spawn", "program": "alacritty"},
+  {"sleep_ms": 400},
+  {"cmd": "spawn", "program": "alacritty"},
+  {"sleep_ms": 600},
+
+  {"comment": "Each iteration is ~10s. 60 iterations targets ~10 minutes. Spawns and closes are balanced (3 each per cycle) so the window pool floats around 5-8, not slowly piling up. Each phase is labelled in the snapshot stream so post-run analysis can correlate state to script position."},
+
+  {"label": "torture: 60-cycle main loop (~10s each, ~600s total)"},
+  {"repeat": 60, "do": [
+
+    {"comment": "Phase A: spawn churn"},
+    {"cmd": "spawn", "program": "alacritty"},
+    {"sleep_ms": 350},
+
+    {"comment": "Phase B: master-stack swaps"},
+    {"repeat": 8, "do": [
+      {"cmd": "move", "dir": "right"},
+      {"sleep_ms": 35},
+      {"cmd": "move", "dir": "left"},
+      {"sleep_ms": 35}
+    ]},
+
+    {"comment": "Phase C: focus cycles"},
+    {"repeat": 6, "do": [
+      {"cmd": "focus", "dir": "down"},
+      {"sleep_ms": 25},
+      {"cmd": "focus", "dir": "up"},
+      {"sleep_ms": 25}
+    ]},
+
+    {"comment": "Phase D: workspace round-trip — adds windows on ws 2 and 3 along the way"},
+    {"cmd": "workspace", "n": 2},
+    {"sleep_ms": 200},
+    {"cmd": "spawn", "program": "alacritty"},
+    {"sleep_ms": 350},
+    {"cmd": "move", "dir": "right"},
+    {"sleep_ms": 60},
+    {"cmd": "workspace", "n": 3},
+    {"sleep_ms": 200},
+    {"cmd": "spawn", "program": "alacritty"},
+    {"sleep_ms": 350},
+    {"cmd": "workspace", "n": 1},
+    {"sleep_ms": 200},
+
+    {"comment": "Phase E: cross-workspace shuffle of focused tile"},
+    {"cmd": "move_to_workspace", "n": 4},
+    {"sleep_ms": 150},
+    {"cmd": "focus", "dir": "down"},
+    {"sleep_ms": 50},
+    {"cmd": "move_to_workspace", "n": 5},
+    {"sleep_ms": 150},
+    {"cmd": "workspace", "n": 4},
+    {"sleep_ms": 200},
+    {"cmd": "workspace", "n": 5},
+    {"sleep_ms": 200},
+    {"cmd": "workspace", "n": 1},
+    {"sleep_ms": 200},
+
+    {"comment": "Phase F: zoom + fullscreen + per-workspace memory"},
+    {"cmd": "toggle_zoom"},
+    {"sleep_ms": 220},
+    {"cmd": "workspace", "n": 2},
+    {"sleep_ms": 220},
+    {"cmd": "workspace", "n": 1},
+    {"sleep_ms": 220},
+    {"cmd": "toggle_zoom"},
+    {"sleep_ms": 220},
+    {"cmd": "toggle_fullscreen"},
+    {"sleep_ms": 280},
+    {"cmd": "toggle_fullscreen"},
+    {"sleep_ms": 280},
+
+    {"comment": "Phase G: close 3 to balance the 3 spawns this cycle (A + D×2)"},
+    {"cmd": "close"},
+    {"sleep_ms": 200},
+    {"cmd": "focus", "dir": "down"},
+    {"sleep_ms": 30},
+    {"cmd": "close"},
+    {"sleep_ms": 200},
+    {"cmd": "workspace", "n": 4},
+    {"sleep_ms": 200},
+    {"cmd": "close"},
+    {"sleep_ms": 200},
+    {"cmd": "workspace", "n": 1},
+    {"sleep_ms": 200},
+
+    {"comment": "Phase H: more master-stack motion + a 4-direction move dance"},
+    {"repeat": 4, "do": [
+      {"cmd": "move", "dir": "right"},
+      {"sleep_ms": 40},
+      {"cmd": "move", "dir": "down"},
+      {"sleep_ms": 40},
+      {"cmd": "move", "dir": "up"},
+      {"sleep_ms": 40},
+      {"cmd": "move", "dir": "left"},
+      {"sleep_ms": 40}
+    ]},
+
+    {"comment": "Phase I: snapshot at end of cycle so the metrics stream tracks growth"},
+    {"cmd": "snapshot"}
+  ]},
+
+  {"label": "torture: end of main loop — sol left running for visual inspection"}
+]

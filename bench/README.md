@@ -28,6 +28,17 @@ From any TTY (or another VT, or SSH'd in via `ssh -t`), in the project root:
 
 `sol-bench` finds the control socket automatically via `XDG_RUNTIME_DIR/sol-ctl-*.sock`. Override with `--socket /path` or `SOL_CTL_SOCKET=...` if multiple sols are running.
 
+For a longer correctness/stability run that doesn't kill sol at the
+end (so visual artifacts can be inspected after):
+
+```sh
+./bench/sol-bench --script bench/scripts/torture_10min.json --no-shutdown > /tmp/torture-metrics.json
+```
+
+This churns spawn / move / focus / workspace / zoom / fullscreen /
+close for ~10 minutes, snapshots metrics every iteration, then
+exits leaving sol running.
+
 The script is JSON: a flat list of commands. Each command is a dict. sol-known commands (`focus`, `move`, `workspace`, `move_to_workspace`, `toggle_zoom`, `toggle_fullscreen`, `close`, `spawn`, `snapshot`, `shutdown`) get forwarded to the compositor; harness-local primitives:
 
 - `{"sleep_ms": N}` — pause N ms (lets sol settle / animations complete).
