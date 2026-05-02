@@ -656,6 +656,15 @@ pub struct Metrics {
     pub phase_render_blur_ns: u64,
     pub phase_render_draw_ns: u64,
     pub phase_render_present_ns: u64,
+    /// Sub-breakdown of `phase_render_present_ns` so we can tell which
+    /// of the four GBM/DRM calls actually owns the time. Working
+    /// theory: `lock_front_buffer` blocks on the GPU's implicit
+    /// fence, which would point at a fence-based async pipeline as
+    /// the structural fix.
+    pub phase_render_present_swap_buffers_ns: u64,
+    pub phase_render_present_lock_front_ns: u64,
+    pub phase_render_present_add_fb_ns: u64,
+    pub phase_render_present_page_flip_ns: u64,
     pub texture_uploads: u64,
     pub texture_evictions: u64,
     pub spring_ticks: u64,
@@ -3752,6 +3761,13 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             comp.state.metrics.phase_render_blur_ns += t.blur_ns;
             comp.state.metrics.phase_render_draw_ns += t.draw_ns;
             comp.state.metrics.phase_render_present_ns += t.present_ns;
+            comp.state.metrics.phase_render_present_swap_buffers_ns +=
+                t.present_swap_buffers_ns;
+            comp.state.metrics.phase_render_present_lock_front_ns +=
+                t.present_lock_front_ns;
+            comp.state.metrics.phase_render_present_add_fb_ns += t.present_add_fb_ns;
+            comp.state.metrics.phase_render_present_page_flip_ns +=
+                t.present_page_flip_ns;
             if r.is_ok() {
                 tracing::debug!(drawn, "drm frame");
             }

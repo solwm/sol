@@ -794,7 +794,7 @@ impl DrmPresenter {
         }
         timing.draw_ns += t_draw.elapsed().as_nanos() as u64;
         let t_present = Instant::now();
-        let r = self.submit_flip();
+        let r = self.submit_flip(timing);
         timing.present_ns += t_present.elapsed().as_nanos() as u64;
         r
     }
@@ -1129,17 +1129,29 @@ impl DrmPresenter {
     /// the event loop as soon as the flip is submitted, and the
     /// flip-complete event arrives on the DRM fd and is handled by
     /// the calloop source in the main loop.
-    fn submit_flip(&mut self) -> Result<()> {
+    fn submit_flip(&mut self, timing: &mut RenderTiming) -> Result<()> {
+        let t_swap = Instant::now();
         self.gl_stack
             .egl
             .swap_buffers(self.gl_stack.display, self.gl_stack.surface)
             .map_err(|e| anyhow!("swap_buffers: {e:?}"))?;
+        timing.present_swap_buffers_ns += t_swap.elapsed().as_nanos() as u64;
+
+        let t_lock = Instant::now();
         let next_bo = unsafe { self.gl_stack.gbm_surface.lock_front_buffer() }
             .context("lock_front_buffer in present")?;
+        timing.present_lock_front_ns += t_lock.elapsed().as_nanos() as u64;
+
+        let t_fb = Instant::now();
         let next_fb = get_or_add_fb(&self.card, &next_bo, &mut self.fb_cache)?;
+        timing.present_add_fb_ns += t_fb.elapsed().as_nanos() as u64;
+
+        let t_flip = Instant::now();
         self.card
             .page_flip(self.sel.crtc, next_fb, PageFlipFlags::EVENT, None)
             .context("page_flip")?;
+        timing.present_page_flip_ns += t_flip.elapsed().as_nanos() as u64;
+
         self.pending_bo = Some(next_bo);
         self.pending_flip = true;
         Ok(())

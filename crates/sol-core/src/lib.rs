@@ -202,7 +202,13 @@ impl<'a> Default for Scene<'a> {
 ///   border pass.
 /// - `present_ns`: framebuffer lookup + page-flip schedule (the
 ///   GBM `lock_front_buffer` + `add_fb` + `drmModePageFlip`
-///   sequence).
+///   sequence). Sub-broken-down further by `present_swap_buffers_ns`,
+///   `present_lock_front_ns`, `present_add_fb_ns`, and
+///   `present_page_flip_ns` so a benchmark can pin which of the
+///   four calls is actually the bottleneck — the leading suspect is
+///   `lock_front_buffer` blocking on the GPU's implicit fence, which
+///   would tell us a fence-based async pipeline is the right fix
+///   rather than e.g. avoiding swap_buffers.
 ///
 /// Values are cumulative *for this single render call*; the Wayland
 /// side accumulates across frames before exporting via debug-ctl.
@@ -212,4 +218,8 @@ pub struct RenderTiming {
     pub blur_ns: u64,
     pub draw_ns: u64,
     pub present_ns: u64,
+    pub present_swap_buffers_ns: u64,
+    pub present_lock_front_ns: u64,
+    pub present_add_fb_ns: u64,
+    pub present_page_flip_ns: u64,
 }
