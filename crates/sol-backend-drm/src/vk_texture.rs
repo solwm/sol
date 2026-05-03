@@ -84,6 +84,10 @@ pub struct TextureCache {
     set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
     pending: Vec<PendingUpload>,
+    /// When true, skip the SHM upload for any buffer whose `upload_seq`
+    /// matches the last copied seq. Toggleable via `SOL_TRUST_UPLOAD_SEQ`
+    /// env var (default `1` / on).
+    trust_upload_seq: bool,
 }
 
 impl TextureCache {
@@ -111,6 +115,14 @@ impl TextureCache {
                 .create_descriptor_pool(&pool_info, None)
                 .context("create_descriptor_pool (texture cache)")?
         };
+        let trust_upload_seq = std::env::var("SOL_TRUST_UPLOAD_SEQ")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        tracing::info!(
+            trust_upload_seq,
+            "SHM upload-skip configured (set SOL_TRUST_UPLOAD_SEQ=0 to disable)"
+        );
         Ok(Self {
             stack,
             entries: HashMap::new(),
@@ -118,6 +130,7 @@ impl TextureCache {
             set_layout,
             sampler,
             pending: Vec::new(),
+            trust_upload_seq,
         })
     }
 
@@ -229,12 +242,41 @@ impl TextureCache {
         let upload_seq = *upload_seq;
         let stride = *stride;
 
-        // Cursor fast-path: same dimensions + same upload_seq ⇒ pixels
-        // already on the GPU, skip the copy. The cursor sprite is
-        // allocated once at startup and never rewritten; everything
-        // else re-uploads to dodge a Chrome-on-YouTube glitch.
-        if elem.buffer_key == CURSOR_SCENE_KEY {
-            if let Some(e) = self.entries.get(&elem.buffer_key) {
+        // Upload-skip: if the source buffer hasn't been re-committed
+        // since the last upload, the GPU texture is still current and
+        // the entire memcpy + vkCmdCopyBufferToImage pair can be
+        // skipped. `upload_seq` is bumped from the wl_surface.commit
+        // dispatch on every commit (see compositor.rs), so equal seqs
+        // mean the client hasn't asked us to re-paint it.
+        //
+        // Set `SOL_TRUST_UPLOAD_SEQ=0` to fall back to the old
+        // cursor-only behavior — kept as an escape hatch in case some
+        // pathological client (the prior incident pointed at Chrome on
+        // YouTube) violates the "no commit since last upload" ⇒
+        // "pixels unchanged" assumption. Default ON because at 4K
+        // every wallpaper / layer-shell buffer that doesn't re-commit
+        // costs ≈32 MB of needless upload per frame, which dominates
+        // the renderer at 240 Hz.
+        //
+        // The `upload_seq != 0` guard avoids skipping on the very first
+        // frame for a freshly-attached buffer: an entry can exist with
+        // `uploaded_seq = 0` after creation but before any copy was
+        // recorded.
+        if let Some(e) = self.entries.get(&elem.buffer_key) {
+            if !e.is_dmabuf
+                && e.width == elem.width
+                && e.height == elem.height
+                && upload_seq != 0
+                && e.uploaded_seq == upload_seq
+                && self.trust_upload_seq
+            {
+                return Ok(());
+            }
+            // The strict cursor-only path stays as a safety net even
+            // when `trust_upload_seq` is off: the cursor sprite is
+            // provably immutable post-init, so its skip is always
+            // correct.
+            if !self.trust_upload_seq && elem.buffer_key == CURSOR_SCENE_KEY {
                 if !e.is_dmabuf
                     && e.width == elem.width
                     && e.height == elem.height
