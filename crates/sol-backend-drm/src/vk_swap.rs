@@ -49,6 +49,12 @@ pub struct Slot {
     /// kernel can scan out (DRM doesn't track Vulkan layouts; GENERAL
     /// is the spec-blessed "any operation" layout).
     pub layout: vk::ImageLayout,
+    /// True once the slot has gone through a release-to-FOREIGN
+    /// barrier (i.e. the kernel has scanned it out at least once).
+    /// On its next use, the renderer must issue a matching acquire-
+    /// from-FOREIGN barrier so the dma-buf fence is honoured. False
+    /// initially — first-time use just transitions from UNDEFINED.
+    pub needs_foreign_acquire: bool,
 }
 
 #[allow(dead_code)] // gbm/width/height kept for future modeset / resize hooks
@@ -129,6 +135,7 @@ impl GbmSwap {
                 view,
                 memory,
                 layout: vk::ImageLayout::UNDEFINED,
+                needs_foreign_acquire: false,
             });
         }
         // Card is borrowed only to build the gbm::Device; we don't add

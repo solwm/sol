@@ -142,6 +142,13 @@ impl VkStack {
             // import path on some drivers.
             ash::khr::external_memory::NAME.as_ptr(),
             ash::khr::external_semaphore::NAME.as_ptr(),
+            // Lets us issue queue-family ownership transfers to/from
+            // VK_QUEUE_FAMILY_FOREIGN_EXT for the GBM-backed scan-out
+            // images. Without these transfers the dma-buf implicit
+            // fence may not be signalled at the right time and the
+            // kernel can scan out a partially-written frame —
+            // observable as tearing on NVIDIA in particular.
+            ash::ext::queue_family_foreign::NAME.as_ptr(),
         ];
 
         // Vulkan 1.3 core toggles. Both required for the dynamic-render
@@ -261,6 +268,7 @@ fn pick_physical(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> 
         ash::khr::external_semaphore_fd::NAME,
         ash::ext::external_memory_dma_buf::NAME,
         ash::ext::image_drm_format_modifier::NAME,
+        ash::ext::queue_family_foreign::NAME,
     ];
 
     // Two-pass: prefer DISCRETE_GPU on the first pass, fall back to

@@ -390,18 +390,16 @@ impl DrmPresenter {
                 .context("begin cb (initial modeset)")?;
         }
         let slot = &mut self.swap.slots[idx];
-        let dst_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-        record_layout_transition(
+        record_scanout_acquire(
             &self.stack.device,
             self.command_buffer,
-            slot.image,
-            slot.layout,
-            dst_layout,
+            slot,
+            self.stack.queue_family,
         );
-        slot.layout = dst_layout;
+        slot.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         let attachment = vk::RenderingAttachmentInfo::default()
             .image_view(slot.view)
-            .image_layout(dst_layout)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .clear_value(vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -426,14 +424,14 @@ impl DrmPresenter {
                 .cmd_begin_rendering(self.command_buffer, &info);
             self.stack.device.cmd_end_rendering(self.command_buffer);
         }
-        record_layout_transition(
+        record_scanout_release(
             &self.stack.device,
             self.command_buffer,
-            slot.image,
-            slot.layout,
-            vk::ImageLayout::GENERAL,
+            slot,
+            self.stack.queue_family,
         );
         slot.layout = vk::ImageLayout::GENERAL;
+        slot.needs_foreign_acquire = true;
 
         unsafe {
             self.stack
@@ -623,18 +621,19 @@ impl DrmPresenter {
         self.draw_main_pass(scene, slot_idx, timing)?;
         timing.draw_ns += t_draw.elapsed().as_nanos() as u64;
 
-        // Slot must be in a layout the kernel can scan out from. GENERAL
-        // is the spec's catch-all; DRM doesn't track Vulkan layouts so
-        // any "any operation" layout works.
+        // Release the slot to FOREIGN ownership for kernel scan-out.
+        // Pairs with the acquire above on the next cycle and tells
+        // the driver to signal the dma-buf fence after our work
+        // completes, preventing partial-frame scan-out.
         let slot = &mut self.swap.slots[slot_idx];
-        record_layout_transition(
+        record_scanout_release(
             &self.stack.device,
             self.command_buffer,
-            slot.image,
-            slot.layout,
-            vk::ImageLayout::GENERAL,
+            slot,
+            self.stack.queue_family,
         );
         slot.layout = vk::ImageLayout::GENERAL;
+        slot.needs_foreign_acquire = true;
 
         // GPU-side phase boundary: frame end (BOTTOM_OF_PIPE).
         if let Some(g) = self.gpu_timings.as_mut() {
@@ -718,13 +717,12 @@ impl DrmPresenter {
     ) -> Result<()> {
         let device = &self.stack.device;
         let slot = &mut self.swap.slots[slot_idx];
-        record_layout_transition(
-            device,
-            self.command_buffer,
-            slot.image,
-            slot.layout,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        );
+        // Acquire from the FOREIGN queue family (kernel scan-out) on
+        // every cycle after the first. Without this barrier the
+        // dma-buf implicit fence isn't honoured and the kernel can
+        // start reading the image before our render finishes — a
+        // common cause of the lower-edge tearing observed on NVIDIA.
+        record_scanout_acquire(device, self.command_buffer, slot, self.stack.queue_family);
         slot.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
 
         let attachment = vk::RenderingAttachmentInfo::default()
@@ -1243,6 +1241,86 @@ fn ndc_rect(x: f32, y: f32, w: f32, h: f32, fb_w: f32, fb_h: f32) -> (f32, f32, 
     (rx, ry, rw, rh)
 }
 
+/// Acquire a scan-out slot for rendering. On any cycle after the first,
+/// transfers ownership FOREIGN_EXT → graphics queue along with the
+/// layout transition GENERAL → COLOR_ATTACHMENT_OPTIMAL — the FOREIGN
+/// side of the barrier signals the driver to wait on the dma-buf
+/// fence (kernel done scanning out the previous frame) before our
+/// render reads/writes. On the very first use of a slot the layout
+/// is UNDEFINED and we issue a plain transition with no QF transfer.
+fn record_scanout_acquire(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    slot: &crate::vk_swap::Slot,
+    queue_family: u32,
+) {
+    let (src_qf, dst_qf, old_layout) = if slot.needs_foreign_acquire {
+        (
+            vk::QUEUE_FAMILY_FOREIGN_EXT,
+            queue_family,
+            vk::ImageLayout::GENERAL,
+        )
+    } else {
+        (
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::ImageLayout::UNDEFINED,
+        )
+    };
+    let barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+        .src_access_mask(vk::AccessFlags2::empty())
+        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .src_queue_family_index(src_qf)
+        .dst_queue_family_index(dst_qf)
+        .old_layout(old_layout)
+        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .image(slot.image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let dep = vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+    unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+}
+
+/// Release a scan-out slot back to FOREIGN ownership for kernel
+/// scan-out. The graphics → FOREIGN queue family transfer (paired
+/// with `record_scanout_acquire` on the next cycle) makes the driver
+/// signal the dma-buf fence after our render completes, so the
+/// kernel only starts reading once the GPU writes are visible.
+fn record_scanout_release(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    slot: &crate::vk_swap::Slot,
+    queue_family: u32,
+) {
+    let barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
+        .dst_access_mask(vk::AccessFlags2::empty())
+        .src_queue_family_index(queue_family)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+        .old_layout(slot.layout)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .image(slot.image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let dep = vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+    unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+}
+
+#[allow(dead_code)] // kept for ad-hoc debug paths; scan-out boundaries use the FOREIGN-aware helpers above
 fn record_layout_transition(
     device: &ash::Device,
     cb: vk::CommandBuffer,
@@ -1274,6 +1352,7 @@ fn record_layout_transition(
     unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 }
 
+#[allow(dead_code)]
 fn pick_access(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
     match layout {
         vk::ImageLayout::UNDEFINED => (

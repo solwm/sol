@@ -115,13 +115,26 @@ impl TextureCache {
                 .create_descriptor_pool(&pool_info, None)
                 .context("create_descriptor_pool (texture cache)")?
         };
+        // Default OFF: previously the universal seq-skip was on and it
+        // exposed a long-standing Chrome-on-YouTube bug — UI flickers,
+        // video stutter, lower-edge flashing on toplevels. Chrome (and
+        // some other clients) seem to write the same SHM buffer between
+        // commits or recycle pool offsets in a way that breaks the
+        // "same upload_seq ⇒ same pixels" invariant. Until we add a
+        // per-surface-role gate that lets layer-shell/wallpaper paths
+        // keep the skip while xdg_toplevel paths always re-upload, the
+        // safe default is the cursor-only path. Set SOL_TRUST_UPLOAD_SEQ=1
+        // to re-enable for benchmarking; the cost in non-Chrome
+        // workloads is ~32 MB of needless wallpaper re-upload per frame
+        // at 4K, so on a clean session it's fine.
         let trust_upload_seq = std::env::var("SOL_TRUST_UPLOAD_SEQ")
             .ok()
-            .map(|v| v != "0")
-            .unwrap_or(true);
+            .map(|v| v == "1")
+            .unwrap_or(false);
         tracing::info!(
             trust_upload_seq,
-            "SHM upload-skip configured (set SOL_TRUST_UPLOAD_SEQ=0 to disable)"
+            "SHM upload-skip configured (set SOL_TRUST_UPLOAD_SEQ=1 to enable wallpaper-fast path; \
+             default off because Chrome triggers the cache-invalidation bug it papers over)"
         );
         Ok(Self {
             stack,
