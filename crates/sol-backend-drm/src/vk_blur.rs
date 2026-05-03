@@ -15,6 +15,8 @@
 use anyhow::{Result, anyhow};
 use ash::vk;
 
+use sol_core::RenderTiming;
+
 use crate::vk_pipe::{BlurPC, Pipelines};
 use crate::vk_stack::SharedStack;
 use crate::vk_swap::SCANOUT_VK_FORMAT;
@@ -63,9 +65,22 @@ impl BlurChain {
     /// background slice into it earlier in the same command buffer).
     /// Returns the descriptor set + image of whichever FBO holds the
     /// final result, so the back-drop draw can sample it.
-    pub fn run(&mut self, cb: vk::CommandBuffer, pipelines: &Pipelines, passes: u32, radius: f32) {
+    pub fn run(
+        &mut self,
+        cb: vk::CommandBuffer,
+        pipelines: &Pipelines,
+        passes: u32,
+        radius: f32,
+        timing: &mut RenderTiming,
+    ) {
         let device = &self.stack.device;
         let total = passes.max(1);
+        timing.n_blur_passes += total;
+        // One pipeline bind for the whole loop, one descriptor bind per
+        // pass (different src each iteration), one push-constants write
+        // per pass, one draw per pass.
+        timing.n_pipeline_binds += 1;
+        timing.n_descriptor_binds += total;
         for i in 0..total {
             let (src, dst) = if i == 0 {
                 (&mut self.capture, &mut self.ping)

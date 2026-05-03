@@ -189,32 +189,34 @@ impl<'a> Default for Scene<'a> {
     }
 }
 
-/// Per-frame wall-clock breakdown of the backend render pass. The
-/// presenter populates the four sub-phase fields inside
-/// `render_scene`; the Wayland side adds them into its cumulative
-/// `Metrics` so a benchmark harness can attribute time *inside* the
-/// render phase, not just total it.
+/// Per-frame breakdown of the backend render pass. CPU phase timings,
+/// GPU phase timings (from VK timestamp queries), and per-frame counts.
+/// The presenter populates these inside `render_scene`; the Wayland side
+/// folds them into its cumulative `Metrics` so a benchmark harness can
+/// attribute time *and* count inside the render phase, not just total
+/// wall-clock.
 ///
-/// Sub-phases:
-/// - `textures_ns`: SHM uploads + dmabuf imports + cache-key checks.
-/// - `blur_ns`: blur capture pre-pass + ping/pong passes (zero when
-///   the cache is valid for this frame).
-/// - `draw_ns`: the main back-to-front textured-quad loop + the
-///   border pass.
-/// - `present_ns`: framebuffer lookup + page-flip schedule (the
-///   GBM `lock_front_buffer` + `add_fb` + `drmModePageFlip`
-///   sequence). Sub-broken-down further by `present_swap_buffers_ns`,
-///   `present_lock_front_ns`, `present_add_fb_ns`, and
-///   `present_page_flip_ns` so a benchmark can pin which of the
-///   four calls is actually the bottleneck — the leading suspect is
-///   `lock_front_buffer` blocking on the GPU's implicit fence, which
-///   would tell us a fence-based async pipeline is the right fix
-///   rather than e.g. avoiding swap_buffers.
+/// CPU sub-phases:
+/// - `textures_ns`: SHM uploads + dmabuf imports + cache-key checks (CPU).
+/// - `blur_ns`: blur capture pre-pass + ping/pong passes record (CPU).
+/// - `draw_ns`: main back-to-front loop record + border pass record (CPU).
+/// - `present_ns`: queue submit + sync FD export + (deferred-flip path)
+///   add_fb + page_flip. Broken down further by `present_*_ns` below.
+///
+/// GPU sub-phases (filled from `VkQueryPool` timestamp results, lagging
+/// one frame: a frame's `gpu_*` fields are the previous frame's GPU
+/// time): `gpu_uploads_ns` (cmd_copy_buffer_to_image phase), `gpu_blur_ns`
+/// (capture + ping/pong), `gpu_draw_ns` (main pass + borders), `gpu_total_ns`
+/// (start-of-cb to end-of-cb on the GPU).
+///
+/// Counts: how many of each kind of operation went in. Lets us correlate
+/// "frame got slow when N draws spiked" with the rest.
 ///
 /// Values are cumulative *for this single render call*; the Wayland
 /// side accumulates across frames before exporting via debug-ctl.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct RenderTiming {
+    // -- CPU phase totals --
     pub textures_ns: u64,
     pub blur_ns: u64,
     pub draw_ns: u64,
@@ -223,4 +225,46 @@ pub struct RenderTiming {
     pub present_lock_front_ns: u64,
     pub present_add_fb_ns: u64,
     pub present_page_flip_ns: u64,
+
+    // -- CPU sub-splits inside render_scene's prologue / epilogue --
+    /// `vkWaitForFences` at the top of render_scene. Should be ~0 once
+    /// the steady state holds — non-zero means we caught up to the GPU.
+    pub cpu_wait_fence_ns: u64,
+    /// Time inside `vkQueueSubmit` itself.
+    pub cpu_queue_submit_ns: u64,
+    /// `vkGetSemaphoreFdKHR` to dup the sync FD out of the binary
+    /// semaphore. Microseconds in the steady state; spikes here mean
+    /// the driver is doing real work.
+    pub cpu_export_sync_fd_ns: u64,
+
+    // -- GPU phase totals (from timestamp queries; one-frame lag) --
+    pub gpu_uploads_ns: u64,
+    pub gpu_blur_ns: u64,
+    pub gpu_draw_ns: u64,
+    pub gpu_total_ns: u64,
+
+    // -- Per-frame operation counts --
+    pub n_textured_draws: u32,
+    pub n_solid_draws: u32,
+    pub n_backdrop_draws: u32,
+    pub n_blur_passes: u32,
+    pub n_pipeline_binds: u32,
+    pub n_descriptor_binds: u32,
+    pub n_shm_uploads: u32,
+    pub n_shm_upload_bytes: u64,
+    /// Number of dmabufs imported *this frame* (first sight). Steady
+    /// state should be 0 — non-zero every frame means the cache is
+    /// thrashing.
+    pub n_dmabuf_imports_new: u32,
+    /// Total entries in the texture cache at end of frame, split by
+    /// backing kind. Slow-moving — useful as a trend signal.
+    pub n_textures_cached_total: u32,
+    pub n_textures_cached_dmabuf: u32,
+
+    // -- Scan-out slot occupancy snapshot --
+    /// State of the GBM swap ring at the moment of submit: `(scanned,
+    /// pending, free)` slot counts.
+    pub slot_scanned: u32,
+    pub slot_pending: u32,
+    pub slot_free: u32,
 }

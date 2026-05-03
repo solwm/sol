@@ -28,6 +28,7 @@ use drm::control::{Device as ControlDevice, ModeTypeFlags, connector};
 
 mod presenter;
 mod vk_blur;
+mod vk_perf;
 mod vk_pipe;
 mod vk_stack;
 mod vk_swap;

@@ -41,6 +41,7 @@ use drm::control::{
 use sol_core::{PixelFormat, RenderTiming, Scene, SceneBorder, SceneContent};
 
 use crate::vk_blur::{BlurChain, set_viewport_scissor, transition as transition_blur, bytes_of};
+use crate::vk_perf::GpuTimings;
 use crate::vk_pipe::{BackdropPC, Pipelines, QuadPC, SolidPC};
 use crate::vk_stack::{SharedStack, VkStack};
 use crate::vk_swap::GbmSwap;
@@ -86,6 +87,9 @@ pub struct DrmPresenter {
     /// declined to create an exportable semaphore — we run the
     /// synchronous fallback in that case.
     sync_semaphore: Option<vk::Semaphore>,
+    /// GPU-side phase timing collector. `None` if the device reports
+    /// `timestamp_period == 0` (no graphics-queue timestamp support).
+    gpu_timings: Option<GpuTimings>,
 
     /// Cache mapping `bo.handle().into()` → DRM framebuffer handle so
     /// `add_framebuffer` runs once per BO. Same shape as the pre-rewrite
@@ -161,6 +165,13 @@ impl DrmPresenter {
         };
 
         let sync_semaphore = create_export_semaphore(&stack);
+        let gpu_timings = match GpuTimings::new(stack.clone()) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, "GPU timestamp pool init failed; gpu_*_ns metrics will stay zero");
+                None
+            }
+        };
         if sync_semaphore.is_none() {
             tracing::warn!(
                 "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD unavailable; \
@@ -188,6 +199,7 @@ impl DrmPresenter {
             command_buffer,
             frame_fence,
             sync_semaphore,
+            gpu_timings,
             fb_cache: HashMap::new(),
             in_flight_slot: None,
             pending_flip: false,
@@ -294,6 +306,15 @@ impl DrmPresenter {
 
     pub fn is_pending_flip(&self) -> bool {
         self.is_busy()
+    }
+
+    /// True iff the GPU's still working on the most recent submit (sync
+    /// FD not yet signalled). Distinct from `is_pending_flip` which
+    /// covers both that case AND a queued page-flip-complete event.
+    /// Lets callers distinguish "GPU bound" from "scan-out bound" when
+    /// counting skipped ticks.
+    pub fn is_render_in_flight(&self) -> bool {
+        self.pending_render
     }
 
     pub fn drm_fd(&self) -> std::os::fd::BorrowedFd<'_> {
@@ -466,16 +487,36 @@ impl DrmPresenter {
             return Ok(None);
         };
 
+        // Snapshot slot occupancy before we mark this one in-flight.
+        // The "free" count here is the number of slots not currently
+        // scanned out and not pending a flip — including the one we
+        // just picked. Dividing by the histogram emit interval lets
+        // the user see how often we ran near-empty.
+        timing.slot_scanned = self.swap.scanned.is_some() as u32;
+        timing.slot_pending = self.swap.pending.is_some() as u32;
+        timing.slot_free =
+            (self.swap.slots.len() as u32) - timing.slot_scanned - timing.slot_pending;
+
         // Wait for the previous frame's submit to drain so we can reuse
         // the command buffer + staging buffers safely. Should be near-
         // instant: by the time we got out of `pending_render` /
         // `pending_flip` the GPU has already finished.
+        let t_wait = Instant::now();
         unsafe {
             self.stack
                 .device
                 .wait_for_fences(&[self.frame_fence], true, u64::MAX)
                 .ok();
             let _ = self.stack.device.reset_fences(&[self.frame_fence]);
+        }
+        timing.cpu_wait_fence_ns += t_wait.elapsed().as_nanos() as u64;
+
+        // Read back the *previous* frame's GPU timestamps now that its
+        // submit has drained. One-frame lag baked in: this frame's
+        // `gpu_*_ns` reflect the previous frame. For steady-state
+        // analysis at 240Hz that's 4ms of lag — negligible.
+        if let Some(g) = self.gpu_timings.as_mut() {
+            g.collect_previous(timing);
         }
 
         let t_textures = Instant::now();
@@ -505,7 +546,7 @@ impl DrmPresenter {
         // SHM uploads: memcpy host pixels into staging, queue
         // PendingUpload records. dmabuf imports happen synchronously
         // inside prepare_uploads — they're once-per-buffer.
-        self.textures.prepare_uploads(scene)?;
+        self.textures.prepare_uploads(scene, timing)?;
 
         unsafe {
             self.stack
@@ -523,10 +564,19 @@ impl DrmPresenter {
                 .context("begin cb")?;
         }
 
+        // GPU-side phase boundary: frame start (TOP_OF_PIPE). Reset
+        // the query pool and write the first timestamp.
+        if let Some(g) = self.gpu_timings.as_mut() {
+            g.cmd_begin(self.command_buffer);
+        }
+
         // Record the queued `vkCmdCopyBufferToImage`s for SHM uploads.
         // Each pair of barriers transitions the texture between
         // SHADER_READ_ONLY and TRANSFER_DST.
-        self.textures.record_uploads(self.command_buffer);
+        self.textures.record_uploads(self.command_buffer, timing);
+        if let Some(g) = self.gpu_timings.as_ref() {
+            g.cmd_after_uploads(self.command_buffer);
+        }
 
         timing.textures_ns += t_textures.elapsed().as_nanos() as u64;
 
@@ -537,7 +587,7 @@ impl DrmPresenter {
             && !blur_cache_valid
             && self.blur.is_some();
         if need_bg_capture {
-            self.draw_background_capture(scene)?;
+            self.draw_background_capture(scene, timing)?;
         }
         if scene_has_backdrop && !blur_cache_valid {
             if let Some(blur) = self.blur.as_mut() {
@@ -546,6 +596,7 @@ impl DrmPresenter {
                     &self.pipelines,
                     scene_blur_params.0,
                     f32::from_bits(scene_blur_params.1),
+                    timing,
                 );
                 self.blur_ready_this_frame = true;
             }
@@ -562,11 +613,14 @@ impl DrmPresenter {
                 );
             }
         }
+        if let Some(g) = self.gpu_timings.as_ref() {
+            g.cmd_after_blur(self.command_buffer);
+        }
         timing.blur_ns += t_blur.elapsed().as_nanos() as u64;
 
         // -- main pass: scene back-to-front into the slot's image --
         let t_draw = Instant::now();
-        self.draw_main_pass(scene, slot_idx)?;
+        self.draw_main_pass(scene, slot_idx, timing)?;
         timing.draw_ns += t_draw.elapsed().as_nanos() as u64;
 
         // Slot must be in a layout the kernel can scan out from. GENERAL
@@ -582,6 +636,11 @@ impl DrmPresenter {
         );
         slot.layout = vk::ImageLayout::GENERAL;
 
+        // GPU-side phase boundary: frame end (BOTTOM_OF_PIPE).
+        if let Some(g) = self.gpu_timings.as_mut() {
+            g.cmd_end(self.command_buffer);
+        }
+
         unsafe {
             self.stack
                 .device
@@ -596,7 +655,11 @@ impl DrmPresenter {
         r
     }
 
-    fn draw_background_capture(&mut self, scene: &Scene) -> Result<()> {
+    fn draw_background_capture(
+        &mut self,
+        scene: &Scene,
+        timing: &mut RenderTiming,
+    ) -> Result<()> {
         let blur = self.blur.as_mut().expect("checked by caller");
         let cap = &mut blur.capture;
         let device = &self.stack.device;
@@ -637,16 +700,22 @@ impl DrmPresenter {
                 self.pipelines.quad.pipeline,
             );
         }
+        timing.n_pipeline_binds += 1;
         let fb_w = cap.width as f32;
         let fb_h = cap.height as f32;
         for elem in &scene.elements[..scene.background_count] {
-            self.draw_textured_element(elem, fb_w, fb_h);
+            self.draw_textured_element(elem, fb_w, fb_h, timing);
         }
         unsafe { device.cmd_end_rendering(self.command_buffer) };
         Ok(())
     }
 
-    fn draw_main_pass(&mut self, scene: &Scene, slot_idx: usize) -> Result<()> {
+    fn draw_main_pass(
+        &mut self,
+        scene: &Scene,
+        slot_idx: usize,
+        timing: &mut RenderTiming,
+    ) -> Result<()> {
         let device = &self.stack.device;
         let slot = &mut self.swap.slots[slot_idx];
         record_layout_transition(
@@ -689,6 +758,7 @@ impl DrmPresenter {
                 self.pipelines.quad.pipeline,
             );
         }
+        timing.n_pipeline_binds += 1;
 
         let fb_w = self.width as f32;
         let fb_h = self.height as f32;
@@ -708,7 +778,7 @@ impl DrmPresenter {
         for (idx, elem) in scene.elements.iter().enumerate() {
             if !borders_drawn && idx == border_anchor && !scene.borders.is_empty() {
                 unsafe { device.cmd_end_rendering(self.command_buffer) };
-                self.draw_solid_borders_pass(slot_idx, &scene.borders);
+                self.draw_solid_borders_pass(slot_idx, &scene.borders, timing);
                 // Re-begin the colour attachment for the rest of the
                 // scene. LOAD = LOAD so we keep what we drew.
                 let attachment = vk::RenderingAttachmentInfo::default()
@@ -736,6 +806,7 @@ impl DrmPresenter {
                         self.pipelines.quad.pipeline,
                     );
                 }
+                timing.n_pipeline_binds += 1;
                 bound = Bound::Quad;
                 borders_drawn = true;
             }
@@ -749,9 +820,10 @@ impl DrmPresenter {
                             self.pipelines.backdrop.pipeline,
                         );
                     }
+                    timing.n_pipeline_binds += 1;
                     bound = Bound::Backdrop;
                 }
-                if let Err(e) = self.draw_backdrop_element(elem, *passes, *radius) {
+                if let Err(e) = self.draw_backdrop_element(elem, *passes, *radius, timing) {
                     tracing::warn!(error = %e, "backdrop draw skipped");
                 }
                 continue;
@@ -765,21 +837,27 @@ impl DrmPresenter {
                         self.pipelines.quad.pipeline,
                     );
                 }
+                timing.n_pipeline_binds += 1;
                 bound = Bound::Quad;
             }
-            self.draw_textured_element(elem, fb_w, fb_h);
+            self.draw_textured_element(elem, fb_w, fb_h, timing);
         }
 
         unsafe { device.cmd_end_rendering(self.command_buffer) };
 
         // Border fallback: anchor was past the last element / not set.
         if !borders_drawn && !scene.borders.is_empty() {
-            self.draw_solid_borders_pass(slot_idx, &scene.borders);
+            self.draw_solid_borders_pass(slot_idx, &scene.borders, timing);
         }
         Ok(())
     }
 
-    fn draw_solid_borders_pass(&self, slot_idx: usize, borders: &[SceneBorder]) {
+    fn draw_solid_borders_pass(
+        &self,
+        slot_idx: usize,
+        borders: &[SceneBorder],
+        timing: &mut RenderTiming,
+    ) {
         let device = &self.stack.device;
         let attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.swap.slots[slot_idx].view)
@@ -808,6 +886,8 @@ impl DrmPresenter {
                 self.pipelines.solid.pipeline,
             );
         }
+        timing.n_pipeline_binds += 1;
+        timing.n_solid_draws += borders.len() as u32;
         for b in borders {
             let (rx, ry, rw, rh) = ndc_rect(b.x, b.y, b.w, b.h, fb_w, fb_h);
             let pc = SolidPC {
@@ -836,6 +916,7 @@ impl DrmPresenter {
         elem: &sol_core::SceneElement<'_>,
         fb_w: f32,
         fb_h: f32,
+        timing: &mut RenderTiming,
     ) {
         if matches!(elem.content, SceneContent::BlurredBackdrop { .. }) {
             return;
@@ -901,6 +982,8 @@ impl DrmPresenter {
                 .device
                 .cmd_draw(self.command_buffer, 4, 1, 0, 0);
         }
+        timing.n_descriptor_binds += 1;
+        timing.n_textured_draws += 1;
     }
 
     fn draw_backdrop_element(
@@ -908,6 +991,7 @@ impl DrmPresenter {
         elem: &sol_core::SceneElement<'_>,
         passes: u32,
         _radius: f32,
+        timing: &mut RenderTiming,
     ) -> Result<()> {
         let Some(blur) = self.blur.as_ref() else {
             anyhow::bail!("blur unavailable");
@@ -962,6 +1046,8 @@ impl DrmPresenter {
                 .device
                 .cmd_draw(self.command_buffer, 4, 1, 0, 0);
         }
+        timing.n_descriptor_binds += 1;
+        timing.n_backdrop_draws += 1;
         Ok(())
     }
 
@@ -970,7 +1056,6 @@ impl DrmPresenter {
         slot_idx: usize,
         timing: &mut RenderTiming,
     ) -> Result<Option<OwnedFd>> {
-        let t_swap = Instant::now();
         let cb_array = [self.command_buffer];
 
         if let Some(sem) = self.sync_semaphore {
@@ -981,15 +1066,21 @@ impl DrmPresenter {
             let submit = vk::SubmitInfo::default()
                 .command_buffers(&cb_array)
                 .signal_semaphores(&signals);
+            let t_submit = Instant::now();
             unsafe {
                 self.stack
                     .device
                     .queue_submit(self.stack.queue, &[submit], self.frame_fence)
                     .context("queue_submit (fence path)")?;
             }
-            timing.present_swap_buffers_ns += t_swap.elapsed().as_nanos() as u64;
+            let submit_ns = t_submit.elapsed().as_nanos() as u64;
+            timing.cpu_queue_submit_ns += submit_ns;
+            timing.present_swap_buffers_ns += submit_ns;
 
-            match export_sync_fd(&self.stack, sem) {
+            let t_export = Instant::now();
+            let exp = export_sync_fd(&self.stack, sem);
+            timing.cpu_export_sync_fd_ns += t_export.elapsed().as_nanos() as u64;
+            match exp {
                 Ok(fd) => {
                     self.in_flight_slot = Some(slot_idx);
                     self.pending_render = true;
@@ -1012,13 +1103,16 @@ impl DrmPresenter {
         } else {
             // Synchronous fallback: submit, fence-wait, flip inline.
             let submit = vk::SubmitInfo::default().command_buffers(&cb_array);
+            let t_submit = Instant::now();
             unsafe {
                 self.stack
                     .device
                     .queue_submit(self.stack.queue, &[submit], self.frame_fence)
                     .context("queue_submit (fallback)")?;
             }
-            timing.present_swap_buffers_ns += t_swap.elapsed().as_nanos() as u64;
+            let submit_ns = t_submit.elapsed().as_nanos() as u64;
+            timing.cpu_queue_submit_ns += submit_ns;
+            timing.present_swap_buffers_ns += submit_ns;
             let t_lock = Instant::now();
             unsafe {
                 self.stack

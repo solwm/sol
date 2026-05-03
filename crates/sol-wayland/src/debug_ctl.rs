@@ -219,14 +219,19 @@ struct MetricsDump {
     frames_rendered: u64,
     /// Render-tick calls that early-bailed because a page flip was
     /// still in flight. Cheap (sub-microsecond) so they don't show
-    /// up in `frame_time_ms_buckets` — but high counts here mean
-    /// many wakeups while we were waiting for vblank, which is
-    /// usually a sign of `needs_render` being set redundantly.
+    /// up in `frame_time_ms_buckets`. The `_pending_render` /
+    /// `_pending_flip` split tells whether the bottleneck is GPU
+    /// (sync FD pending) vs DRM scan-out (page-flip-complete pending).
     ticks_skipped: u64,
+    ticks_skipped_pending_render: u64,
+    ticks_skipped_pending_flip: u64,
     page_flips: u64,
     render_tick_total_ns: u64,
     render_tick_max_ns: u64,
     frame_time_ms_buckets: [u64; 8],
+    /// Histogram of intervals between consecutive page-flip-complete
+    /// events — the actual refresh cadence the user sees.
+    frame_interval_ms_buckets: [u64; 8],
     /// Per-phase wall-clock totals over every real render. Compare
     /// across snapshots to see which phase a particular workload
     /// hit hardest. Phases: prune, layout, animations, scene
@@ -244,6 +249,31 @@ struct MetricsDump {
     phase_render_present_lock_front_ns: u64,
     phase_render_present_add_fb_ns: u64,
     phase_render_present_page_flip_ns: u64,
+    /// CPU sub-splits inside `render_scene`'s prologue / epilogue.
+    phase_render_cpu_wait_fence_ns: u64,
+    phase_render_cpu_queue_submit_ns: u64,
+    phase_render_cpu_export_sync_fd_ns: u64,
+    /// GPU-side phase totals (lag the CPU totals by one frame).
+    gpu_uploads_ns: u64,
+    gpu_blur_ns: u64,
+    gpu_draw_ns: u64,
+    gpu_total_ns: u64,
+    /// Per-frame operation counters, summed.
+    n_textured_draws: u64,
+    n_solid_draws: u64,
+    n_backdrop_draws: u64,
+    n_blur_passes: u64,
+    n_pipeline_binds: u64,
+    n_descriptor_binds: u64,
+    n_shm_uploads: u64,
+    n_shm_upload_bytes: u64,
+    n_dmabuf_imports_new: u64,
+    /// Latest sample of texture-cache occupancy + swap-slot state.
+    last_textures_cached_total: u32,
+    last_textures_cached_dmabuf: u32,
+    last_slot_scanned: u32,
+    last_slot_pending: u32,
+    last_slot_free: u32,
     spring_ticks: u64,
     input_events: u64,
     ctl_commands: u64,
@@ -337,10 +367,13 @@ fn snapshot_response(comp: &Compositor) -> String {
         uptime_ms: comp.state.started.elapsed().as_millis() as u64,
         frames_rendered: m.frames_rendered,
         ticks_skipped: m.ticks_skipped,
+        ticks_skipped_pending_render: m.ticks_skipped_pending_render,
+        ticks_skipped_pending_flip: m.ticks_skipped_pending_flip,
         page_flips: m.page_flips,
         render_tick_total_ns: m.render_tick_total_ns,
         render_tick_max_ns: m.render_tick_max_ns,
         frame_time_ms_buckets: m.frame_time_ms_buckets,
+        frame_interval_ms_buckets: m.frame_interval_ms_buckets,
         phase_prune_ns: m.phase_prune_ns,
         phase_layout_ns: m.phase_layout_ns,
         phase_animations_ns: m.phase_animations_ns,
@@ -354,6 +387,27 @@ fn snapshot_response(comp: &Compositor) -> String {
         phase_render_present_lock_front_ns: m.phase_render_present_lock_front_ns,
         phase_render_present_add_fb_ns: m.phase_render_present_add_fb_ns,
         phase_render_present_page_flip_ns: m.phase_render_present_page_flip_ns,
+        phase_render_cpu_wait_fence_ns: m.phase_render_cpu_wait_fence_ns,
+        phase_render_cpu_queue_submit_ns: m.phase_render_cpu_queue_submit_ns,
+        phase_render_cpu_export_sync_fd_ns: m.phase_render_cpu_export_sync_fd_ns,
+        gpu_uploads_ns: m.gpu_uploads_ns,
+        gpu_blur_ns: m.gpu_blur_ns,
+        gpu_draw_ns: m.gpu_draw_ns,
+        gpu_total_ns: m.gpu_total_ns,
+        n_textured_draws: m.n_textured_draws,
+        n_solid_draws: m.n_solid_draws,
+        n_backdrop_draws: m.n_backdrop_draws,
+        n_blur_passes: m.n_blur_passes,
+        n_pipeline_binds: m.n_pipeline_binds,
+        n_descriptor_binds: m.n_descriptor_binds,
+        n_shm_uploads: m.n_shm_uploads,
+        n_shm_upload_bytes: m.n_shm_upload_bytes,
+        n_dmabuf_imports_new: m.n_dmabuf_imports_new,
+        last_textures_cached_total: m.last_textures_cached_total,
+        last_textures_cached_dmabuf: m.last_textures_cached_dmabuf,
+        last_slot_scanned: m.last_slot_scanned,
+        last_slot_pending: m.last_slot_pending,
+        last_slot_free: m.last_slot_free,
         spring_ticks: m.spring_ticks,
         input_events: m.input_events,
         ctl_commands: m.ctl_commands,

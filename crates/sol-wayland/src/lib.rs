@@ -505,6 +505,26 @@ pub struct State {
     /// re-set to `now` whenever the screen wakes, so a wake doesn't
     /// immediately re-arm another blank countdown.
     pub last_input_at: Instant,
+    /// Timestamp of the last page-flip-complete event we saw. Used to
+    /// compute frame-to-frame intervals for `Metrics::frame_interval_ms_buckets`
+    /// — the difference between two consecutive flips is the actual
+    /// refresh cadence the user sees on screen, which matters more
+    /// than wall-clock render time once the GPU is overlapping with
+    /// scan-out.
+    pub last_flip_at: Option<Instant>,
+    /// Last time the periodic perf log line was emitted (env-var-gated
+    /// via `SOL_PERF_LOG_INTERVAL_MS`). Snapshot of `metrics` taken at
+    /// emit time lets the next line print deltas, not lifetime totals.
+    pub last_perf_log_at: Option<Instant>,
+    /// Snapshot of `metrics` at the previous perf-log emit. The
+    /// difference between this and the current value is what gets
+    /// logged — averages over the most recent interval rather than
+    /// since startup.
+    pub last_perf_log_metrics: Option<Box<Metrics>>,
+    /// Period in ms between automatic perf-log emits, set from
+    /// `SOL_PERF_LOG_INTERVAL_MS` at startup. `None` means disabled
+    /// (the default — keeps quiet in interactive sessions).
+    pub perf_log_interval_ms: Option<u64>,
     /// True while the monitor is DPMS-off. Lets apply_input cheaply
     /// detect "first input since blank" and re-power the display.
     pub idle: bool,
@@ -635,42 +655,79 @@ pub struct State {
 pub struct Metrics {
     pub frames_rendered: u64,
     pub ticks_skipped: u64,
+    /// Splits `ticks_skipped` by reason. `_pending_render` means the
+    /// last submit's GPU work is still finishing (sync-FD not yet
+    /// signalled — GPU is the bottleneck). `_pending_flip` means the
+    /// kernel still hasn't completed the previous page-flip (scan-out
+    /// / vblank is the bottleneck). Should sum to `ticks_skipped`.
+    pub ticks_skipped_pending_render: u64,
+    pub ticks_skipped_pending_flip: u64,
     pub page_flips: u64,
     pub render_tick_total_ns: u64,
     pub render_tick_max_ns: u64,
     /// Frame-time histogram tuned for high-refresh analysis. Boundaries
-    /// (in ms): [<2, <3, <4, <5, <8, <16, <33, >=33]. The fine cluster
-    /// at the low end is what makes 240Hz (4.16ms budget) and 144Hz
-    /// (6.94ms) regressions visible — the previous `[<8, <16, …]`
-    /// scheme parked every healthy frame in one bucket and erased
-    /// the signal.
+    /// (in ms): [<2, <3, <4, <5, <8, <16, <33, >=33].
     pub frame_time_ms_buckets: [u64; 8],
+    /// Histogram of intervals between consecutive page-flip-complete
+    /// events — the *real* refresh cadence the user sees. Boundaries
+    /// (in ms): [<3.5, <4.0, <4.5, <5.0, <6.0, <8.5, <16.7, >=16.7].
+    /// At 240Hz the budget per slot is 4.16ms; at 144Hz 6.94ms; at
+    /// 60Hz 16.67ms. Most frames should park in the bucket matching
+    /// the connector's refresh rate.
+    pub frame_interval_ms_buckets: [u64; 8],
     /// Per-phase wall-clock totals, summed over every real render.
-    /// Pin which sub-step is eating the frame budget without
-    /// resorting to perf / flamegraph — divide by frames_rendered
-    /// for an average, or take a snapshot diff across script phases.
     pub phase_prune_ns: u64,
     pub phase_layout_ns: u64,
     pub phase_animations_ns: u64,
     pub phase_collect_scene_ns: u64,
     pub phase_render_ns: u64,
-    /// Sub-breakdown of `phase_render_ns` for the DRM backend. The
-    /// four parts should sum to ≈ phase_render_ns; the gap (typically
-    /// microseconds) is bookkeeping the presenter does outside any
-    /// of the four blocks. Headless leaves all four at zero.
+    /// Sub-breakdown of `phase_render_ns` for the DRM backend. Each
+    /// part is the total CPU time spent in that phase across all
+    /// frames; headless leaves them at zero.
     pub phase_render_textures_ns: u64,
     pub phase_render_blur_ns: u64,
     pub phase_render_draw_ns: u64,
     pub phase_render_present_ns: u64,
-    /// Sub-breakdown of `phase_render_present_ns` so we can tell which
-    /// of the four GBM/DRM calls actually owns the time. Working
-    /// theory: `lock_front_buffer` blocks on the GPU's implicit
-    /// fence, which would point at a fence-based async pipeline as
-    /// the structural fix.
+    /// Sub-breakdown of `phase_render_present_ns`. With the Vulkan
+    /// pipeline, `present_swap_buffers_ns` actually measures
+    /// `vkQueueSubmit`, and `present_lock_front_ns` is either the
+    /// fence wait (sync fallback) or near-zero (deferred path).
     pub phase_render_present_swap_buffers_ns: u64,
     pub phase_render_present_lock_front_ns: u64,
     pub phase_render_present_add_fb_ns: u64,
     pub phase_render_present_page_flip_ns: u64,
+    /// CPU sub-splits inside `render_scene`'s prologue / epilogue.
+    pub phase_render_cpu_wait_fence_ns: u64,
+    pub phase_render_cpu_queue_submit_ns: u64,
+    pub phase_render_cpu_export_sync_fd_ns: u64,
+    /// GPU-side phase totals from VK timestamp queries. Lag the CPU
+    /// totals by one frame (we read frame N's GPU times during frame
+    /// N+1). For "is the GPU the bottleneck?" compare
+    /// `gpu_total_ns / frames_rendered` against the refresh-rate
+    /// budget (4.16ms @ 240Hz).
+    pub gpu_uploads_ns: u64,
+    pub gpu_blur_ns: u64,
+    pub gpu_draw_ns: u64,
+    pub gpu_total_ns: u64,
+    /// Per-frame operation count totals, summed over every real
+    /// render. Divide by `frames_rendered` for averages.
+    pub n_textured_draws: u64,
+    pub n_solid_draws: u64,
+    pub n_backdrop_draws: u64,
+    pub n_blur_passes: u64,
+    pub n_pipeline_binds: u64,
+    pub n_descriptor_binds: u64,
+    pub n_shm_uploads: u64,
+    pub n_shm_upload_bytes: u64,
+    pub n_dmabuf_imports_new: u64,
+    /// Last sample of the texture-cache size (gauge, not counter).
+    pub last_textures_cached_total: u32,
+    pub last_textures_cached_dmabuf: u32,
+    /// Last sample of swap-slot occupancy. Persistent gauge so the
+    /// most-recent snapshot is always inspectable.
+    pub last_slot_scanned: u32,
+    pub last_slot_pending: u32,
+    pub last_slot_free: u32,
     pub texture_uploads: u64,
     pub texture_evictions: u64,
     pub spring_ticks: u64,
@@ -698,6 +755,62 @@ impl Metrics {
             else if ms < 33 { 6 }
             else { 7 };
         self.frame_time_ms_buckets[idx] += 1;
+    }
+
+    /// Slot a frame-to-frame interval (time between consecutive
+    /// page-flip-complete events) into the cadence histogram. Boundaries
+    /// in ms: [<3.5, <4.0, <4.5, <5.0, <6.0, <8.5, <16.7, >=16.7].
+    /// At 240Hz a healthy stream parks in bucket 1 (<4.5ms) or 2; bucket
+    /// 4 (<6ms) means an occasional miss; anything ≥ bucket 5 means
+    /// the kernel waited an extra vblank.
+    pub fn record_frame_interval(&mut self, ns: u64) {
+        // Compare in microseconds so the half-millisecond boundaries
+        // don't get rounded away.
+        let us = ns / 1_000;
+        let idx = if us < 3_500 { 0 }
+            else if us < 4_000 { 1 }
+            else if us < 4_500 { 2 }
+            else if us < 5_000 { 3 }
+            else if us < 6_000 { 4 }
+            else if us < 8_500 { 5 }
+            else if us < 16_700 { 6 }
+            else { 7 };
+        self.frame_interval_ms_buckets[idx] += 1;
+    }
+
+    /// Fold one frame's `RenderTiming` into the cumulative totals.
+    /// One place to add per-frame numbers so adding a new field doesn't
+    /// require chasing every accumulation site.
+    pub fn fold_render_timing(&mut self, t: &sol_core::RenderTiming) {
+        self.phase_render_textures_ns += t.textures_ns;
+        self.phase_render_blur_ns += t.blur_ns;
+        self.phase_render_draw_ns += t.draw_ns;
+        self.phase_render_present_ns += t.present_ns;
+        self.phase_render_present_swap_buffers_ns += t.present_swap_buffers_ns;
+        self.phase_render_present_lock_front_ns += t.present_lock_front_ns;
+        self.phase_render_present_add_fb_ns += t.present_add_fb_ns;
+        self.phase_render_present_page_flip_ns += t.present_page_flip_ns;
+        self.phase_render_cpu_wait_fence_ns += t.cpu_wait_fence_ns;
+        self.phase_render_cpu_queue_submit_ns += t.cpu_queue_submit_ns;
+        self.phase_render_cpu_export_sync_fd_ns += t.cpu_export_sync_fd_ns;
+        self.gpu_uploads_ns += t.gpu_uploads_ns;
+        self.gpu_blur_ns += t.gpu_blur_ns;
+        self.gpu_draw_ns += t.gpu_draw_ns;
+        self.gpu_total_ns += t.gpu_total_ns;
+        self.n_textured_draws += t.n_textured_draws as u64;
+        self.n_solid_draws += t.n_solid_draws as u64;
+        self.n_backdrop_draws += t.n_backdrop_draws as u64;
+        self.n_blur_passes += t.n_blur_passes as u64;
+        self.n_pipeline_binds += t.n_pipeline_binds as u64;
+        self.n_descriptor_binds += t.n_descriptor_binds as u64;
+        self.n_shm_uploads += t.n_shm_uploads as u64;
+        self.n_shm_upload_bytes += t.n_shm_upload_bytes;
+        self.n_dmabuf_imports_new += t.n_dmabuf_imports_new as u64;
+        self.last_textures_cached_total = t.n_textures_cached_total;
+        self.last_textures_cached_dmabuf = t.n_textures_cached_dmabuf;
+        self.last_slot_scanned = t.slot_scanned;
+        self.last_slot_pending = t.slot_pending;
+        self.last_slot_free = t.slot_free;
     }
 }
 
@@ -3615,6 +3728,17 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     if let BackendState::Drm(presenter) = &comp.backend {
         if presenter.is_pending_flip() {
             comp.state.metrics.ticks_skipped += 1;
+            // Split by reason so we can tell whether the GPU
+            // (`pending_render` set, sync-FD not yet signalled) or the
+            // kernel scan-out (`pending_flip` set, page-flip-complete
+            // not yet fired) is the bottleneck. `is_pending_render`
+            // would be a cleaner API; for now infer from the flag pair
+            // exposed today.
+            if presenter.is_render_in_flight() {
+                comp.state.metrics.ticks_skipped_pending_render += 1;
+            } else {
+                comp.state.metrics.ticks_skipped_pending_flip += 1;
+            }
             comp.state.needs_render = true;
             return Ok(());
         }
@@ -3623,7 +3747,143 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
     let result = render_tick_inner(comp);
     let elapsed_ns = tick_started.elapsed().as_nanos() as u64;
     comp.state.metrics.record_frame(elapsed_ns);
+    maybe_emit_perf_log(&mut comp.state);
     result
+}
+
+/// One-line periodic perf summary, env-var-gated via
+/// `SOL_PERF_LOG_INTERVAL_MS`. Computes deltas against the previous
+/// snapshot so the numbers describe the most recent window, not
+/// process-lifetime cumulative totals.
+fn maybe_emit_perf_log(state: &mut State) {
+    let Some(interval_ms) = state.perf_log_interval_ms else {
+        return;
+    };
+    let now = Instant::now();
+    let due = match state.last_perf_log_at {
+        Some(prev) => now.duration_since(prev).as_millis() as u64 >= interval_ms,
+        None => true,
+    };
+    if !due {
+        return;
+    }
+    let cur = state.metrics.clone();
+    let elapsed_ms = match state.last_perf_log_at {
+        Some(prev) => now.duration_since(prev).as_millis() as u64,
+        None => interval_ms.max(1),
+    };
+    let prev = state
+        .last_perf_log_metrics
+        .as_ref()
+        .map(|b| (**b).clone())
+        .unwrap_or_default();
+    state.last_perf_log_at = Some(now);
+    state.last_perf_log_metrics = Some(Box::new(cur.clone()));
+
+    let frames = cur.frames_rendered.saturating_sub(prev.frames_rendered);
+    let flips = cur.page_flips.saturating_sub(prev.page_flips);
+    let skipped = cur.ticks_skipped.saturating_sub(prev.ticks_skipped);
+    let skipped_render = cur
+        .ticks_skipped_pending_render
+        .saturating_sub(prev.ticks_skipped_pending_render);
+    let skipped_flip = cur
+        .ticks_skipped_pending_flip
+        .saturating_sub(prev.ticks_skipped_pending_flip);
+    if frames == 0 && flips == 0 {
+        // Idle window — nothing to say. Don't spam the log.
+        return;
+    }
+    let fps = (frames as f64 * 1000.0 / elapsed_ms as f64) as u64;
+
+    // Per-frame averages. Avoid div-by-zero when `frames == 0` by
+    // dividing by `frames.max(1)`; that bucket goes to "0" naturally
+    // when nothing rendered.
+    let f = frames.max(1);
+    let avg_us = |cur: u64, prev: u64| (cur.saturating_sub(prev)) / f / 1_000;
+    let avg_kb = |cur: u64, prev: u64| (cur.saturating_sub(prev)) / f / 1_024;
+    let avg_n = |cur: u64, prev: u64| (cur.saturating_sub(prev)) / f;
+
+    let tick_us = avg_us(cur.render_tick_total_ns, prev.render_tick_total_ns);
+    let render_us = avg_us(cur.phase_render_ns, prev.phase_render_ns);
+    let tex_us = avg_us(cur.phase_render_textures_ns, prev.phase_render_textures_ns);
+    let blur_us = avg_us(cur.phase_render_blur_ns, prev.phase_render_blur_ns);
+    let draw_us = avg_us(cur.phase_render_draw_ns, prev.phase_render_draw_ns);
+    let pres_us = avg_us(cur.phase_render_present_ns, prev.phase_render_present_ns);
+    let wait_us = avg_us(
+        cur.phase_render_cpu_wait_fence_ns,
+        prev.phase_render_cpu_wait_fence_ns,
+    );
+    let submit_us = avg_us(
+        cur.phase_render_cpu_queue_submit_ns,
+        prev.phase_render_cpu_queue_submit_ns,
+    );
+    let export_us = avg_us(
+        cur.phase_render_cpu_export_sync_fd_ns,
+        prev.phase_render_cpu_export_sync_fd_ns,
+    );
+
+    let gpu_total_us = avg_us(cur.gpu_total_ns, prev.gpu_total_ns);
+    let gpu_up_us = avg_us(cur.gpu_uploads_ns, prev.gpu_uploads_ns);
+    let gpu_blur_us = avg_us(cur.gpu_blur_ns, prev.gpu_blur_ns);
+    let gpu_draw_us = avg_us(cur.gpu_draw_ns, prev.gpu_draw_ns);
+
+    let n_textured = avg_n(cur.n_textured_draws, prev.n_textured_draws);
+    let n_solid = avg_n(cur.n_solid_draws, prev.n_solid_draws);
+    let n_backdrop = avg_n(cur.n_backdrop_draws, prev.n_backdrop_draws);
+    let n_blur_passes = avg_n(cur.n_blur_passes, prev.n_blur_passes);
+    let n_pipe = avg_n(cur.n_pipeline_binds, prev.n_pipeline_binds);
+    let n_desc = avg_n(cur.n_descriptor_binds, prev.n_descriptor_binds);
+    let n_uploads = avg_n(cur.n_shm_uploads, prev.n_shm_uploads);
+    let upload_kb = avg_kb(cur.n_shm_upload_bytes, prev.n_shm_upload_bytes);
+    let dmabuf_new = cur
+        .n_dmabuf_imports_new
+        .saturating_sub(prev.n_dmabuf_imports_new);
+
+    // Frame-interval histogram delta — show only the buckets that
+    // changed in the window so the line stays compact.
+    let mut iv_delta = [0u64; 8];
+    for i in 0..8 {
+        iv_delta[i] = cur.frame_interval_ms_buckets[i]
+            .saturating_sub(prev.frame_interval_ms_buckets[i]);
+    }
+
+    tracing::info!(
+        target: "sol_perf",
+        fps,
+        flips,
+        skipped,
+        skipped_r = skipped_render,
+        skipped_f = skipped_flip,
+        cpu_tick_us = tick_us,
+        cpu_render_us = render_us,
+        cpu_tex_us = tex_us,
+        cpu_blur_us = blur_us,
+        cpu_draw_us = draw_us,
+        cpu_pres_us = pres_us,
+        cpu_wait_us = wait_us,
+        cpu_submit_us = submit_us,
+        cpu_export_us = export_us,
+        gpu_total_us,
+        gpu_up_us,
+        gpu_blur_us,
+        gpu_draw_us,
+        n_textured,
+        n_solid,
+        n_backdrop,
+        n_blur_passes,
+        n_pipe,
+        n_desc,
+        n_uploads,
+        upload_kb,
+        dmabuf_new,
+        cached_total = cur.last_textures_cached_total,
+        cached_dmabuf = cur.last_textures_cached_dmabuf,
+        slot_s = cur.last_slot_scanned,
+        slot_p = cur.last_slot_pending,
+        slot_f = cur.last_slot_free,
+        ?iv_delta,
+        "perf"
+    );
 }
 
 fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
@@ -3768,20 +4028,11 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             let r = presenter
                 .render_scene(&scene, &mut t)
                 .context("drm render_scene");
-            // Fold sub-phase totals into the cumulative metrics so
-            // bench snapshots can show whether the time goes into
-            // texture upload vs blur vs draw vs page-flip schedule.
-            comp.state.metrics.phase_render_textures_ns += t.textures_ns;
-            comp.state.metrics.phase_render_blur_ns += t.blur_ns;
-            comp.state.metrics.phase_render_draw_ns += t.draw_ns;
-            comp.state.metrics.phase_render_present_ns += t.present_ns;
-            comp.state.metrics.phase_render_present_swap_buffers_ns +=
-                t.present_swap_buffers_ns;
-            comp.state.metrics.phase_render_present_lock_front_ns +=
-                t.present_lock_front_ns;
-            comp.state.metrics.phase_render_present_add_fb_ns += t.present_add_fb_ns;
-            comp.state.metrics.phase_render_present_page_flip_ns +=
-                t.present_page_flip_ns;
+            // Fold per-frame numbers (CPU + GPU phase totals + draw/upload
+            // counts + slot occupancy) into the cumulative metrics. One
+            // call instead of a wall of `+=` so adding a new field
+            // doesn't mean chasing every accumulation site.
+            comp.state.metrics.fold_render_timing(&t);
             if r.is_ok() {
                 tracing::debug!(drawn, "drm frame");
             }
@@ -3817,16 +4068,11 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
                     if let BackendState::Drm(p) = &mut comp.backend {
                         match p.submit_flip_after_fence() {
                             Ok(t) => {
-                                // Fold the deferred-phase lock + flip
-                                // costs into the same metrics the
-                                // synchronous path uses so the bench
-                                // sees a consistent attribution.
-                                comp.state.metrics.phase_render_present_lock_front_ns +=
-                                    t.present_lock_front_ns;
-                                comp.state.metrics.phase_render_present_add_fb_ns +=
-                                    t.present_add_fb_ns;
-                                comp.state.metrics.phase_render_present_page_flip_ns +=
-                                    t.present_page_flip_ns;
+                                // Fold the deferred-phase numbers
+                                // through the same path the synchronous
+                                // submit uses so the bench sees a
+                                // consistent attribution.
+                                comp.state.metrics.fold_render_timing(&t);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "submit_flip_after_fence");
@@ -4090,6 +4336,17 @@ fn setup_event_loop(
                     };
                     if saw_flip {
                         comp.state.metrics.page_flips += 1;
+                        // Real refresh cadence: the gap between the
+                        // *previous* flip-complete event and this one
+                        // is what the monitor actually displayed at.
+                        // Bucketed at 0.5ms granularity around the
+                        // 240Hz / 144Hz / 60Hz budgets.
+                        let now = Instant::now();
+                        if let Some(prev) = comp.state.last_flip_at {
+                            let dt = now.duration_since(prev).as_nanos() as u64;
+                            comp.state.metrics.record_frame_interval(dt);
+                        }
+                        comp.state.last_flip_at = Some(now);
                         let ts = comp.state.elapsed_ms();
                         for cb in std::mem::take(
                             &mut comp.state.pending_frame_callbacks,
@@ -4211,6 +4468,13 @@ fn setup_event_loop(
         ext_workspace_managers: Vec::new(),
         idle_inhibitors: Vec::new(),
         last_input_at: Instant::now(),
+        last_flip_at: None,
+        last_perf_log_at: None,
+        last_perf_log_metrics: None,
+        perf_log_interval_ms: std::env::var("SOL_PERF_LOG_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0),
         idle: false,
         pending_wake: false,
         screen_width,

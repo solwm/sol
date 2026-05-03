@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
-use sol_core::{CURSOR_SCENE_KEY, SceneContent, SceneElement};
+use sol_core::{CURSOR_SCENE_KEY, RenderTiming, SceneContent, SceneElement};
 use std::collections::HashMap;
 use std::os::fd::{IntoRawFd, OwnedFd};
 
@@ -183,18 +183,36 @@ impl TextureCache {
     /// `record_uploads` into the per-frame command buffer). Dmabuf
     /// imports happen synchronously here on first sight; subsequent
     /// frames are no-ops.
-    pub fn prepare_uploads(&mut self, scene: &sol_core::Scene<'_>) -> Result<()> {
+    ///
+    /// `timing` accumulates per-frame counts: `n_dmabuf_imports_new`
+    /// bumps on fresh imports, the cached-texture gauges are populated
+    /// at the end so callers see end-of-frame totals.
+    pub fn prepare_uploads(
+        &mut self,
+        scene: &sol_core::Scene<'_>,
+        timing: &mut RenderTiming,
+    ) -> Result<()> {
         self.pending.clear();
         for elem in &scene.elements {
             let res = match &elem.content {
                 SceneContent::Shm { .. } => self.prepare_shm(elem),
-                SceneContent::Dmabuf { .. } => self.prepare_dmabuf(elem),
+                SceneContent::Dmabuf { .. } => self.prepare_dmabuf(elem, timing),
                 SceneContent::BlurredBackdrop { .. } => Ok(()),
             };
             if let Err(e) = res {
                 tracing::warn!(error = %e, key = elem.buffer_key, "scene element skipped");
             }
         }
+        // Snapshot end-of-frame cache occupancy (cheap: HashMap len +
+        // a single pass to count is_dmabuf entries). Lets the metrics
+        // export show "how many client buffers do we have GPU memory
+        // tied up for".
+        timing.n_textures_cached_total = self.entries.len() as u32;
+        timing.n_textures_cached_dmabuf = self
+            .entries
+            .values()
+            .filter(|e| e.is_dmabuf)
+            .count() as u32;
         Ok(())
     }
 
@@ -300,7 +318,11 @@ impl TextureCache {
         Ok(())
     }
 
-    fn prepare_dmabuf(&mut self, elem: &SceneElement<'_>) -> Result<()> {
+    fn prepare_dmabuf(
+        &mut self,
+        elem: &SceneElement<'_>,
+        timing: &mut RenderTiming,
+    ) -> Result<()> {
         let SceneContent::Dmabuf {
             fd,
             fourcc: _,
@@ -351,13 +373,19 @@ impl TextureCache {
                 staging: None,
             },
         );
+        // Fresh import — the texture cache previously had nothing for
+        // this `buffer_key`. Steady-state should be 0 (clients re-use
+        // their wl_buffers); a non-zero number every frame would
+        // indicate cache thrash.
+        timing.n_dmabuf_imports_new += 1;
         Ok(())
     }
 
     /// Drain the pending-upload list into the supplied command buffer.
     /// Each upload is bracketed by image-layout barriers (UNDEFINED ⇒
     /// TRANSFER_DST, then TRANSFER_DST ⇒ SHADER_READ_ONLY_OPTIMAL).
-    pub fn record_uploads(&mut self, cb: vk::CommandBuffer) {
+    /// `timing` accumulates the upload count + total bytes copied.
+    pub fn record_uploads(&mut self, cb: vk::CommandBuffer, timing: &mut RenderTiming) {
         if self.pending.is_empty() {
             return;
         }
@@ -384,6 +412,10 @@ impl TextureCache {
             let dep_pre =
                 vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&pre));
             unsafe { device.cmd_pipeline_barrier2(cb, &dep_pre) };
+
+            timing.n_shm_uploads += 1;
+            timing.n_shm_upload_bytes +=
+                (up.width as u64) * (up.height as u64) * 4;
 
             let region = vk::BufferImageCopy::default()
                 .buffer_offset(0)
