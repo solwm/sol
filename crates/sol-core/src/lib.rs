@@ -252,6 +252,12 @@ pub struct RenderTiming {
     pub n_descriptor_binds: u32,
     pub n_shm_uploads: u32,
     pub n_shm_upload_bytes: u64,
+    /// Largest single SHM upload this frame, in bytes. Lets the perf
+    /// log distinguish "many small surfaces re-uploaded" (waybar / UI
+    /// chrome) from "one giant surface re-uploaded" (animated 4K
+    /// wallpaper) — the former is a count problem, the latter a size
+    /// problem with very different fixes.
+    pub n_shm_upload_max_bytes: u64,
     /// Number of dmabufs imported *this frame* (first sight). Steady
     /// state should be 0 — non-zero every frame means the cache is
     /// thrashing.

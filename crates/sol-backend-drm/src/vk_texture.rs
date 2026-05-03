@@ -455,9 +455,12 @@ impl TextureCache {
                 vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&pre));
             unsafe { device.cmd_pipeline_barrier2(cb, &dep_pre) };
 
+            let bytes = (up.width as u64) * (up.height as u64) * 4;
             timing.n_shm_uploads += 1;
-            timing.n_shm_upload_bytes +=
-                (up.width as u64) * (up.height as u64) * 4;
+            timing.n_shm_upload_bytes += bytes;
+            if bytes > timing.n_shm_upload_max_bytes {
+                timing.n_shm_upload_max_bytes = bytes;
+            }
 
             let region = vk::BufferImageCopy::default()
                 .buffer_offset(0)

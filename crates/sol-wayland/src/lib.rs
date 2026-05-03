@@ -719,6 +719,12 @@ pub struct Metrics {
     pub n_descriptor_binds: u64,
     pub n_shm_uploads: u64,
     pub n_shm_upload_bytes: u64,
+    /// Running maximum of any single SHM upload's byte count since the
+    /// last perf-log emit. Reset to 0 each time the perf log line
+    /// fires (so the displayed value reflects the largest upload in
+    /// the just-reported interval, not all-time). Lifetime peak is
+    /// not tracked separately — add if needed.
+    pub n_shm_upload_max_bytes_running: u64,
     pub n_dmabuf_imports_new: u64,
     /// Last sample of the texture-cache size (gauge, not counter).
     pub last_textures_cached_total: u32,
@@ -805,6 +811,9 @@ impl Metrics {
         self.n_descriptor_binds += t.n_descriptor_binds as u64;
         self.n_shm_uploads += t.n_shm_uploads as u64;
         self.n_shm_upload_bytes += t.n_shm_upload_bytes;
+        if t.n_shm_upload_max_bytes > self.n_shm_upload_max_bytes_running {
+            self.n_shm_upload_max_bytes_running = t.n_shm_upload_max_bytes;
+        }
         self.n_dmabuf_imports_new += t.n_dmabuf_imports_new as u64;
         self.last_textures_cached_total = t.n_textures_cached_total;
         self.last_textures_cached_dmabuf = t.n_textures_cached_dmabuf;
@@ -3800,7 +3809,6 @@ fn maybe_emit_perf_log(state: &mut State) {
     // when nothing rendered.
     let f = frames.max(1);
     let avg_us = |cur: u64, prev: u64| (cur.saturating_sub(prev)) / f / 1_000;
-    let avg_kb = |cur: u64, prev: u64| (cur.saturating_sub(prev)) / f / 1_024;
     let avg_n = |cur: u64, prev: u64| (cur.saturating_sub(prev)) / f;
 
     let tick_us = avg_us(cur.render_tick_total_ns, prev.render_tick_total_ns);
@@ -3833,8 +3841,19 @@ fn maybe_emit_perf_log(state: &mut State) {
     let n_blur_passes = avg_n(cur.n_blur_passes, prev.n_blur_passes);
     let n_pipe = avg_n(cur.n_pipeline_binds, prev.n_pipeline_binds);
     let n_desc = avg_n(cur.n_descriptor_binds, prev.n_descriptor_binds);
-    let n_uploads = avg_n(cur.n_shm_uploads, prev.n_shm_uploads);
-    let upload_kb = avg_kb(cur.n_shm_upload_bytes, prev.n_shm_upload_bytes);
+    // Uploads are bursty (zero most frames, several MB on others), so
+    // per-frame integer averages truncate to 0 and lose the signal.
+    // Show interval totals + the largest single upload seen, which is
+    // what actually distinguishes "static wallpaper happy path" from
+    // "animated wallpaper recommit" or "browser dropped to SHM mode".
+    let up_total = cur.n_shm_uploads.saturating_sub(prev.n_shm_uploads);
+    let up_kb = cur
+        .n_shm_upload_bytes
+        .saturating_sub(prev.n_shm_upload_bytes)
+        / 1024;
+    let up_max_kb = cur.n_shm_upload_max_bytes_running / 1024;
+    // Reset the running max so the next interval starts fresh.
+    state.metrics.n_shm_upload_max_bytes_running = 0;
     let dmabuf_new = cur
         .n_dmabuf_imports_new
         .saturating_sub(prev.n_dmabuf_imports_new);
@@ -3873,8 +3892,9 @@ fn maybe_emit_perf_log(state: &mut State) {
         n_blur_passes,
         n_pipe,
         n_desc,
-        n_uploads,
-        upload_kb,
+        up_total,
+        up_kb,
+        up_max_kb,
         dmabuf_new,
         cached_total = cur.last_textures_cached_total,
         cached_dmabuf = cur.last_textures_cached_dmabuf,
