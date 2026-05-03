@@ -23,8 +23,9 @@ pub enum PixelFormat {
 
 /// Where a scene element's pixel data actually lives. SHM buffers are
 /// CPU-mapped and the server blits/uploads from the borrowed slice. Dmabuf
-/// buffers live on the GPU; the server imports the fd as an EGLImage on
-/// first sight and re-uses the resulting GL texture.
+/// buffers live on the GPU; the server imports the fd as a `VkImage` on
+/// first sight (via `VK_EXT_external_memory_dma_buf` +
+/// `VK_EXT_image_drm_format_modifier`) and re-uses the resulting texture.
 pub enum SceneContent<'a> {
     Shm {
         pixels: &'a [u8],
@@ -156,9 +157,9 @@ pub struct Scene<'a> {
     /// Number of leading entries in `elements` that are background
     /// (Background + Bottom layer surfaces and their subsurfaces).
     /// The DRM presenter renders these into its capture FBO first,
-    /// then blits the result onto the screen — that gives the blur
+    /// then samples it during the blur passes — that gives the blur
     /// pipeline a clean, sampler-friendly source independent of how
-    /// the default framebuffer is laid out by GBM/EGL. Everything
+    /// the scan-out image is laid out under the DRM modifier. Everything
     /// from `elements[background_count..]` draws normally on top.
     pub background_count: usize,
     /// Z-order anchor for the border pass. The presenter draws

@@ -3,7 +3,7 @@
 //! Usage:
 //!   sol                       # default (headless) backend
 //!   sol --backend=headless    # explicit
-//!   sol --backend=drm         # real DRM+GBM+GLES, from a free VT
+//!   sol --backend=drm         # real DRM+GBM+Vulkan, from a free VT
 //!
 //! Extra env knobs:
 //!   SOL_PNG_PATH    (headless) where to dump the frame PNG

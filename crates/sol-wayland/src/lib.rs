@@ -1010,10 +1010,11 @@ impl ClientData for ClientState {
 }
 
 /// Backend-specific render target. Chosen at startup; does not switch at
-/// runtime. `DrmPresenter` is boxed because it carries the GBM /
-/// EGL / texture-cache state and is a couple of orders of magnitude
-/// larger than the headless canvas — without the box every
-/// `BackendState`-shaped local would carry that fixed overhead.
+/// runtime. `DrmPresenter` is boxed because it carries the Vulkan
+/// device / GBM scan-out / texture-cache state and is a couple of
+/// orders of magnitude larger than the headless canvas — without the
+/// box every `BackendState`-shaped local would carry that fixed
+/// overhead.
 pub enum BackendState {
     Headless { canvas: Canvas, png_path: PathBuf },
     Drm(Box<DrmPresenter>),
@@ -1536,10 +1537,11 @@ fn install_config_watcher(
 /// Deliberately NOT reapplied:
 /// - `exec-once` — would spawn a duplicate waybar / awww-daemon every
 ///   save. Startup-only.
-/// - `mode` — changing the output mode requires tearing down and
-///   rebuilding the GBM/EGL surface to the new size; that work isn't
-///   wired yet. We log a warning so the user knows their edit won't
-///   take effect until restart.
+/// - `mode` — changing the output mode requires tearing down the
+///   GBM scan-out ring + the Vulkan images imported from it and
+///   rebuilding both at the new size; that work isn't wired yet.
+///   We log a warning so the user knows their edit won't take
+///   effect until restart.
 fn apply_config_reload(state: &mut State) {
     let new_cfg = config::load();
 
@@ -3626,7 +3628,7 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
 
 fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     // Phase 1 — prune. Free GPU resources for buffers clients
-    // destroyed since the last tick (dmabuf-backed EGLImages don't
+    // destroyed since the last tick (dmabuf-backed VkImages don't
     // get freed via Drop), drop dead weak refs from the mapped
     // collections, and rebalance focus if it pointed at a now-dead
     // surface.
@@ -3727,12 +3729,12 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
                         );
                     }
                     SceneContent::Dmabuf { .. } => {
-                        // Headless backend has no EGL context, can't sample
-                        // the dmabuf. Skip — dmabuf clients are a DRM-backend
-                        // feature.
+                        // Headless backend has no GPU import path, can't
+                        // sample the dmabuf. Skip — dmabuf clients are a
+                        // DRM-backend feature.
                     }
                     SceneContent::BlurredBackdrop { .. } => {
-                        // Headless has no GL context, no FBO, no blur path.
+                        // Headless has no GPU FBO and no blur path.
                         // Inactive-window frosted glass is a DRM-backend
                         // feature; the headless PNG dump just shows
                         // un-blurred wallpaper behind the inactive

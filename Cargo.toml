@@ -31,9 +31,7 @@ png = "0.17"
 rustix = { version = "0.38", features = ["fs", "mm", "event"] }
 drm = "0.14"
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
-khronos-egl = { version = "6", features = ["dynamic"] }
-glow = "0.14"
-libloading = "0.8"
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
 ctrlc = { version = "3", features = ["termination"] }
 input = { version = "0.9", features = ["libinput_1_19"] }
 libc = "0.2"

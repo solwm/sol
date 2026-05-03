@@ -2,11 +2,11 @@
 
 A small Wayland tiling compositor written in Rust. Master-stack layout, vim-like keybinds, spring-physics tile animations, frosted-glass dim for inactive windows, and rounded corners.
 
-Status: working daily driver for the author's setup (DRM/GBM/GLES on Linux). Not packaged, not broadly tested. Expect rough edges.
+Status: working daily driver for the author's setup (DRM/GBM/Vulkan on Linux). Not packaged, not broadly tested. Expect rough edges.
 
 ## Backends
 
-- **DRM** — real hardware via libseat + libinput + GBM/EGL/GLES2. Run from a free TTY.
+- **DRM** — real hardware via libseat + libinput + GBM/Vulkan. Run from a free TTY.
 - **Headless** — software canvas that dumps each frame as a PNG. For development and sanity-checking the protocol layer without a graphics stack.
 
 ## Build
@@ -15,7 +15,7 @@ Status: working daily driver for the author's setup (DRM/GBM/GLES on Linux). Not
 cargo build --release
 ```
 
-System libraries: `libdrm`, `libinput`, `libxkbcommon`, `libseat`, `libegl1`, `libgbm`. seatd or systemd-logind must be running so the binary can take a session without root.
+System libraries at runtime: `libdrm`, `libinput`, `libxkbcommon`, `libseat`, `libgbm`, `libvulkan`, plus a Vulkan ICD for your GPU (Mesa's `vulkan-radeon` / `vulkan-intel`, or `nvidia-utils`). At build time you also need `glslc` from the `shaderc` package (Arch: `pacman -S shaderc`) — `build.rs` invokes it to compile the GLSL shaders to SPIR-V. seatd or systemd-logind must be running so the binary can take a session without root.
 
 ## Run
 
@@ -73,7 +73,7 @@ Per-tile motion is spring-driven (no time-based tweens): each of `x`, `y`, `w`, 
 - `sol` — binary entry point and CLI.
 - `sol-core` — backend-agnostic scene types (`Scene`, `SceneElement`).
 - `sol-wayland` — protocol dispatch, layout, animation, input, focus.
-- `sol-backend-drm` — DRM/GBM/EGL/GLES2 presenter (textured-quad pipeline, dual-Kawase blur for inactive-window backdrops, SDF rounded-corner masking).
+- `sol-backend-drm` — DRM/GBM/Vulkan presenter (textured-quad pipeline, dual-Kawase blur for inactive-window backdrops, SDF rounded-corner masking). Scan-out BOs are GBM-allocated and imported into Vulkan as `VkImage`s via `VK_EXT_image_drm_format_modifier`; GPU-completion is exported as a `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD` so the page flip defers until rendering's done.
 
 ## License
 

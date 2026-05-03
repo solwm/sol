@@ -35,7 +35,7 @@ When a client connects, calloop's socket-source callback accepts the stream and 
 - `layer_shell.rs` — `zwlr_layer_surface_v1`. The protocol waybar / rofi / wallpaper apps speak — they need to anchor to a screen edge with a known z-layer (Background, Bottom, Top, Overlay), not participate in tile layout.
 - `seat.rs`, `input.rs` — pointer + keyboard input plumbing.
 - `data_device.rs`, `primary_selection.rs` — clipboard (Ctrl+C/V) and middle-click paste, which are separate protocols.
-- `linux_dmabuf.rs` — the protocol GPU clients (Chrome, mpv) use to hand us `dma-buf` fds instead of CPU-mapped pixels. We re-export them as EGLImages.
+- `linux_dmabuf.rs` — the protocol GPU clients (Chrome, mpv) use to hand us `dma-buf` fds instead of CPU-mapped pixels. The Vulkan backend imports them as `VkImage`s via `VK_EXT_external_memory_dma_buf`.
 - `subcompositor.rs`, `viewporter.rs`, `xdg_decoration.rs`, `fractional_scale.rs`, `presentation_time.rs`, `xdg_output.rs`, `idle_inhibit.rs`, `ext_workspace.rs` — smaller protocols, one file each.
 
 The pattern in all of them is the same: a `Dispatch` impl receives a `Request`, mutates `&mut State`, possibly sends a response event back via the resource handle. The state mutation is mostly bookkeeping — recording the new `wl_buffer` attached to a surface, recording a popup's positioner, recording that the client has acked a configure. The actual visual change comes a tick later.
@@ -139,22 +139,46 @@ The trick worth noting: zoom and fullscreen don't have a special render path for
 
 ## 9. The renderer — `DrmPresenter::render_scene`
 
-`crates/sol-backend-drm/src/presenter.rs::render_scene` (around line 514) is where the `Scene` becomes pixels. It's a GLES2 textured-quad pipeline running on a GBM surface:
+`crates/sol-backend-drm/src/presenter.rs::render_scene` is where the `Scene` becomes pixels. It's a Vulkan 1.3 pipeline driving a GBM-backed scan-out ring — no `VkSwapchainKHR`, no EGL, no compositor-side window-system dance: we own the display via DRM/KMS and just render into images the kernel will scan out.
 
-1. **Cache check.** The background slice (wallpaper + bottom layers) is hashed into a signature; if it matches last frame and the blur params are unchanged, the blur FBOs from the previous frame still hold the right result, so we skip the blur pre-pass entirely. This is the hot path for "client churns its own buffer but the wallpaper is static" (a terminal running `cmatrix` while waybar's clock advances).
-2. **Texture upload pass.** For each `SceneElement`, ensure there's a current GL texture for its buffer. SHM buffers go through `glTexSubImage2D` (`upload_shm_texture`); dmabuf buffers go through `EGL_EXT_image_dma_buf_import` (`import_dmabuf_texture`) once per buffer, then we keep the EGLImage and the resulting GL texture in a `HashMap<u64, TextureEntry>` keyed by `buffer_key`. The `BufferData::upload_seq` / `TextureEntry::uploaded_seq` plumbing is wired all the way through — bumped in the wl_surface.commit handler, exposed on every `SceneContent::Shm` — but the actual upload-skip is currently gated on the `CURSOR_SCENE_KEY` sentinel only. Generalising the skip to client SHM buffers stuttered Chrome on YouTube (UI position glitches and video frame drops in tile mode); the working theory is that something about Chrome's repaint path violates the "no commit since last upload" ⟹ "pixels unchanged" assumption. Until that's understood, the skip stays narrow: the cursor sprite is the only thing not re-uploaded every frame.
-3. **Background pre-pass.** If the cache check failed, the background slice is rendered into a presenter-owned capture FBO so the blur pipeline samples a render target we wrote into (not the GBM-backed default FB, which on at least one Mesa configuration produces zero-RGB readbacks).
-4. **Blur passes.** `inactive_blur_passes` rounds of dual-Kawase blur, ping-ponging between two half-resolution FBOs. Cheap (a few fullscreen quads at 1080p / 4K) and cached across frames.
-5. **Main draw loop.** Walk the scene back-to-front. Each textured element gets a quad in NDC, the textured-quad fragment shader samples its texture, applies an SDF-based rounded-corner alpha mask if `corner_radius > 0`, multiplies in the per-element alpha, blends over what's there. Backdrops sample from the final-blur FBO instead of a buffer texture. Solid borders (the focus ring) use a separate solid-rounded-rect shader and draw at the `border_anchor` index, between tiles and top-layer.
-6. **Render → fence → deferred flip.** After the GL draw loop finishes, `submit_render` issues `eglSwapBuffers` (which queues commands and returns) and creates an `EGL_SYNC_NATIVE_FENCE_ANDROID` sync object. `eglDupNativeFenceFDANDROID` extracts a pollable FD from that sync — readable when the GPU has finished the work the swap kicked off. The presenter sets `pending_render = true` and returns the FD up to the wayland-side; the wayland-side registers it as a one-shot `Generic` calloop source. Nothing has called `lock_front_buffer` yet — that's the point. The render thread returns to the event loop while the GPU is still working, freeing it to handle other client traffic.
+The crate splits into a few small modules so the per-frame logic stays readable:
 
-When the fence FD signals (GPU done), the calloop source fires and `submit_flip_after_fence` runs: `lock_front_buffer` (now cheap because the implicit fence is already signalled), `add_fb` (cached), `page_flip(EVENT)`. State transitions `pending_render → pending_flip`. The kernel queues the flip for the next vblank.
+- `vk_stack.rs` — load libvulkan, create instance + device + graphics queue. Picks a discrete GPU first (skip llvmpipe), requires the dmabuf-import / sync-FD extensions.
+- `vk_swap.rs` — allocate three GBM BOs (`SCANOUT | RENDERING | LINEAR`, `XRGB8888`), import each as a `VkImage` via `VK_EXT_image_drm_format_modifier` + `VK_EXT_external_memory_dma_buf`. The `Slot` ring tracks which BO is on screen, which has a flip queued, and which is free for the next render.
+- `vk_pipe.rs` — four graphics pipelines that all share `quad.vert`: `quad` (textured), `solid` (rounded ring/border), `blur` (5×5 box), `backdrop` (sample blurred FBO with rounded mask). All use `dynamic_rendering` (no `VkRenderPass`). Per-draw uniforms travel as push constants; samplers are one combined-image-sampler descriptor at `(set=0, binding=0)`.
+- `vk_texture.rs` — per-`buffer_key` `TextureEntry` holding `VkImage` + view + descriptor set. SHM uploads memcpy host pixels into a persistent host-visible staging buffer, then the per-frame command buffer issues `vkCmdCopyBufferToImage` bracketed by layout barriers. Dmabuf imports happen once per `wl_buffer` via `VK_EXT_external_memory_dma_buf`. The cursor sentinel still gets the upload-skip fast path.
+- `vk_blur.rs` — three offscreen images for the inactive-window frosted-glass backdrop: `capture` at full output resolution + `ping`/`pong` at half. Ping-pongs with the `blur` pipeline; final result lives in `ping` or `pong` depending on parity.
 
-The fallback path (driver doesn't advertise `EGL_ANDROID_native_fence_sync`) keeps the old synchronous order — `submit_render` calls lock + add_fb + page_flip inline, blocking on the implicit fence — and skips the calloop dance entirely. A startup log line tells you which path you're on.
+Each `render_scene` call walks this sequence:
 
-The page flip is **not** waited on synchronously — that was the old model. The kernel wakes us via a readable event on the DRM fd; calloop's source callback drains the events, calls our `drain_events`, which clears `pending_flip` and releases the previous BO back to GBM. If anything was animating, we set `needs_render = true` and the loop schedules the next tick.
+1. **Busy check.** If a flip is queued (`pending_flip`) or a sync FD is still in flight (`pending_render`), bail and drop the frame — the next `render_tick` will retry.
+2. **Cache check.** The background slice (wallpaper + bottom layers) is hashed into a signature; if it matches last frame and the blur params are unchanged, the blur ping/pong images from the previous frame still hold the right result, so we skip both the bg pre-pass *and* the blur passes. Hot path for "client churns its own buffer but the wallpaper is static" (`cmatrix` in alacritty while waybar's clock advances).
+3. **SHM uploads + dmabuf imports.** `prepare_uploads` walks the scene; SHM elements memcpy into their per-entry staging buffer and register a `PendingUpload`, dmabuf elements import once on first sight. The `upload_seq` plumbing is wired through but the actual upload-skip is gated on `CURSOR_SCENE_KEY` only — generalising it to client SHM buffers stuttered Chrome on YouTube and the cause was never pinned, so the skip stays narrow.
+4. **Command buffer record.** Reset the per-frame primary command buffer, begin recording.
+5. **Upload copies.** `record_uploads` translates each `PendingUpload` into a layout barrier (`SHADER_READ_ONLY` ⇒ `TRANSFER_DST`) + `vkCmdCopyBufferToImage` + barrier (`TRANSFER_DST` ⇒ `SHADER_READ_ONLY`).
+6. **Background pre-pass.** If the cache failed, render the background slice into the blur capture FBO — same `quad` pipeline as the main draw, just into the half-res capture image instead of the scan-out slot.
+7. **Blur passes.** `BlurChain::run` issues N rounds of 5×5 box blur ping-ponging between `ping` and `pong`. Each pass is a fullscreen quad; layout barriers transition src into `SHADER_READ_ONLY` and dst into `COLOR_ATTACHMENT_OPTIMAL` between passes.
+8. **Main draw.** Begin dynamic rendering against the slot's image. Walk scene elements back-to-front: quad pipeline for textured surfaces, backdrop pipeline for `BlurredBackdrop` entries (sampling the final blur image), solid pipeline injected at `border_anchor`. Pipeline switches are tracked so consecutive same-pipeline draws don't rebind. Per-draw, push the `QuadPC` / `BackdropPC` / `SolidPC` block and `vkCmdDraw(4, 1, 0, 0)`.
+9. **End rendering, transition slot to `GENERAL`.** DRM doesn't track Vulkan layouts; `GENERAL` is the spec-blessed "any operation" state, fine for kernel scan-out.
+10. **Submit + sync-FD export.** `vkQueueSubmit` signals an exportable binary semaphore (created with `VkExportSemaphoreCreateInfo` for `SYNC_FD`); `vkGetSemaphoreFdKHR` transfers the payload out as an `OwnedFd` that becomes readable when the GPU finishes. The presenter sets `pending_render = true` and returns the FD up to the wayland-side; the wayland-side registers it as a one-shot `Generic` calloop source. Nothing has called `add_framebuffer` / `page_flip` yet — that's the point. The render thread returns to the event loop while the GPU is still working.
+
+When the sync FD signals (GPU done), the calloop source fires and `submit_flip_after_fence` runs: `add_framebuffer` (cached, keyed on the BO's GEM handle), `drmModePageFlip(EVENT)`. State transitions `pending_render → pending_flip`. The kernel queues the flip for the next vblank.
+
+The fallback path (driver doesn't expose `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD`) submits with a fence, blocks via `vkWaitForFences`, then runs `add_framebuffer` + `page_flip` inline — same shape as the pre-rewrite synchronous fallback. A startup log line tells you which path you're on (Mesa always supports the fast path on Linux).
+
+The page flip is **not** waited on synchronously. The kernel wakes us via a readable event on the DRM fd; calloop's source callback calls `drain_events`, which clears `pending_flip` and rotates the slot ring. If anything was animating, `needs_render = true` schedules the next tick.
 
 `is_busy()` covers both `pending_flip` and `pending_render` so a re-entry into `render_tick` doesn't try to start a second frame on top of an in-flight one.
+
+### Format / orientation choices
+
+- All scan-out and intermediate images use `VK_FORMAT_B8G8R8A8_UNORM`, which matches Wayland's little-endian ARGB / XRGB and the Linux DRM `AR24` / `XR24` fourcc bytes. The shader sees `(R, G, B, A)` directly; no per-shader swizzle.
+- Vulkan's NDC has +Y pointing down — the opposite of GL's. The presenter's CPU-side `ndc_rect` uses Vulkan-native math (`y / fb_h * 2.0 - 1.0` puts the top edge at NDC y=-1) and the vertex shader doesn't flip V on UVs. Top-row-first Wayland buffers and top-row-first dmabufs are sampled right-side-up without tricks.
+- Scan-out modifier is fixed at `DRM_FORMAT_MOD_LINEAR` for now — `BufferObjectFlags::LINEAR` on the GBM allocation, matched by an explicit modifier in the Vulkan import. Modifier negotiation between GBM and the Vulkan device is a future-perf knob, not a correctness requirement.
+
+### Shaders
+
+GLSL sources live in `crates/sol-backend-drm/shaders/`. `build.rs` invokes the system `glslc` (from the `shaderc` package) at compile time to produce SPIR-V in `OUT_DIR`; the renderer `include_bytes!`'s the `.spv` outputs. Edit a `.frag` / `.vert`, `cargo build` re-runs `glslc`, no manual step. If `glslc` isn't on `PATH`, the build fails loudly with the install hint baked into the panic message — there's no silent fallback to stale SPIR-V.
 
 ## 10. Input
 

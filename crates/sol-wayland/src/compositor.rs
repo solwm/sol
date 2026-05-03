@@ -68,7 +68,7 @@ pub struct SurfaceState {
     /// Strong handle to the currently-attached wl_buffer, **not** a
     /// `Weak`. Holding a strong `WlBuffer` keeps the resource (and its
     /// user_data — BufferData / DmabufBuffer — and the underlying
-    /// SHM mapping or imported EGLImage) alive even after the client
+    /// SHM mapping or imported `VkImage`) alive even after the client
     /// destroys its end. Alacritty (and any GL client managing its
     /// own swapchain) destroys old buffers ahead of committing the
     /// new one across a resize; with `Weak<WlBuffer>` that race

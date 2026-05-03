@@ -80,10 +80,11 @@ fn pick_closest(images: &[Image], desired: u32) -> Option<&Image> {
 }
 
 /// XCursor pixel data is RGBA8888 with pre-multiplied alpha. Our
-/// shader samples SHM buffers as ARGB8888 with a BGR swizzle (see
-/// `sol-backend-drm/src/quad.rs`), so we store bytes as
-/// `[B, G, R, A]`. Simple per-pixel reorder — no alpha re-multiply,
-/// the source is already premultiplied.
+/// SHM uploads target `VK_FORMAT_B8G8R8A8_UNORM` (matches Wayland's
+/// little-endian ARGB / XRGB), so we store bytes as `[B, G, R, A]`
+/// here at sprite-load time and the renderer sampling-side reads them
+/// straight back as RGBA. Simple per-pixel reorder — no alpha
+/// re-multiply, the source is already premultiplied.
 fn rgba_to_bgra(img: &Image) -> CursorSprite {
     let w = img.width as i32;
     let h = img.height as i32;

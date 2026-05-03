@@ -10,9 +10,9 @@ thiserror.workspace = true
 tracing.workspace = true
 drm.workspace = true
 gbm.workspace = true
-khronos-egl.workspace = true
-glow.workspace = true
-libloading.workspace = true
+ash.workspace = true
 rustix.workspace = true
-png.workspace = true
 sol-core.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true

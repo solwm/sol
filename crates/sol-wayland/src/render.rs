@@ -1,9 +1,9 @@
-//! Software canvas and PNG dump used by the headless backend at B2.
+//! Software canvas and PNG dump used by the headless backend.
 //!
 //! This is intentionally the dumbest possible renderer: a flat ARGB8888
-//! buffer we memcpy pixels into, then encode as PNG. Real rendering lands in
-//! B3/B4 when DRM+GLES arrive; the interface here (`Canvas::blit_argb`,
-//! `Canvas::write_png`) is what the compositor will keep calling.
+//! buffer we memcpy pixels into, then encode as PNG. Real rendering goes
+//! through `sol-backend-drm`'s Vulkan presenter; the headless canvas
+//! exists to keep the protocol layer testable without a graphics stack.
 
 use std::fs::File;
 use std::path::Path;

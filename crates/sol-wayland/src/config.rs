@@ -49,7 +49,7 @@
 //! The file is watched at runtime (inotify on its parent dir): saves
 //! re-apply gaps, border, idle_timeout, bindings, and remaps live.
 //! `mode` changes log a "restart to apply" warning (live mode-set
-//! requires GBM/EGL surface rebuild, not yet wired). `exec-once` is
+//! requires the GBM scan-out ring + Vulkan image rebuild, not yet wired). `exec-once` is
 //! startup-only and is ignored on reload.
 //!
 //! Modifiers (case-insensitive): `ALT`/`MOD1`, `CTRL`/`CONTROL`,
@@ -123,7 +123,7 @@ pub struct Config {
     /// still takes precedence — env is for one-off testing, config
     /// is the persistent intent. Hot-reloading this value at runtime
     /// is currently a warn-and-keep-old-mode (changing mode requires
-    /// rebuilding the GBM/EGL surface; restart sol to apply).
+    /// tearing down the GBM scan-out ring + its Vulkan images; restart sol to apply).
     pub mode: Option<ModePref>,
     /// `wl_keyboard.repeat_info` rate, in characters per second. The
     /// compositor does not implement repeat itself — clients do, off

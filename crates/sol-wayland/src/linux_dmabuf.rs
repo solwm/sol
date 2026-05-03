@@ -11,7 +11,9 @@
 //! Legacy `format`/`modifier` events are still emitted for v1-v3 binds.
 //! Plane info collected via `create_params → add → create_immed` becomes
 //! a `DmabufBuffer` attached to the new `wl_buffer` as user-data. Import
-//! into GL textures happens in `sol_backend_drm::presenter`.
+//! into a `VkImage` (via `VK_EXT_external_memory_dma_buf` +
+//! `VK_EXT_image_drm_format_modifier`) happens in
+//! `sol_backend_drm::presenter` on first sight of the buffer.
 
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
@@ -86,9 +88,9 @@ pub struct ParamsInner {
 }
 
 /// User-data attached to a dmabuf-backed `wl_buffer`. Stores the plane
-/// descriptors plus logical pixel dimensions and the DRM fourcc. Rendering
-/// code (from B10.3 onwards) will import these into an EGLImage on first
-/// use.
+/// descriptors plus logical pixel dimensions and the DRM fourcc. The
+/// Vulkan backend imports these into a `VkImage` on first use and
+/// caches the result keyed by `cache_key`.
 #[derive(Debug)]
 pub struct DmabufBuffer {
     pub width: i32,
@@ -383,8 +385,8 @@ impl Dispatch<WlBuffer, DmabufBuffer> for State {
             // Queue for eviction using the stable counter-based key
             // (see shm::BufferData::cache_key for the rationale):
             // alacritty creates a new dmabuf on every tile resize, so
-            // without this the EGLImage + GL texture for each old
-            // buffer leak until sol exits.
+            // without this the imported `VkImage` + `VkDeviceMemory`
+            // for each old buffer would leak until sol exits.
             state.pending_texture_evictions.push(data.cache_key);
             tracing::debug!(key = data.cache_key, "dmabuf wl_buffer destroyed; queued for eviction");
         }
