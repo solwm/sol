@@ -572,6 +572,16 @@ impl DrmPresenter {
         // Each pair of barriers transitions the texture between
         // SHADER_READ_ONLY and TRANSFER_DST.
         self.textures.record_uploads(self.command_buffer, timing);
+        // Per-frame FOREIGN_EXT acquire on every client dmabuf actually
+        // sampled this frame. Honours the producer's dma-buf fence so
+        // we don't read partial writes — without it, Chrome's video
+        // can tear at the per-buffer level. Cheap (one barrier batch
+        // per frame regardless of buffer count).
+        self.textures.record_dmabuf_acquires(
+            scene,
+            self.command_buffer,
+            self.stack.queue_family,
+        );
         if let Some(g) = self.gpu_timings.as_ref() {
             g.cmd_after_uploads(self.command_buffer);
         }

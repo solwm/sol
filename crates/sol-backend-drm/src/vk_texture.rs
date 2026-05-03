@@ -42,6 +42,16 @@ pub struct TextureEntry {
     /// True iff this entry was imported from a dmabuf (no per-frame
     /// upload work; image is read-only from our side).
     pub is_dmabuf: bool,
+    /// For dmabuf entries only: true once we've seen the image at
+    /// least once and its layout is `SHADER_READ_ONLY_OPTIMAL`. The
+    /// first-frame acquire is a plain UNDEFINED → SHADER_READ_ONLY
+    /// transition with no QF transfer; subsequent frames issue a
+    /// FOREIGN_EXT → graphics-queue acquire so the dma-buf implicit
+    /// fence (signalled by the client's GPU process when its writes
+    /// land) is honoured before we sample. Without this, Chrome
+    /// rapidly rotating its video buffers can produce tearing /
+    /// stutter as we read partial writes.
+    pub dmabuf_seen: bool,
     /// Persistent host-visible staging buffer for SHM uploads. Sized
     /// to `width * height * 4`; reallocated when the surface resizes.
     /// `None` for dmabuf entries.
@@ -115,26 +125,23 @@ impl TextureCache {
                 .create_descriptor_pool(&pool_info, None)
                 .context("create_descriptor_pool (texture cache)")?
         };
-        // Default OFF: previously the universal seq-skip was on and it
-        // exposed a long-standing Chrome-on-YouTube bug — UI flickers,
-        // video stutter, lower-edge flashing on toplevels. Chrome (and
-        // some other clients) seem to write the same SHM buffer between
-        // commits or recycle pool offsets in a way that breaks the
-        // "same upload_seq ⇒ same pixels" invariant. Until we add a
-        // per-surface-role gate that lets layer-shell/wallpaper paths
-        // keep the skip while xdg_toplevel paths always re-upload, the
-        // safe default is the cursor-only path. Set SOL_TRUST_UPLOAD_SEQ=1
-        // to re-enable for benchmarking; the cost in non-Chrome
-        // workloads is ~32 MB of needless wallpaper re-upload per frame
-        // at 4K, so on a clean session it's fine.
+        // Default ON. The skip was previously blamed for Chrome
+        // glitches but the actual root cause was missing FOREIGN_EXT
+        // queue-family transfers on client dmabufs (Chrome's video
+        // frames could tear at the consumer side without an explicit
+        // dma-buf fence acquire). With the per-frame dmabuf acquire
+        // barrier in place — see `TextureCache::record_dmabuf_acquires`
+        // — the upload-seq skip is safe again, and worth ≈ 32 MB / frame
+        // of wallpaper-upload savings at 4K. Set SOL_TRUST_UPLOAD_SEQ=0
+        // to disable as a debugging knob if a regression suspect
+        // points back here.
         let trust_upload_seq = std::env::var("SOL_TRUST_UPLOAD_SEQ")
             .ok()
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
         tracing::info!(
             trust_upload_seq,
-            "SHM upload-skip configured (set SOL_TRUST_UPLOAD_SEQ=1 to enable wallpaper-fast path; \
-             default off because Chrome triggers the cache-invalidation bug it papers over)"
+            "SHM upload-skip configured (set SOL_TRUST_UPLOAD_SEQ=0 to disable)"
         );
         Ok(Self {
             stack,
@@ -321,6 +328,7 @@ impl TextureCache {
                     height: elem.height,
                     uploaded_seq: 0,
                     is_dmabuf: false,
+                    dmabuf_seen: false,
                     staging: Some(entry.staging),
                 },
             );
@@ -425,6 +433,7 @@ impl TextureCache {
                 height: elem.height,
                 uploaded_seq: 0,
                 is_dmabuf: true,
+                dmabuf_seen: false,
                 staging: None,
             },
         );
@@ -519,6 +528,80 @@ impl TextureCache {
 
     pub fn get(&self, key: u64) -> Option<&TextureEntry> {
         self.entries.get(&key)
+    }
+
+    /// Per-frame foreign-queue acquire on every dmabuf entry actually
+    /// sampled this frame. Pairs with the producer's release (which is
+    /// implicit, signalled via the dma-buf fence when the client's
+    /// commit lands). Without this barrier, NVIDIA in particular may
+    /// sample a partially-written buffer — observable as Chrome video
+    /// stutter at the per-buffer level, and as UI flicker for the rest
+    /// of the browser chrome.
+    ///
+    /// First-time acquire on a freshly-imported dmabuf is a plain
+    /// UNDEFINED → SHADER_READ_ONLY_OPTIMAL transition with no QF
+    /// transfer (the image was never owned by the foreign side from
+    /// Vulkan's view). Subsequent acquires emit the real
+    /// FOREIGN_EXT → graphics-queue barrier.
+    pub fn record_dmabuf_acquires(
+        &mut self,
+        scene: &sol_core::Scene<'_>,
+        cb: vk::CommandBuffer,
+        queue_family: u32,
+    ) {
+        let device = &self.stack.device;
+        let mut barriers: Vec<vk::ImageMemoryBarrier2<'_>> = Vec::new();
+        // Track which keys we've already acquired this frame so the
+        // same buffer referenced twice (e.g. via subsurface) doesn't
+        // get a duplicate barrier.
+        let mut acquired: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        for elem in &scene.elements {
+            if !matches!(elem.content, SceneContent::Dmabuf { .. }) {
+                continue;
+            }
+            if !acquired.insert(elem.buffer_key) {
+                continue;
+            }
+            let Some(entry) = self.entries.get_mut(&elem.buffer_key) else {
+                continue;
+            };
+            if !entry.is_dmabuf {
+                continue;
+            }
+            let (src_qf, dst_qf, old_layout) = if entry.dmabuf_seen {
+                (
+                    vk::QUEUE_FAMILY_FOREIGN_EXT,
+                    queue_family,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )
+            } else {
+                (
+                    vk::QUEUE_FAMILY_IGNORED,
+                    vk::QUEUE_FAMILY_IGNORED,
+                    vk::ImageLayout::UNDEFINED,
+                )
+            };
+            barriers.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                    .src_access_mask(vk::AccessFlags2::empty())
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                    .src_queue_family_index(src_qf)
+                    .dst_queue_family_index(dst_qf)
+                    .old_layout(old_layout)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(entry.image)
+                    .subresource_range(color_range()),
+            );
+            entry.dmabuf_seen = true;
+        }
+        if barriers.is_empty() {
+            return;
+        }
+        let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
     }
 }
 
