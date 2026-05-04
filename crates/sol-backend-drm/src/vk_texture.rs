@@ -94,10 +94,31 @@ pub struct TextureCache {
     set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
     pending: Vec<PendingUpload>,
-    /// When true, skip the SHM upload for any buffer whose `upload_seq`
-    /// matches the last copied seq. Toggleable via `SOL_TRUST_UPLOAD_SEQ`
-    /// env var (default `1` / on).
-    trust_upload_seq: bool,
+    /// Controls whether the SHM upload-skip optimization fires. See
+    /// `TrustMode` for the three states; default `PerElement` honours
+    /// `SceneContent::Shm::trust_seq`.
+    trust_upload_seq: TrustMode,
+}
+
+/// Three-way knob for the SHM upload-skip optimisation. Default is
+/// `PerElement`, which trusts the `trust_seq` flag the Wayland side
+/// sets per-surface. The two override modes are debug aids — set the
+/// `SOL_TRUST_UPLOAD_SEQ` env var to `0` (Off) or `1` (Always) to
+/// force-disable / force-enable, respectively.
+#[derive(Clone, Copy, Debug)]
+enum TrustMode {
+    /// Skip only for the compositor cursor sentinel; everything else
+    /// re-uploads on every render. Conservative; loses the wallpaper
+    /// fast-path. Triggered by `SOL_TRUST_UPLOAD_SEQ=0`.
+    Off,
+    /// Trust `upload_seq` for every SHM surface regardless of role.
+    /// Maximum perf but exposes Chrome-style cache-invalidation bugs.
+    /// Triggered by `SOL_TRUST_UPLOAD_SEQ=1`.
+    Always,
+    /// Honour the per-element `trust_seq` flag from `SceneContent::Shm`
+    /// (true for layer-shell + cursor; false for xdg_toplevel and
+    /// friends). Default; the right balance for typical desktops.
+    PerElement,
 }
 
 impl TextureCache {
@@ -125,23 +146,24 @@ impl TextureCache {
                 .create_descriptor_pool(&pool_info, None)
                 .context("create_descriptor_pool (texture cache)")?
         };
-        // Default ON. The skip was previously blamed for Chrome
-        // glitches but the actual root cause was missing FOREIGN_EXT
-        // queue-family transfers on client dmabufs (Chrome's video
-        // frames could tear at the consumer side without an explicit
-        // dma-buf fence acquire). With the per-frame dmabuf acquire
-        // barrier in place — see `TextureCache::record_dmabuf_acquires`
-        // — the upload-seq skip is safe again, and worth ≈ 32 MB / frame
-        // of wallpaper-upload savings at 4K. Set SOL_TRUST_UPLOAD_SEQ=0
-        // to disable as a debugging knob if a regression suspect
-        // points back here.
-        let trust_upload_seq = std::env::var("SOL_TRUST_UPLOAD_SEQ")
+        // Default `PerElement`: trust the Wayland side's role hint.
+        // Layer-shell surfaces and cursor get the skip; xdg_toplevel
+        // and its descendants always re-upload (Chrome's repaint
+        // pattern violates the "same upload_seq ⇒ same pixels"
+        // invariant). Override via `SOL_TRUST_UPLOAD_SEQ=0` (off) or
+        // `SOL_TRUST_UPLOAD_SEQ=1` (always on, for benchmarking the
+        // upper bound on a Chrome-free workload).
+        let trust_upload_seq = match std::env::var("SOL_TRUST_UPLOAD_SEQ")
             .ok()
-            .map(|v| v != "0")
-            .unwrap_or(true);
+            .as_deref()
+        {
+            Some("0") => TrustMode::Off,
+            Some("1") => TrustMode::Always,
+            _ => TrustMode::PerElement,
+        };
         tracing::info!(
-            trust_upload_seq,
-            "SHM upload-skip configured (set SOL_TRUST_UPLOAD_SEQ=0 to disable)"
+            mode = ?trust_upload_seq,
+            "SHM upload-skip mode (SOL_TRUST_UPLOAD_SEQ=0/1 to override)"
         );
         Ok(Self {
             stack,
@@ -255,51 +277,47 @@ impl TextureCache {
             stride,
             format: _,
             upload_seq,
+            trust_seq,
         } = &elem.content
         else {
             unreachable!();
         };
         let upload_seq = *upload_seq;
         let stride = *stride;
+        let trust_seq = *trust_seq;
 
-        // Upload-skip: if the source buffer hasn't been re-committed
-        // since the last upload, the GPU texture is still current and
-        // the entire memcpy + vkCmdCopyBufferToImage pair can be
-        // skipped. `upload_seq` is bumped from the wl_surface.commit
-        // dispatch on every commit (see compositor.rs), so equal seqs
-        // mean the client hasn't asked us to re-paint it.
+        // Upload-skip decision tree:
         //
-        // Set `SOL_TRUST_UPLOAD_SEQ=0` to fall back to the old
-        // cursor-only behavior — kept as an escape hatch in case some
-        // pathological client (the prior incident pointed at Chrome on
-        // YouTube) violates the "no commit since last upload" ⇒
-        // "pixels unchanged" assumption. Default ON because at 4K
-        // every wallpaper / layer-shell buffer that doesn't re-commit
-        // costs ≈32 MB of needless upload per frame, which dominates
-        // the renderer at 240 Hz.
+        // 1. The compositor cursor sentinel always gets the skip —
+        //    it's allocated once at startup and provably immutable.
+        // 2. Per-element `trust_seq` is set true at SceneElement
+        //    construction for layer-shell surfaces (wallpaper /
+        //    waybar / overlay) and the client cursor; false for
+        //    xdg_toplevel and friends. This is the seam that lets
+        //    static-pixel surfaces enjoy the skip while keeping
+        //    the Chrome-style repaint path safe.
+        // 3. The env var `SOL_TRUST_UPLOAD_SEQ` overrides:
+        //    - `=1` forces the skip on regardless of `trust_seq` (debug knob,
+        //       useful when measuring the upper bound of the optimization).
+        //    - `=0` forces it off except for the cursor sentinel
+        //       (debug knob, useful when chasing a regression here).
+        //    - unset (default) honours the per-element flag.
         //
         // The `upload_seq != 0` guard avoids skipping on the very first
         // frame for a freshly-attached buffer: an entry can exist with
         // `uploaded_seq = 0` after creation but before any copy was
         // recorded.
-        if let Some(e) = self.entries.get(&elem.buffer_key) {
-            if !e.is_dmabuf
-                && e.width == elem.width
-                && e.height == elem.height
-                && upload_seq != 0
-                && e.uploaded_seq == upload_seq
-                && self.trust_upload_seq
-            {
-                return Ok(());
-            }
-            // The strict cursor-only path stays as a safety net even
-            // when `trust_upload_seq` is off: the cursor sprite is
-            // provably immutable post-init, so its skip is always
-            // correct.
-            if !self.trust_upload_seq && elem.buffer_key == CURSOR_SCENE_KEY {
+        let allow_skip = match self.trust_upload_seq {
+            TrustMode::Off => elem.buffer_key == CURSOR_SCENE_KEY,
+            TrustMode::Always => true,
+            TrustMode::PerElement => trust_seq || elem.buffer_key == CURSOR_SCENE_KEY,
+        };
+        if allow_skip {
+            if let Some(e) = self.entries.get(&elem.buffer_key) {
                 if !e.is_dmabuf
                     && e.width == elem.width
                     && e.height == elem.height
+                    && upload_seq != 0
                     && e.uploaded_seq == upload_seq
                 {
                     return Ok(());

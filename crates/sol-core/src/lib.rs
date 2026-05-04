@@ -40,6 +40,18 @@ pub enum SceneContent<'a> {
         /// vblank because the renderer had no way to tell their
         /// pixels hadn't changed.
         upload_seq: u64,
+        /// Whether the renderer can trust the "same `upload_seq` ⇒
+        /// same pixels" invariant for this surface. Set true for
+        /// layer-shell surfaces (wallpaper, waybar, dock, lockscreen)
+        /// and the compositor's cursor sentinel — those don't
+        /// modify SHM bytes between commits in any of the patterns
+        /// we've seen. Set false for `xdg_toplevel` and friends:
+        /// at least Chrome's repaint path appears to violate that
+        /// invariant, manifesting as UI flicker / video stutter
+        /// when we skip uploads on it. False is the safe default;
+        /// the perf cost is one full SHM re-upload per frame for
+        /// the affected surface.
+        trust_seq: bool,
     },
     Dmabuf {
         /// Raw dmabuf fd. Borrowed from the wl_buffer's user-data for one

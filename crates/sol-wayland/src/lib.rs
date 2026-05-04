@@ -2022,6 +2022,16 @@ enum Placed {
         /// to the parent's rounded shape would require a stencil
         /// pass we don't have yet.
         corner_radius: f32,
+        /// Per-role gate for the SHM upload-skip optimization.
+        /// `true` for layer-shell (wallpaper / waybar / lockscreen
+        /// surfaces) where commits are infrequent and pixels are
+        /// stable between them — the renderer can rely on a
+        /// matching `upload_seq` to skip the per-frame re-upload.
+        /// `false` for xdg_toplevel and its descendants because at
+        /// least Chrome's repaint path violates the invariant, and
+        /// trusting it manifests as UI flicker / video stutter.
+        /// Subsurfaces inherit from their root role.
+        trust_seq: bool,
     },
     Backdrop {
         rect: RectF,
@@ -2057,8 +2067,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                trust_seq: true,
             });
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0, true);
         }
     }
     // Mark the boundary: everything pushed so far (bg + bottom layers
@@ -2187,6 +2198,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                     vsrc,
                     alpha: win_alpha,
                     corner_radius,
+                    trust_seq: false,
                 });
             }
             emit_subsurface_tree(
@@ -2195,6 +2207,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 scaled.x,
                 scaled.y,
                 win_alpha,
+                false,
             );
         }
     };
@@ -2227,6 +2240,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             vsrc: cw.vsrc,
             alpha: cw.render_alpha,
             corner_radius,
+            // Closing tiles are frozen-buffer copies of toplevels —
+            // same Chrome-glitch risk as live toplevels.
+            trust_seq: false,
         });
     }
 
@@ -2252,8 +2268,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                trust_seq: true,
             });
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0, true);
         }
     }
 
@@ -2285,6 +2302,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: win.render_alpha,
                         corner_radius: 0.0,
+                        trust_seq: false,
                     });
                 }
                 emit_subsurface_tree(
@@ -2293,6 +2311,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                     scaled.x,
                     scaled.y,
                     win.render_alpha,
+                    false,
                 );
             }
         }
@@ -2330,9 +2349,10 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius,
+                trust_seq: false,
             });
         }
-        emit_subsurface_tree(&mut out, &surface, dx, dy, 1.0);
+        emit_subsurface_tree(&mut out, &surface, dx, dy, 1.0, false);
     }
 
     // 5. Mapped xdg_popups. Stacked above tiled toplevels, Top
@@ -2387,9 +2407,10 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                trust_seq: false,
             });
         }
-        emit_subsurface_tree(&mut out, &surface, buffer_x, buffer_y, 1.0);
+        emit_subsurface_tree(&mut out, &surface, buffer_x, buffer_y, 1.0, false);
     }
 
     // 6. Overlay layer surfaces — always on top, even of fullscreen.
@@ -2403,8 +2424,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
+                trust_seq: true,
             });
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0, true);
         }
     }
 
@@ -2444,8 +2466,14 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: 1.0,
                         corner_radius: 0.0,
+                        // Client cursors are typically static
+                        // sprites swapped in for hover states; pixel
+                        // changes always come with a real commit.
+                        // Treat the same as compositor cursor for
+                        // skip purposes.
+                        trust_seq: true,
                     });
-                    emit_subsurface_tree(&mut out, &cur, cx, cy, 1.0);
+                    emit_subsurface_tree(&mut out, &cur, cx, cy, 1.0, true);
                 }
             }
         }
@@ -2472,6 +2500,7 @@ fn emit_subsurface_tree(
     parent_x: f32,
     parent_y: f32,
     alpha: f32,
+    trust_seq: bool,
 ) {
     let Some(sd_arc) = parent.data::<Arc<Mutex<SurfaceData>>>() else {
         return;
@@ -2532,9 +2561,10 @@ fn emit_subsurface_tree(
                 // reasoning. Rounded clipping inside the parent
                 // would need a stencil pass.
                 corner_radius: 0.0,
+                trust_seq,
             });
         }
-        emit_subsurface_tree(out, &child, child_x, child_y, alpha);
+        emit_subsurface_tree(out, &child, child_x, child_y, alpha, trust_seq);
     }
 }
 
@@ -2553,9 +2583,9 @@ fn scene_from_buffers<'a>(
     // want (cursor on top).
     scene.border_anchor = border_anchor;
     for p in placed {
-        let (buf, rect, vsrc, alpha, corner_radius) = match p {
-            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius } => {
-                (buf, rect, vsrc, alpha, corner_radius)
+        let (buf, rect, vsrc, alpha, corner_radius, trust_seq) = match p {
+            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius, trust_seq } => {
+                (buf, rect, vsrc, alpha, corner_radius, *trust_seq)
             }
             Placed::Backdrop {
                 rect,
@@ -2617,6 +2647,7 @@ fn scene_from_buffers<'a>(
                     upload_seq: bd
                         .upload_seq
                         .load(std::sync::atomic::Ordering::Relaxed),
+                    trust_seq,
                 },
             });
         } else if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
@@ -2676,6 +2707,8 @@ fn scene_from_buffers<'a>(
                 stride: cursor.width * 4,
                 format: sol_core::PixelFormat::Argb8888,
                 upload_seq: cursor.upload_seq,
+                // Compositor cursor is provably immutable post-init.
+                trust_seq: true,
             },
         });
     }
@@ -3997,6 +4030,7 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
                         stride,
                         format,
                         upload_seq: _,
+                        trust_seq: _,
                     } => {
                         canvas.blit_argb(
                             e.x.round() as i32,
