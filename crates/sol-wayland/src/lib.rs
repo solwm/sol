@@ -92,11 +92,8 @@ use wayland_server::protocol::{
     wl_subcompositor::WlSubcompositor,
 };
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
-use wayland_protocols::wp::idle_inhibit::zv1::server::{
-    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
-    zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
-};
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
+use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 use xkb::KeymapState;
 
 /// Hand out a fresh, never-recycled key for the DRM presenter's
@@ -521,11 +518,18 @@ pub struct State {
     /// workspace handles. `switch_workspace` walks this list on
     /// every switch to emit state changes atomically.
     pub ext_workspace_managers: Vec<ext_workspace::ManagerBinding>,
-    /// Live `zwp_idle_inhibitor_v1` resources. Non-empty → video
-    /// players / presentation tools have asked us not to idle-blank.
-    /// The idle timer consults this before DPMS-off. Cleaned up
-    /// in the inhibitor's `Destroy` dispatch.
-    pub idle_inhibitors: Vec<ZwpIdleInhibitorV1>,
+    /// Surfaces with at least one live inhibitor. Non-empty →
+    /// video players / presentation tools have asked us not to
+    /// idle-blank. The idle timer consults this (via
+    /// `idle_inhibit::any_active`) before DPMS-off. Smithay's
+    /// `IdleInhibitHandler::inhibit` / `uninhibit` add and remove
+    /// entries; dead `Weak`s are pruned lazily by `any_active`.
+    pub idle_inhibitors: Vec<Weak<WlSurface>>,
+    /// Smithay's idle-inhibit manager state (owns the global). The
+    /// `delegate_idle_inhibit!` macro routes Dispatch into this; the
+    /// only reason it lives on `State` is to keep the global ID
+    /// reachable for shutdown.
+    pub idle_inhibit_manager_state: IdleInhibitManagerState,
     /// Monotonic timestamp of the most recent user input. Updated
     /// on every `apply_input` call; the idle timer compares it to
     /// `now - config.idle_timeout` to decide whether to blank. Also
@@ -1187,6 +1191,20 @@ impl BufferHandler for State {
 }
 
 smithay::delegate_shm!(State);
+
+// Smithay idle-inhibit wiring. The handler bodies live in
+// `idle_inhibit.rs` so the State impl here stays a one-liner — we
+// don't want a second copy of the surface-tracking logic.
+impl IdleInhibitHandler for State {
+    fn inhibit(&mut self, surface: WlSurface) {
+        idle_inhibit::on_inhibit(self, surface);
+    }
+    fn uninhibit(&mut self, surface: WlSurface) {
+        idle_inhibit::on_uninhibit(self, surface);
+    }
+}
+
+smithay::delegate_idle_inhibit!(State);
 
 /// Backend-specific render target. Chosen at startup; does not switch at
 /// runtime. `DrmPresenter` is boxed because it carries the Vulkan
@@ -4232,6 +4250,11 @@ fn setup_event_loop(
     let shm_state = ShmState::new::<State>(&dh, []);
     let shm_global = shm_state.global();
 
+    // Smithay owns the zwp_idle_inhibit_manager_v1 global. Same
+    // construct-before-Globals shape so we can hand the GlobalId in.
+    let idle_inhibit_manager_state = IdleInhibitManagerState::new::<State>(&dh);
+    let idle_inhibit_global = idle_inhibit_manager_state.global();
+
     let globals = Globals {
         compositor: dh.create_global::<State, WlCompositor, ()>(COMPOSITOR_VERSION, ()),
         shm: shm_global,
@@ -4279,10 +4302,7 @@ fn setup_event_loop(
             ext_workspace::EXT_WORKSPACE_MANAGER_VERSION,
             (),
         ),
-        idle_inhibit: dh.create_global::<State, ZwpIdleInhibitManagerV1, ()>(
-            idle_inhibit::IDLE_INHIBIT_MANAGER_VERSION,
-            (),
-        ),
+        idle_inhibit: idle_inhibit_global,
         primary_selection: dh
             .create_global::<State, ZwpPrimarySelectionDeviceManagerV1, ()>(
                 primary_selection::PRIMARY_SELECTION_VERSION,
@@ -4602,6 +4622,7 @@ fn setup_event_loop(
         pending_texture_evictions: Vec::new(),
         shm_state,
         shm_cache: std::collections::HashMap::new(),
+        idle_inhibit_manager_state,
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
         data_devices: Vec::new(),
