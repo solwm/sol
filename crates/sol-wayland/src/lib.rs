@@ -1007,11 +1007,6 @@ impl State {
     }
 
     pub fn set_keyboard_focus(&mut self, new: Option<WlSurface>) {
-        tracing::info!(
-            new = ?new.as_ref().map(|s| s.id()),
-            kb_count = self.keyboards.len(),
-            "set_keyboard_focus called"
-        );
         if surface_eq(self.keyboard_focus.as_ref(), new.as_ref()) {
             return;
         }
@@ -1028,10 +1023,8 @@ impl State {
         if let Some(new) = new.as_ref() {
             let serial = self.next_serial();
             let keys = self.pressed_keys_bytes();
-            let mut sent = 0;
             for kb in &self.keyboards {
                 if same_client(kb, new) {
-                    sent += 1;
                     kb.enter(serial, new, keys.clone());
                     // Send current modifier state so the client starts with
                     // a correct shift/ctrl/etc view of the world.
@@ -1048,7 +1041,6 @@ impl State {
                     }
                 }
             }
-            tracing::info!(sent_enter_to = sent, "set_keyboard_focus dispatched");
         }
         // Remember the focused tile's slot per workspace if it's a
         // STACK tile (any tile that isn't the master / first entry
@@ -1590,7 +1582,6 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
         crate::layer_shell::send_initial_configure(state, surface);
     }
     if just_mapped_toplevel {
-        tracing::info!(id = ?surface.id(), "commit_surface: just_mapped_toplevel → on_toplevel_mapped");
         state.on_toplevel_mapped(surface);
     }
 
@@ -1756,8 +1747,7 @@ pub(crate) fn start_dialog_drag(state: &mut State, surface: &WlSurface) {
 fn dialog_render_origin(state: &State, idx: usize) -> Option<(f32, f32)> {
     let dlg = state.mapped_dialogs.get(idx)?;
     let surface = dlg.surface.upgrade().ok()?;
-    let (dw, dh) = compositor::with_sol_data(&surface, |sd| surface_logical_size(sd))
-        .flatten()?;
+    let (dw, dh) = compositor::with_sol_data(&surface, surface_logical_size).flatten()?;
     let dw_f = dw as f32;
     let dh_f = dh as f32;
 
@@ -2342,7 +2332,7 @@ fn send_pending_configures(state: &mut State) {
         tl.configure(w, h, state_bytes.clone());
         xs.configure(serial);
         state.mapped_toplevels[i].pending_size = Some((w, h));
-        tracing::info!(
+        tracing::debug!(
             tile_index = i,
             width = w,
             height = h,
@@ -3515,7 +3505,7 @@ fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
 pub(crate) fn settle_pending_layout(state: &mut State, surface: &WlSurface) {
     // Pull logical size out of the surface's SurfaceData while we
     // already have a Mutex guard available; cheap and read-only.
-    let logical = compositor::with_sol_data(surface, |sd| surface_logical_size(sd)).flatten();
+    let logical = compositor::with_sol_data(surface, surface_logical_size).flatten();
 
     let mut kicked = false;
     for win in state.mapped_toplevels.iter_mut() {
@@ -5571,7 +5561,7 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         }
         let Ok(surface) = dlg.surface.upgrade() else { continue };
         let Some((dx, dy)) = dialog_render_origin(state, idx) else { continue };
-        let Some((dw, dh)) = compositor::with_sol_data(&surface, |sd| surface_logical_size(sd))
+        let Some((dw, dh)) = compositor::with_sol_data(&surface, surface_logical_size)
             .flatten()
         else {
             continue;

@@ -59,12 +59,7 @@ impl Dispatch<WlSeat, ()> for State {
             }
             wl_seat::Request::GetKeyboard { id } => {
                 let keyboard = init.init(id, ());
-                tracing::info!(
-                    id = ?keyboard.id(),
-                    client = ?keyboard.client().map(|c| c.id()),
-                    focus = ?state.keyboard_focus.as_ref().map(|s| s.id()),
-                    "create wl_keyboard"
-                );
+                tracing::debug!(id = ?keyboard.id(), "create wl_keyboard");
                 // Send the keymap to this freshly bound keyboard so the
                 // client can make sense of future key events.
                 if let Some(km) = state.keymap.as_ref() {
