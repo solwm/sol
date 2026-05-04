@@ -14,7 +14,7 @@
 //! configure sequence so clients proceed to map. Scene integration,
 //! input routing, and exclusive-zone layout all land in B9.3–B9.5.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use wayland_protocols_wlr::layer_shell::v1::server::{
     zwlr_layer_shell_v1::{self, Layer, ZwlrLayerShellV1},
@@ -26,7 +26,7 @@ use wayland_server::{
     protocol::wl_surface::WlSurface,
 };
 
-use crate::{State, compositor::{SurfaceData, SurfaceRole}};
+use crate::{State, compositor::SurfaceRole};
 
 pub const LAYER_SHELL_VERSION: u32 = 4;
 
@@ -48,7 +48,6 @@ pub struct LayerState {
 /// User-data for a live `zwlr_layer_surface_v1` resource.
 pub struct LayerSurfaceData {
     pub wl_surface: WlSurface,
-    pub surface_data: Arc<Mutex<SurfaceData>>,
     pub namespace: String,
     pub inner: Mutex<LayerSurfaceInner>,
 }
@@ -123,48 +122,44 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
                     }
                 };
 
-                let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
+                // Reject if the surface already has a role or a buffer.
+                let bad_role = crate::compositor::with_sol_data(&surface, |sd| {
+                    !matches!(sd.role, SurfaceRole::None)
+                })
+                .unwrap_or(false);
+                if bad_role {
                     resource.post_error(
                         zwlr_layer_shell_v1::Error::Role,
-                        "wl_surface missing SurfaceData",
+                        "wl_surface already has a role",
                     );
                     return;
-                };
-                // Reject if the surface already has a role or a buffer.
-                {
-                    let sd = sd_arc.lock().unwrap();
-                    if !matches!(sd.role, SurfaceRole::None) {
-                        resource.post_error(
-                            zwlr_layer_shell_v1::Error::Role,
-                            "wl_surface already has a role",
-                        );
-                        return;
-                    }
-                    if sd.current.buffer.is_some() || sd.pending.buffer.is_some() {
-                        resource.post_error(
-                            zwlr_layer_shell_v1::Error::AlreadyConstructed,
-                            "wl_surface already has a buffer attached",
-                        );
-                        return;
-                    }
+                }
+                let has_buffer = crate::compositor::with_sol_data(&surface, |sd| {
+                    sd.current_buffer.is_some()
+                })
+                .unwrap_or(false);
+                if has_buffer {
+                    resource.post_error(
+                        zwlr_layer_shell_v1::Error::AlreadyConstructed,
+                        "wl_surface already has a buffer attached",
+                    );
+                    return;
                 }
 
                 let data = LayerSurfaceData {
                     wl_surface: surface.clone(),
-                    surface_data: sd_arc.clone(),
                     namespace: namespace.clone(),
                     inner: Mutex::new(LayerSurfaceInner::new(layer_num)),
                 };
                 let ls = init.init(id, data);
 
-                {
-                    let mut sd = sd_arc.lock().unwrap();
+                crate::compositor::with_sol_data_mut(&surface, |sd| {
                     sd.role = SurfaceRole::LayerSurface {
                         mapped: false,
                         initial_configure_sent: false,
                     };
                     sd.zwlr_layer_surface = Some(ls.downgrade());
-                }
+                });
 
                 // Track membership for the next render tick (scene assembly
                 // + apply_layout). We use a separate list from mapped_toplevels
@@ -336,14 +331,15 @@ pub fn mapped_layers(state: &State, screen: crate::Rect) -> Vec<MappedLayer> {
     let mut out = Vec::new();
     for weak in state.pending_layer_surfaces.iter() {
         let Ok(surface) = weak.upgrade() else { continue };
-        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (ls_weak, buffer) = {
-            let sd = sd_arc.lock().unwrap();
+        let Some((ls_weak, buffer)) = crate::compositor::with_sol_data(&surface, |sd| {
             if !matches!(sd.role, SurfaceRole::LayerSurface { mapped: true, .. }) {
-                continue;
+                return None;
             }
-            let Some(buf) = sd.current.buffer.clone() else { continue };
-            (sd.zwlr_layer_surface.clone(), buf)
+            let buf = sd.current_buffer.clone()?;
+            Some((sd.zwlr_layer_surface.clone(), buf))
+        })
+        .flatten() else {
+            continue;
         };
         let Some(ls_weak) = ls_weak else { continue };
         let Ok(ls) = ls_weak.upgrade() else { continue };
@@ -415,11 +411,7 @@ pub fn usable_area(mapped: &[MappedLayer], screen: crate::Rect) -> crate::Rect {
 /// Called from the wl_surface.commit handler for any surface whose role
 /// is LayerSurface, before we decide whether to send configure / map.
 pub fn promote_layer_state(surface: &WlSurface) {
-    let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { return };
-    let ls_weak = {
-        let sd = sd_arc.lock().unwrap();
-        sd.zwlr_layer_surface.clone()
-    };
+    let ls_weak = crate::compositor::with_sol_data(surface, |sd| sd.zwlr_layer_surface.clone()).flatten();
     let Some(ls_weak) = ls_weak else { return };
     let Ok(ls) = ls_weak.upgrade() else { return };
     let Some(data) = ls.data::<LayerSurfaceData>() else { return };
@@ -433,11 +425,7 @@ pub fn promote_layer_state(surface: &WlSurface) {
 /// axis by setting it to zero.
 pub fn send_initial_configure(state: &mut State, surface: &WlSurface) {
     let (screen_w, screen_h) = (state.screen_width, state.screen_height);
-    let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { return };
-    let ls_weak = {
-        let sd = sd_arc.lock().unwrap();
-        sd.zwlr_layer_surface.clone()
-    };
+    let ls_weak = crate::compositor::with_sol_data(surface, |sd| sd.zwlr_layer_surface.clone()).flatten();
     let Some(ls_weak) = ls_weak else { return };
     let Ok(ls) = ls_weak.upgrade() else { return };
     let Some(data) = ls.data::<LayerSurfaceData>() else { return };

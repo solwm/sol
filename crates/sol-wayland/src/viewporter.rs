@@ -24,7 +24,6 @@
 //! `wayland-protocols` bindings hand them to us as pre-converted
 //! `f64`, so no manual shift.
 
-use std::sync::{Arc, Mutex};
 
 use wayland_protocols::wp::viewporter::server::{
     wp_viewport::{self, WpViewport},
@@ -35,7 +34,7 @@ use wayland_server::{
     protocol::wl_surface::WlSurface,
 };
 
-use crate::{State, compositor::SurfaceData};
+use crate::State;
 
 pub const VIEWPORTER_VERSION: u32 = 1;
 
@@ -111,11 +110,9 @@ impl Dispatch<WpViewport, ViewportData> for State {
                     dst = ?dst,
                     "viewport.set_destination"
                 );
-                if let Some(sd_arc) =
-                    data.surface.data::<Arc<Mutex<SurfaceData>>>()
-                {
-                    sd_arc.lock().unwrap().viewport_dst = dst;
-                }
+                crate::compositor::with_sol_data_mut(&data.surface, |sd| {
+                    sd.viewport_dst = dst;
+                });
             }
             wp_viewport::Request::SetSource { x, y, width, height } => {
                 tracing::debug!(
@@ -132,20 +129,15 @@ impl Dispatch<WpViewport, ViewportData> for State {
                 } else {
                     None
                 };
-                if let Some(sd_arc) =
-                    data.surface.data::<Arc<Mutex<SurfaceData>>>()
-                {
-                    sd_arc.lock().unwrap().viewport_src = src;
-                }
+                crate::compositor::with_sol_data_mut(&data.surface, |sd| {
+                    sd.viewport_src = src;
+                });
             }
             wp_viewport::Request::Destroy => {
-                if let Some(sd_arc) =
-                    data.surface.data::<Arc<Mutex<SurfaceData>>>()
-                {
-                    let mut sd = sd_arc.lock().unwrap();
+                crate::compositor::with_sol_data_mut(&data.surface, |sd| {
                     sd.viewport_dst = None;
                     sd.viewport_src = None;
-                }
+                });
             }
             _ => {}
         }

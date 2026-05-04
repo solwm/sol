@@ -6,7 +6,7 @@
 //! relative to their parent and render as a separate top-of-z-order
 //! pass so they appear over toplevels and overlay layer surfaces.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use wayland_protocols::xdg::shell::server::{
     xdg_popup::{self, XdgPopup},
@@ -20,7 +20,7 @@ use wayland_server::{
     WEnum, protocol::wl_surface::WlSurface,
 };
 
-use crate::{State, compositor::SurfaceData};
+use crate::State;
 
 /// Canonical `states` payload for every configure sol sends. Includes
 /// MAXIMIZED (tells the client "obey this size, per the xdg-shell spec")
@@ -53,10 +53,10 @@ pub(crate) fn tile_state_bytes() -> Vec<u8> {
 }
 
 /// Tracks the surface a given xdg_surface wraps, so toplevel requests can
-/// reach through to modify the underlying compositor state.
+/// reach through to modify the underlying compositor state via
+/// `compositor::with_sol_data*`.
 pub struct XdgSurfaceData {
     pub wl_surface: WlSurface,
-    pub surface_data: Arc<Mutex<SurfaceData>>,
 }
 
 /// Per-`xdg_positioner` mutable state. The protocol is incremental:
@@ -126,14 +126,10 @@ impl Dispatch<XdgWmBase, ()> for State {
     ) {
         match request {
             xdg_wm_base::Request::GetXdgSurface { id, surface } => {
-                let sd = surface
-                    .data::<Arc<Mutex<SurfaceData>>>()
-                    .expect("wl_surface without SurfaceData");
                 let _ = init.init(
                     id,
                     XdgSurfaceData {
                         wl_surface: surface.clone(),
-                        surface_data: sd.clone(),
                     },
                 );
             }
@@ -160,12 +156,11 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
         match request {
             xdg_surface::Request::GetToplevel { id } => {
                 let toplevel = init.init(id, data.wl_surface.clone());
-                {
-                    let mut sd = data.surface_data.lock().unwrap();
+                crate::compositor::with_sol_data_mut(&data.wl_surface, |sd| {
                     sd.role = crate::compositor::SurfaceRole::XdgToplevel { mapped: false };
                     sd.xdg_toplevel = Some(toplevel.downgrade());
                     sd.xdg_surface = Some(xs.downgrade());
-                }
+                });
                 // Initial configure with size 0,0 and no states tells
                 // the client "pick your own size for now". This is the
                 // only signal we have at this point that lets dialogs
@@ -206,8 +201,7 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                 let (px, py) = compute_popup_position(&pos_state);
                 let (pw, ph) = pos_state.size;
 
-                {
-                    let mut sd = data.surface_data.lock().unwrap();
+                crate::compositor::with_sol_data_mut(&data.wl_surface, |sd| {
                     sd.role = crate::compositor::SurfaceRole::XdgPopup {
                         mapped: false,
                         offset: (px, py),
@@ -216,7 +210,7 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                     sd.xdg_surface = Some(xs.downgrade());
                     sd.xdg_popup = Some(popup.downgrade());
                     sd.xdg_popup_parent = parent_surface.as_ref().map(|s| s.downgrade());
-                }
+                });
 
                 // Initial configure: position + size, then xdg_surface
                 // serial. The client acks and commits its first buffer.
@@ -236,8 +230,9 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for State {
                 tracing::debug!(serial, "client ack_configure");
             }
             xdg_surface::Request::SetWindowGeometry { x, y, width, height } => {
-                let mut sd = data.surface_data.lock().unwrap();
-                sd.xdg_window_geometry = Some((x, y, width, height));
+                crate::compositor::with_sol_data_mut(&data.wl_surface, |sd| {
+                    sd.xdg_window_geometry = Some((x, y, width, height));
+                });
             }
             xdg_surface::Request::Destroy => {}
             _ => {}
@@ -267,10 +262,9 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
                 let parent_surface = parent.as_ref().and_then(|tl| {
                     tl.data::<WlSurface>().cloned()
                 });
-                if let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() {
-                    let mut sd = sd_arc.lock().unwrap();
+                crate::compositor::with_sol_data_mut(surface, |sd| {
                     sd.xdg_toplevel_parent = parent_surface.as_ref().map(|s| s.downgrade());
-                }
+                });
                 tracing::info!(
                     id = ?surface.id(),
                     parent = ?parent_surface.as_ref().map(|s| s.id()),
@@ -285,15 +279,15 @@ impl Dispatch<XdgToplevel, WlSurface> for State {
                 tracing::info!(id = ?surface.id(), %app_id, "toplevel app_id");
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
-                if let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() {
-                    sd_arc.lock().unwrap().xdg_min_size = (width, height);
-                }
+                crate::compositor::with_sol_data_mut(surface, |sd| {
+                    sd.xdg_min_size = (width, height);
+                });
                 crate::reclassify_window(state, surface);
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {
-                if let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() {
-                    sd_arc.lock().unwrap().xdg_max_size = (width, height);
-                }
+                crate::compositor::with_sol_data_mut(surface, |sd| {
+                    sd.xdg_max_size = (width, height);
+                });
                 crate::reclassify_window(state, surface);
             }
             xdg_toplevel::Request::Move { seat: _, serial: _ } => {
@@ -381,8 +375,7 @@ impl Dispatch<XdgPopup, XdgPopupData> for State {
                     .unwrap_or_default();
                 let (px, py) = compute_popup_position(&pos_state);
                 let (pw, ph) = pos_state.size;
-                if let Some(sd_arc) = data.wl_surface.data::<Arc<Mutex<SurfaceData>>>() {
-                    let mut sd = sd_arc.lock().unwrap();
+                crate::compositor::with_sol_data_mut(&data.wl_surface, |sd| {
                     sd.role = crate::compositor::SurfaceRole::XdgPopup {
                         mapped: matches!(
                             sd.role,
@@ -391,7 +384,7 @@ impl Dispatch<XdgPopup, XdgPopupData> for State {
                         offset: (px, py),
                         size: (pw, ph),
                     };
-                }
+                });
                 resource.repositioned(token);
                 resource.configure(px, py, pw.max(1), ph.max(1));
             }

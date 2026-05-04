@@ -39,15 +39,18 @@ use std::os::fd::AsRawFd;
 use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
-    Display, DisplayHandle, Resource, Weak,
+    Client, Display, DisplayHandle, Resource, Weak,
     backend::{ClientData, ClientId, DisconnectReason, GlobalId, ObjectId},
     protocol::{
-        wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat,
-        wl_surface::WlSurface,
+        wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface,
     },
 };
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::compositor::{
+    self as smithay_compositor, BufferAssignment, CompositorClientState,
+    CompositorHandler, CompositorState, SubsurfaceCachedState, SurfaceAttributes,
+};
 
 mod compositor;
 mod config;
@@ -75,7 +78,7 @@ mod xdg_output;
 mod xdg_shell;
 mod xkb;
 
-use compositor::{SurfaceData, SurfaceRole};
+use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
@@ -89,7 +92,6 @@ use wayland_server::protocol::{
     wl_data_device_manager::WlDataDeviceManager,
     wl_keyboard::{self, WlKeyboard},
     wl_pointer::{self, WlPointer},
-    wl_subcompositor::WlSubcompositor,
 };
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
@@ -111,7 +113,6 @@ pub(crate) fn next_buffer_cache_key() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-const COMPOSITOR_VERSION: u32 = 6;
 const OUTPUT_VERSION: u32 = 4;
 const SEAT_VERSION: u32 = 8;
 const XDG_WM_BASE_VERSION: u32 = 5;
@@ -453,6 +454,11 @@ pub struct State {
     /// before the rest of `Globals` so its `global()` ID can populate
     /// `globals.shm`.
     pub shm_state: ShmState,
+    /// Smithay's compositor state: owns the wl_compositor +
+    /// wl_subcompositor globals, plus the per-surface tree
+    /// (`SurfaceAttributes`, role, `cached_state`, `data_map` slot
+    /// for our `SolSurfaceData`).
+    pub compositor_state: CompositorState,
     /// Per-`wl_buffer` compositor-owned state, keyed by the buffer's
     /// `ObjectId`. Lazily populated at commit time in `compositor.rs`
     /// (see `shm::is_shm_buffer` gate); entries removed by
@@ -1151,7 +1157,11 @@ fn surface_eq(a: Option<&WlSurface>, b: Option<&WlSurface>) -> bool {
 }
 
 #[derive(Default)]
-pub struct ClientState;
+pub struct ClientState {
+    /// Per-client compositor state for smithay's `CompositorHandler`.
+    /// Used by the per-client scale shim and transaction queue plumbing.
+    pub compositor: CompositorClientState,
+}
 
 impl ClientData for ClientState {
     fn initialized(&self, client_id: ClientId) {
@@ -1191,6 +1201,70 @@ impl BufferHandler for State {
 }
 
 smithay::delegate_shm!(State);
+
+// Smithay compositor wiring. `delegate_compositor!` claims the
+// wl_compositor / wl_subcompositor / wl_surface / wl_subsurface /
+// wl_region / wl_callback Dispatch impls. We provide the handler
+// and `client_compositor_state` to expose the per-client state
+// stored on our `ClientState`.
+impl CompositorHandler for State {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        &client.get_data::<ClientState>().unwrap().compositor
+    }
+    fn new_surface(&mut self, surface: &WlSurface) {
+        // Attach our per-surface state behind a Mutex on the smithay
+        // data_map. Done lazily on first call rather than at create
+        // time because smithay's data_map insert API is "set if
+        // missing" and idempotent — easier to put it here than to
+        // override CompositorState::create_surface.
+        smithay_compositor::with_states(surface, |states| {
+            states
+                .data_map
+                .insert_if_missing_threadsafe(|| Mutex::new(SolSurfaceData::default()));
+        });
+    }
+    fn new_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) {
+        // Mark the child's role and link it into the parent's
+        // children list so the scene walker finds it when recursing
+        // down from the mapped root. Smithay enforces "one role per
+        // surface" via `give_role` for us, so by the time we get
+        // here the role slot is already exclusive.
+        compositor::with_sol_data_mut(surface, |sd| {
+            sd.role = SurfaceRole::Subsurface;
+            sd.subsurface_parent = Some(parent.downgrade());
+        });
+        compositor::with_sol_data_mut(parent, |psd| {
+            psd.subsurface_children.push(surface.downgrade());
+        });
+    }
+    fn commit(&mut self, surface: &WlSurface) {
+        commit_surface(self, surface);
+    }
+    fn destroyed(&mut self, surface: &WlSurface) {
+        // If this was a subsurface, remove it from the parent's
+        // children list so the scene walker doesn't try to upgrade
+        // a dead Weak every frame. Read the parent link before
+        // any cleanup since it's stored on `surface`'s SolSurfaceData
+        // which is also being torn down.
+        let parent = compositor::with_sol_data(surface, |sd| {
+            sd.subsurface_parent.as_ref().and_then(|w| w.upgrade().ok())
+        })
+        .flatten();
+        if let Some(parent) = parent {
+            let child_id = surface.id();
+            compositor::with_sol_data_mut(&parent, |psd| {
+                psd.subsurface_children.retain(|w| {
+                    w.upgrade().ok().map(|s| s.id() != child_id).unwrap_or(false)
+                });
+            });
+        }
+    }
+}
+
+smithay::delegate_compositor!(State);
 
 // Smithay idle-inhibit wiring. The handler bodies live in
 // `idle_inhibit.rs` so the State impl here stays a one-liner — we
@@ -1254,10 +1328,259 @@ pub struct Compositor {
 /// previously the surface mapped as a tile, was given half the
 /// screen, then jumped to a centered float once set_parent landed,
 /// producing a visible flash).
-pub(crate) fn is_fixed_size_floater(sd: &compositor::SurfaceData) -> bool {
+pub(crate) fn is_fixed_size_floater(sd: &compositor::SolSurfaceData) -> bool {
     let (min_w, min_h) = sd.xdg_min_size;
     let (max_w, max_h) = sd.xdg_max_size;
     min_w > 0 && min_h > 0 && min_w == max_w && min_h == max_h
+}
+
+/// Compositor-side commit handler. Smithay calls this from
+/// `CompositorHandler::commit` after merging pending → current
+/// surface state (buffer assignment, damage, frame callbacks, role
+/// state). We:
+///
+/// 1. Read smithay's `SurfaceAttributes` (cached_state) and
+///    `SubsurfaceCachedState` for the just-promoted values.
+/// 2. Update our `SolSurfaceData::current_buffer` based on the
+///    `BufferAssignment` (NewBuffer vs Removed vs no-attach) and
+///    mirror the subsurface offset so renderers don't have to crack
+///    open `with_states` per-frame.
+/// 3. Bump `state.shm_cache.upload_seq` for SHM buffers when there's
+///    a real pixel change (attach OR damage since last commit) — bare
+///    commits used for ack_configure / frame-callback handshakes
+///    don't invalidate any upload cache.
+/// 4. Drive role-specific map/unmap transitions (XdgToplevel,
+///    LayerSurface, XdgPopup), running side-effects (push to
+///    `mapped_toplevels` / `mapped_dialogs` / `mapped_popups`,
+///    `unmap_toplevel`, `settle_pending_layout`,
+///    `send_initial_configure`, `on_toplevel_mapped`) outside any
+///    lock on `SolSurfaceData` — those helpers themselves call into
+///    `with_states` and would re-enter the surface mutex.
+/// 5. Drain frame callbacks into `state.pending_frame_callbacks` for
+///    firing post-render.
+/// 6. Set `needs_render = true`.
+fn commit_surface(state: &mut State, surface: &WlSurface) {
+    use std::sync::atomic::Ordering;
+
+    // Phase 1 — single pass through smithay's cached_state. Drains
+    // damage and frame_callbacks, takes the buffer assignment, reads
+    // the subsurface offset, and updates our SolSurfaceData under the
+    // surface's outer Mutex (which smithay already holds for us
+    // inside this closure). Captures the role + new current_buffer
+    // for downstream phases that need them without re-entering.
+    struct Snapshot {
+        buffer_assignment: Option<BufferAssignment>,
+        damaged_now: bool,
+        frame_callbacks: Vec<wayland_server::protocol::wl_callback::WlCallback>,
+        role: SurfaceRole,
+        new_current_buffer: Option<wayland_server::protocol::wl_buffer::WlBuffer>,
+    }
+    let snap = smithay_compositor::with_states(surface, |states| {
+        let mut attrs_guard = states.cached_state.get::<SurfaceAttributes>();
+        let attrs = attrs_guard.current();
+        let buffer_assignment = attrs.buffer.take();
+        let damaged_now = !attrs.damage.is_empty();
+        attrs.damage.clear();
+        let frame_callbacks = std::mem::take(&mut attrs.frame_callbacks);
+        drop(attrs_guard);
+
+        let mut ss_guard = states.cached_state.get::<SubsurfaceCachedState>();
+        let ss_loc = ss_guard.current().location;
+        drop(ss_guard);
+
+        let sd_arc = states
+            .data_map
+            .get::<Mutex<compositor::SolSurfaceData>>()
+            .expect("SolSurfaceData missing — did new_surface run?");
+        let mut sd = sd_arc.lock().unwrap();
+        match &buffer_assignment {
+            Some(BufferAssignment::NewBuffer(buf)) => {
+                sd.current_buffer = Some(buf.clone());
+            }
+            Some(BufferAssignment::Removed) => {
+                sd.current_buffer = None;
+            }
+            None => {
+                // No attach this commit (frame-callback ack /
+                // ack_configure). Leave current_buffer untouched.
+            }
+        }
+        sd.subsurface_offset = (ss_loc.x, ss_loc.y);
+        let role = sd.role.clone();
+        let new_current_buffer = sd.current_buffer.clone();
+        Snapshot {
+            buffer_assignment,
+            damaged_now,
+            frame_callbacks,
+            role,
+            new_current_buffer,
+        }
+    });
+
+    let attached_now = matches!(
+        snap.buffer_assignment,
+        Some(BufferAssignment::NewBuffer(_)) | Some(BufferAssignment::Removed)
+    );
+    let pixels_changed = attached_now || snap.damaged_now;
+
+    // Phase 2 — bump shm_cache upload_seq when the client signalled a
+    // real pixel change. The cache is currently cursor-only anyway
+    // (see vk_texture.rs / project memory note on upload-skip), but
+    // keeping the gate correct here means we're ready to re-enable a
+    // broader skip path without compositor-side changes.
+    if pixels_changed {
+        if let Some(buf) = &snap.new_current_buffer {
+            if crate::shm::is_shm_buffer(buf) {
+                let entry = state.shm_cache.entry(buf.id()).or_default();
+                entry.upload_seq.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Phase 3 — layer-shell state promotion. This helper itself calls
+    // into `with_states`, so it must run with no SolSurfaceData lock
+    // held. We already dropped ours when `with_states` returned.
+    if matches!(snap.role, SurfaceRole::LayerSurface { .. }) {
+        crate::layer_shell::promote_layer_state(surface);
+    }
+
+    // Phase 4 — role-specific map/unmap transitions. Read role flags,
+    // mutate them, and decide which side-effects to run, all under
+    // one with_sol_data_mut. The actual side-effects (push to
+    // mapped_*, unmap_toplevel, etc.) need `&mut state` and helpers
+    // that call back into `with_states`, so we collect "what to do"
+    // here and execute below.
+    let has_buffer = snap.new_current_buffer.is_some();
+    let mut just_mapped_toplevel = false;
+    let mut should_unmap_toplevel = false;
+    let mut layer_needs_configure = false;
+    let mut new_window: Option<Window> = None;
+    let mut new_dialog: Option<DialogWindow> = None;
+    let mut popup_unmap: bool = false;
+
+    compositor::with_sol_data_mut(surface, |sd| {
+        match &mut sd.role {
+            SurfaceRole::XdgToplevel { mapped } => {
+                if has_buffer {
+                    if !*mapped {
+                        *mapped = true;
+                        just_mapped_toplevel = true;
+                        // Dialog vs tile fork. A toplevel floats if it
+                        // has a parent OR is fixed-size (min == max).
+                        let dialog_parent = sd
+                            .xdg_toplevel_parent
+                            .as_ref()
+                            .and_then(|w| w.upgrade().ok());
+                        let fixed = is_fixed_size_floater(sd);
+                        if dialog_parent.is_some() || fixed {
+                            tracing::info!(
+                                id = ?surface.id(),
+                                parent = ?dialog_parent.as_ref().map(|s| s.id()),
+                                fixed,
+                                "dialog mapped"
+                            );
+                            new_dialog = Some(DialogWindow {
+                                surface: surface.downgrade(),
+                                parent: dialog_parent
+                                    .as_ref()
+                                    .map(|s| s.downgrade()),
+                                workspace: state.active_ws,
+                                position: None,
+                            });
+                        } else {
+                            tracing::info!(id = ?surface.id(), "toplevel mapped");
+                            new_window = Some(Window {
+                                surface: surface.downgrade(),
+                                rect: Rect::default(),
+                                render_rect: RectF::default(),
+                                velocity: RectF::default(),
+                                render_alpha: 0.0,
+                                vel_alpha: 0.0,
+                                render_scale: 0.7,
+                                vel_scale: 0.0,
+                                border_alpha: 0.0,
+                                vel_border_alpha: 0.0,
+                                swap_active: false,
+                                pending_size: None,
+                                pending_layout: false,
+                                workspace: state.active_ws,
+                            });
+                        }
+                    }
+                } else if *mapped {
+                    *mapped = false;
+                    should_unmap_toplevel = true;
+                }
+            }
+            SurfaceRole::LayerSurface {
+                mapped,
+                initial_configure_sent,
+            } => {
+                if !*initial_configure_sent && !has_buffer {
+                    layer_needs_configure = true;
+                    *initial_configure_sent = true;
+                } else if has_buffer && !*mapped && *initial_configure_sent {
+                    *mapped = true;
+                    tracing::info!(id = ?surface.id(), "layer surface mapped");
+                } else if !has_buffer && *mapped {
+                    *mapped = false;
+                }
+            }
+            SurfaceRole::XdgPopup { mapped, .. } => {
+                if has_buffer && !*mapped {
+                    *mapped = true;
+                    tracing::info!(id = ?surface.id(), "xdg_popup mapped");
+                } else if !has_buffer && *mapped {
+                    *mapped = false;
+                    popup_unmap = true;
+                }
+            }
+            SurfaceRole::None | SurfaceRole::Subsurface => {}
+        }
+    });
+
+    // Phase 5 — run the deferred side-effects. None of these may run
+    // with a SolSurfaceData lock held; helpers like `unmap_toplevel`,
+    // `settle_pending_layout`, `on_toplevel_mapped` re-enter
+    // `with_states` themselves.
+    if let Some(d) = new_dialog {
+        state.mapped_dialogs.push(d);
+    }
+    if let Some(w) = new_window {
+        state.mapped_toplevels.push(w);
+    }
+    if popup_unmap {
+        state
+            .mapped_popups
+            .retain(|w| w.upgrade().ok().as_ref() != Some(surface));
+    }
+    if matches!(snap.role, SurfaceRole::XdgPopup { .. })
+        && has_buffer
+        && !state.mapped_popups.iter().any(|w| {
+            w.upgrade().ok().as_ref() == Some(surface)
+        })
+    {
+        state.mapped_popups.push(surface.downgrade());
+    }
+    if should_unmap_toplevel {
+        unmap_toplevel(state, surface);
+    }
+    if has_buffer && !just_mapped_toplevel {
+        settle_pending_layout(state, surface);
+    }
+    if layer_needs_configure {
+        crate::layer_shell::send_initial_configure(state, surface);
+    }
+    if just_mapped_toplevel {
+        state.on_toplevel_mapped(surface);
+    }
+
+    // Phase 6 — frame callbacks. Defer firing until the next
+    // successful render: firing them here would let clients commit
+    // the next buffer before we've presented the current one, so
+    // they'd just over-render at full CPU speed.
+    state.pending_frame_callbacks.extend(snap.frame_callbacks);
+    state.needs_render = true;
 }
 
 /// Classify a mapped surface as tile vs floating dialog based on its
@@ -1278,12 +1601,10 @@ pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
         .iter()
         .position(|d| d.surface.upgrade().ok().as_ref() == Some(surface));
 
-    let Some(sd_arc) = surface.data::<Arc<Mutex<compositor::SurfaceData>>>() else {
+    let Some((parent_weak, fixed)) = compositor::with_sol_data(surface, |sd| {
+        (sd.xdg_toplevel_parent.clone(), is_fixed_size_floater(sd))
+    }) else {
         return;
-    };
-    let (parent_weak, fixed) = {
-        let sd = sd_arc.lock().unwrap();
-        (sd.xdg_toplevel_parent.clone(), is_fixed_size_floater(&sd))
     };
     let parent_alive = parent_weak.as_ref().and_then(|w| w.upgrade().ok());
     let should_float = parent_alive.is_some() || fixed;
@@ -1368,18 +1689,13 @@ fn weak_eq(a: Option<&Weak<WlSurface>>, b: Option<&Weak<WlSurface>>) -> bool {
 }
 
 fn send_unconstrained_configure(state: &mut State, surface: &WlSurface) {
-    let Some(sd_arc) = surface.data::<Arc<Mutex<compositor::SurfaceData>>>() else {
+    let Some((tl, xs)) = compositor::with_sol_data(surface, |sd| {
+        let tl = sd.xdg_toplevel.as_ref().and_then(|w| w.upgrade().ok())?;
+        let xs = sd.xdg_surface.as_ref().and_then(|w| w.upgrade().ok())?;
+        Some((tl, xs))
+    })
+    .flatten() else {
         return;
-    };
-    let (tl, xs) = {
-        let sd = sd_arc.lock().unwrap();
-        let Some(tl) = sd.xdg_toplevel.as_ref().and_then(|w| w.upgrade().ok()) else {
-            return;
-        };
-        let Some(xs) = sd.xdg_surface.as_ref().and_then(|w| w.upgrade().ok()) else {
-            return;
-        };
-        (tl, xs)
     };
     tl.configure(0, 0, Vec::new());
     let serial = state.next_serial();
@@ -1421,11 +1737,8 @@ pub(crate) fn start_dialog_drag(state: &mut State, surface: &WlSurface) {
 fn dialog_render_origin(state: &State, idx: usize) -> Option<(f32, f32)> {
     let dlg = state.mapped_dialogs.get(idx)?;
     let surface = dlg.surface.upgrade().ok()?;
-    let sd_arc = surface.data::<Arc<Mutex<compositor::SurfaceData>>>()?;
-    let (dw, dh) = {
-        let sd = sd_arc.lock().ok()?;
-        surface_logical_size(&sd)?
-    };
+    let (dw, dh) = compositor::with_sol_data(&surface, |sd| surface_logical_size(sd))
+        .flatten()?;
     let dw_f = dw as f32;
     let dh_f = dh as f32;
 
@@ -1517,18 +1830,13 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
     // apply_layout — no extra work for them.
     if let Some(idx) = removed_idx {
         let win = &state.mapped_toplevels[idx];
-        let buffer = win
-            .surface
-            .upgrade()
-            .ok()
-            .and_then(|s| {
-                s.data::<Arc<Mutex<compositor::SurfaceData>>>().and_then(|arc| {
-                    let sd = arc.lock().ok()?;
-                    let buf = sd.current.buffer.clone()?;
-                    let vsrc = sd.viewport_src;
-                    Some((buf, vsrc))
-                })
-            });
+        let buffer = win.surface.upgrade().ok().and_then(|s| {
+            compositor::with_sol_data(&s, |sd| {
+                let buf = sd.current_buffer.clone()?;
+                Some((buf, sd.viewport_src))
+            })
+            .flatten()
+        });
         if let Some((buffer, vsrc)) = buffer {
             state.closing_windows.push(ClosingWindow {
                 buffer,
@@ -2001,22 +2309,15 @@ fn send_pending_configures(state: &mut State) {
         }
     }
     for (i, w, h) in todo {
-        let (tl, xs) = {
-            let win = &state.mapped_toplevels[i];
-            let Ok(surface) = win.surface.upgrade() else { continue };
-            let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
-                continue;
-            };
-            let sd = sd_arc.lock().unwrap();
-            let (Some(tl_weak), Some(xs_weak)) =
-                (sd.xdg_toplevel.as_ref(), sd.xdg_surface.as_ref())
-            else {
-                continue;
-            };
-            let (Ok(tl), Ok(xs)) = (tl_weak.upgrade(), xs_weak.upgrade()) else {
-                continue;
-            };
-            (tl, xs)
+        let win = &state.mapped_toplevels[i];
+        let Ok(surface) = win.surface.upgrade() else { continue };
+        let Some((tl, xs)) = compositor::with_sol_data(&surface, |sd| {
+            let tl = sd.xdg_toplevel.as_ref()?.upgrade().ok()?;
+            let xs = sd.xdg_surface.as_ref()?.upgrade().ok()?;
+            Some((tl, xs))
+        })
+        .flatten() else {
+            continue;
         };
         let serial = state.next_serial();
         tl.configure(w, h, state_bytes.clone());
@@ -2201,19 +2502,14 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
         for i in indices {
             let win = &state.mapped_toplevels[i];
             let Ok(surface) = win.surface.upgrade() else { continue };
-            let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else {
-                continue;
-            };
-            let (buf_opt, vsrc, vdst) = {
-                let sd = sd_arc.lock().unwrap();
+            let Some((buf_opt, vsrc, vdst)) = compositor::with_sol_data(&surface, |sd| {
                 if !matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true }) {
-                    continue;
+                    return None;
                 }
-                (
-                    sd.current.buffer.clone(),
-                    sd.viewport_src,
-                    sd.viewport_dst,
-                )
+                Some((sd.current_buffer.clone(), sd.viewport_src, sd.viewport_dst))
+            })
+            .flatten() else {
+                continue;
             };
             let _ = vdst;
             // Active = the surface owning keyboard focus. Active windows
@@ -2344,11 +2640,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             .iter()
             .find(|w| w.surface.upgrade().ok().as_ref() == Some(fs))
         {
-            if let Some(sd_arc) = fs.data::<Arc<Mutex<SurfaceData>>>() {
-                let (buf, vsrc) = {
-                    let sd = sd_arc.lock().unwrap();
-                    (sd.current.buffer.clone(), sd.viewport_src)
-                };
+            if let Some((buf, vsrc)) = compositor::with_sol_data(fs, |sd| {
+                (sd.current_buffer.clone(), sd.viewport_src)
+            }) {
                 // Honor open animation in fullscreen too — popping
                 // up scaled and fading in still reads natural even
                 // at full size.
@@ -2386,15 +2680,13 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
         }
         let Ok(surface) = dlg.surface.upgrade() else { continue };
         let Some((dx, dy)) = dialog_render_origin(state, idx) else { continue };
-        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (buf, vsrc, logical) = {
-            let sd = sd_arc.lock().unwrap();
+        let Some((buf, vsrc, logical)) = compositor::with_sol_data(&surface, |sd| {
             (
-                sd.current.buffer.clone(),
+                sd.current_buffer.clone(),
                 sd.viewport_src,
-                surface_logical_size(&sd),
+                surface_logical_size(sd),
             )
-        };
+        }) else { continue };
         let Some((dw, dh)) = logical else { continue };
         let dw_f = dw as f32;
         let dh_f = dh as f32;
@@ -2426,16 +2718,15 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
     // expects.
     for popup in &state.mapped_popups {
         let Ok(surface) = popup.upgrade() else { continue };
-        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (offset, buf, vsrc, geom, buf_dims) = {
-            let sd = sd_arc.lock().unwrap();
+        let Some((offset, buf, vsrc, geom, buf_dims)) = compositor::with_sol_data(&surface, |sd| {
             let SurfaceRole::XdgPopup { mapped: true, offset, .. } = sd.role else {
-                continue;
+                return None;
             };
-            let buf = sd.current.buffer.clone();
+            let buf = sd.current_buffer.clone();
             let buf_dims = buf.as_ref().and_then(surface_buffer_dims);
-            (offset, buf, sd.viewport_src, sd.xdg_window_geometry, buf_dims)
-        };
+            Some((offset, buf, sd.viewport_src, sd.xdg_window_geometry, buf_dims))
+        })
+        .flatten() else { continue };
         let Some((origin_x, origin_y)) = popup_screen_origin(state, &surface) else {
             continue;
         };
@@ -2496,13 +2787,11 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             .as_ref()
             .and_then(|w| w.upgrade().ok())
         {
-            if let Some(sd_arc) = cur.data::<Arc<Mutex<SurfaceData>>>() {
-                let (buf, vsrc, dims) = {
-                    let sd = sd_arc.lock().unwrap();
-                    let buf = sd.current.buffer.clone();
-                    let dims = buf.as_ref().and_then(surface_buffer_dims);
-                    (buf, sd.viewport_src, dims)
-                };
+            if let Some((buf, vsrc, dims)) = compositor::with_sol_data(&cur, |sd| {
+                let buf = sd.current_buffer.clone();
+                let dims = buf.as_ref().and_then(surface_buffer_dims);
+                (buf, sd.viewport_src, dims)
+            }) {
                 if let (Some(buf), Some((w, h))) = (buf, dims) {
                     let cx = state.cursor.pos_x as f32
                         - state.cursor.client_hot_x as f32;
@@ -2529,10 +2818,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
 }
 
 fn surface_viewport_src(s: &WlSurface) -> Option<(f64, f64, f64, f64)> {
-    s.data::<Arc<Mutex<SurfaceData>>>()?
-        .lock()
-        .ok()?
-        .viewport_src
+    compositor::with_sol_data(s, |sd| sd.viewport_src).flatten()
 }
 
 /// Walk a surface's subsurface_children recursively, pushing each mapped
@@ -2548,34 +2834,33 @@ fn emit_subsurface_tree(
     parent_y: f32,
     alpha: f32,
 ) {
-    let Some(sd_arc) = parent.data::<Arc<Mutex<SurfaceData>>>() else {
-        return;
-    };
-    // Snapshot the child list so we don't hold the parent's lock while
-    // we recurse into child locks (avoids any risk of the same surface
-    // being double-locked if the topology is ever cyclic).
-    let children: Vec<WlSurface> = {
-        let sd = sd_arc.lock().unwrap();
+    // Snapshot the child list so we don't re-enter `with_states` for
+    // the parent while recursing into children — smithay's surface
+    // mutex is per-surface, but locking the parent and a child
+    // simultaneously across nested `with_states` calls is fragile.
+    let Some(children) = compositor::with_sol_data(parent, |sd| {
         sd.subsurface_children
             .iter()
             .filter_map(|w| w.upgrade().ok())
-            .collect()
+            .collect::<Vec<WlSurface>>()
+    }) else {
+        return;
     };
     for child in children {
-        let Some(child_sd_arc) = child.data::<Arc<Mutex<SurfaceData>>>() else {
+        let Some((buf_opt, child_x, child_y, vsrc, logical)) =
+            compositor::with_sol_data(&child, |sd| {
+                let (ox, oy) = sd.subsurface_offset;
+                let buf = sd.current_buffer.clone();
+                (
+                    buf,
+                    parent_x + ox as f32,
+                    parent_y + oy as f32,
+                    sd.viewport_src,
+                    surface_logical_size(sd),
+                )
+            })
+        else {
             continue;
-        };
-        let (buf_opt, child_x, child_y, vsrc, logical) = {
-            let sd = child_sd_arc.lock().unwrap();
-            let (ox, oy) = sd.subsurface_offset;
-            let buf = sd.current.buffer.clone();
-            (
-                buf,
-                parent_x + ox as f32,
-                parent_y + oy as f32,
-                sd.viewport_src,
-                surface_logical_size(&sd),
-            )
         };
         if let Some(buf) = buf_opt {
             // Output rect uses the surface's *logical* size, not the
@@ -3169,10 +3454,11 @@ fn has_active_animation(state: &State) -> bool {
 /// the end. Returns `None` if the chain leads to a non-mapped root
 /// or terminates without one.
 fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
-    let sd_arc = popup.data::<Arc<Mutex<SurfaceData>>>()?;
-    let parent = sd_arc.lock().ok()?.xdg_popup_parent.clone()?.upgrade().ok()?;
-    let parent_sd = parent.data::<Arc<Mutex<SurfaceData>>>()?;
-    let role = parent_sd.lock().ok()?.role.clone();
+    let parent = compositor::with_sol_data(popup, |sd| sd.xdg_popup_parent.clone())
+        .flatten()?
+        .upgrade()
+        .ok()?;
+    let role = compositor::with_sol_data(&parent, |sd| sd.role.clone())?;
     match role {
         SurfaceRole::XdgToplevel { mapped: true } => state
             .mapped_toplevels
@@ -3210,9 +3496,7 @@ fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
 pub(crate) fn settle_pending_layout(state: &mut State, surface: &WlSurface) {
     // Pull logical size out of the surface's SurfaceData while we
     // already have a Mutex guard available; cheap and read-only.
-    let logical = surface
-        .data::<Arc<Mutex<compositor::SurfaceData>>>()
-        .and_then(|arc| arc.lock().ok().and_then(|sd| surface_logical_size(&sd)));
+    let logical = compositor::with_sol_data(surface, |sd| surface_logical_size(sd)).flatten();
 
     let mut kicked = false;
     for win in state.mapped_toplevels.iter_mut() {
@@ -3247,14 +3531,14 @@ pub(crate) fn settle_pending_layout(state: &mut State, surface: &WlSurface) {
     }
 }
 
-fn surface_logical_size(sd: &compositor::SurfaceData) -> Option<(i32, i32)> {
+fn surface_logical_size(sd: &compositor::SolSurfaceData) -> Option<(i32, i32)> {
     if let Some((w, h)) = sd.viewport_dst {
         return Some((w, h));
     }
     if let Some((_, _, w, h)) = sd.viewport_src {
         return Some((w as i32, h as i32));
     }
-    let buf = sd.current.buffer.as_ref()?;
+    let buf = sd.current_buffer.as_ref()?;
     surface_buffer_dims(buf)
 }
 
@@ -3489,13 +3773,10 @@ fn master_swap_partner_index(state: &State, focus_idx: usize, ws: u32) -> Option
 /// we don't escalate to SIGTERM; that's a different action.
 fn close_focused_window(state: &mut State) {
     let Some(focus) = state.keyboard_focus.as_ref() else { return };
-    let Some(sd_arc) = focus.data::<Arc<Mutex<SurfaceData>>>() else { return };
-    let tl = sd_arc
-        .lock()
-        .unwrap()
-        .xdg_toplevel
-        .as_ref()
-        .and_then(|w| w.upgrade().ok());
+    let tl = compositor::with_sol_data(focus, |sd| {
+        sd.xdg_toplevel.as_ref().and_then(|w| w.upgrade().ok())
+    })
+    .flatten();
     let Some(tl) = tl else {
         // Not a mapped xdg_toplevel — layer surface, popup, etc.
         // Those don't have a close request in the same sense.
@@ -4255,8 +4536,14 @@ fn setup_event_loop(
     let idle_inhibit_manager_state = IdleInhibitManagerState::new::<State>(&dh);
     let idle_inhibit_global = idle_inhibit_manager_state.global();
 
+    // Smithay owns the wl_compositor (v6) + wl_subcompositor globals.
+    // The constructor creates both; the IDs drop into Globals below.
+    let compositor_state = CompositorState::new_v6::<State>(&dh);
+    let compositor_global = compositor_state.compositor_global();
+    let subcompositor_global = compositor_state.subcompositor_global();
+
     let globals = Globals {
-        compositor: dh.create_global::<State, WlCompositor, ()>(COMPOSITOR_VERSION, ()),
+        compositor: compositor_global,
         shm: shm_global,
         output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
         seat: dh.create_global::<State, WlSeat, ()>(SEAT_VERSION, ()),
@@ -4273,10 +4560,7 @@ fn setup_event_loop(
             layer_shell::LAYER_SHELL_VERSION,
             (),
         ),
-        subcompositor: dh.create_global::<State, WlSubcompositor, ()>(
-            subcompositor::SUBCOMPOSITOR_VERSION,
-            (),
-        ),
+        subcompositor: subcompositor_global,
         data_device_manager: dh.create_global::<State, WlDataDeviceManager, ()>(
             data_device::DATA_DEVICE_MANAGER_VERSION,
             (),
@@ -4334,7 +4618,7 @@ fn setup_event_loop(
                     match comp
                         .state
                         .display_handle
-                        .insert_client(stream, Arc::new(ClientState))
+                        .insert_client(stream, Arc::new(ClientState::default()))
                     {
                         Ok(_) => {
                             comp.state.clients_seen += 1;
@@ -4621,6 +4905,7 @@ fn setup_event_loop(
         exec_once_pgids: Vec::new(),
         pending_texture_evictions: Vec::new(),
         shm_state,
+        compositor_state,
         shm_cache: std::collections::HashMap::new(),
         idle_inhibit_manager_state,
         pending_layer_surfaces: Vec::new(),
@@ -5223,16 +5508,15 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
     // the shadow_top of however much the client padded.
     for popup in state.mapped_popups.iter().rev() {
         let Ok(surface) = popup.upgrade() else { continue };
-        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let (offset, size, geom) = match sd_arc.lock().ok() {
-            Some(sd) => match sd.role.clone() {
+        let Some((offset, size, geom)) = compositor::with_sol_data(&surface, |sd| {
+            match sd.role.clone() {
                 SurfaceRole::XdgPopup { mapped: true, offset, size } => {
-                    (offset, size, sd.xdg_window_geometry)
+                    Some((offset, size, sd.xdg_window_geometry))
                 }
-                _ => continue,
-            },
-            None => continue,
-        };
+                _ => None,
+            }
+        })
+        .flatten() else { continue };
         let Some((ox, oy)) = popup_screen_origin(state, &surface) else { continue };
         let popup_rect = Rect {
             x: (ox + offset.0 as f32).round() as i32,
@@ -5268,8 +5552,8 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
         }
         let Ok(surface) = dlg.surface.upgrade() else { continue };
         let Some((dx, dy)) = dialog_render_origin(state, idx) else { continue };
-        let Some(sd_arc) = surface.data::<Arc<Mutex<SurfaceData>>>() else { continue };
-        let Some((dw, dh)) = sd_arc.lock().ok().and_then(|sd| surface_logical_size(&sd))
+        let Some((dw, dh)) = compositor::with_sol_data(&surface, |sd| surface_logical_size(sd))
+            .flatten()
         else {
             continue;
         };
@@ -5332,14 +5616,11 @@ fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
             // don't catch clicks they can't visually receive.
             continue;
         }
-        let sd_arc = match surface.data::<Arc<Mutex<SurfaceData>>>() {
-            Some(s) => s,
-            None => continue,
-        };
-        if !matches!(
-            sd_arc.lock().unwrap().role,
-            SurfaceRole::XdgToplevel { mapped: true }
-        ) {
+        let mapped = compositor::with_sol_data(&surface, |sd| {
+            matches!(sd.role, SurfaceRole::XdgToplevel { mapped: true })
+        })
+        .unwrap_or(false);
+        if !mapped {
             continue;
         }
         // Hit test against what the user can actually see (render_rect)
@@ -5379,31 +5660,26 @@ fn hit_subsurfaces(
     // (child surface, parent-relative offset, buffer dims).
     type Child = (WlSurface, (i32, i32), (i32, i32));
 
-    let sd_arc = parent.data::<Arc<Mutex<SurfaceData>>>()?;
-    // Snapshot children while holding the parent lock only briefly;
-    // recurse outside so child locks don't nest.
-    let children: Vec<Child> = {
-        let sd = sd_arc.lock().ok()?;
-        sd.subsurface_children
-            .iter()
-            .filter_map(|w| {
-                let s = w.upgrade().ok()?;
-                // Lock the child's SurfaceData, read out everything we
-                // need, then drop the guard before moving `s` into
-                // the tuple — otherwise the borrow checker sees the
-                // guard still holding a reference to `s` via its arc.
-                let (offset, dims) = {
-                    let csd_arc = s.data::<Arc<Mutex<SurfaceData>>>()?;
-                    let csd = csd_arc.lock().ok()?;
-                    let offset = csd.subsurface_offset;
-                    let buf = csd.current.buffer.as_ref()?;
-                    let dims = surface_buffer_dims(buf)?;
-                    (offset, dims)
-                };
-                Some((s, offset, dims))
+    // Snapshot children with their offsets + buffer dims. Each
+    // `with_sol_data` call locks the per-surface mutex briefly; we
+    // never nest a child lookup inside the parent's, so smithay's
+    // tree mutex never sees re-entry.
+    let child_weaks: Vec<Weak<WlSurface>> = compositor::with_sol_data(parent, |sd| {
+        sd.subsurface_children.clone()
+    })?;
+    let children: Vec<Child> = child_weaks
+        .into_iter()
+        .filter_map(|w| {
+            let s = w.upgrade().ok()?;
+            let (offset, dims) = compositor::with_sol_data(&s, |csd| {
+                let buf = csd.current_buffer.as_ref()?;
+                let dims = surface_buffer_dims(buf)?;
+                Some((csd.subsurface_offset, dims))
             })
-            .collect()
-    };
+            .flatten()?;
+            Some((s, offset, dims))
+        })
+        .collect();
     // Topmost first: collect_scene draws in registration order, so
     // last-registered is on top, so we iterate in reverse.
     for (child, (ox, oy), (cw, ch)) in children.into_iter().rev() {
@@ -5613,10 +5889,13 @@ fn pointer_focus_in_popup_chain(state: &State) -> bool {
 }
 
 fn surface_in_subtree(root: &WlSurface, target: &WlSurface) -> bool {
-    let Some(sd_arc) = root.data::<Arc<Mutex<SurfaceData>>>() else { return false };
-    let children: Vec<WlSurface> = match sd_arc.lock() {
-        Ok(sd) => sd.subsurface_children.iter().filter_map(|w| w.upgrade().ok()).collect(),
-        Err(_) => return false,
+    let Some(children) = compositor::with_sol_data(root, |sd| {
+        sd.subsurface_children
+            .iter()
+            .filter_map(|w| w.upgrade().ok())
+            .collect::<Vec<WlSurface>>()
+    }) else {
+        return false;
     };
     for child in children {
         if &child == target {
@@ -5642,10 +5921,7 @@ fn dismiss_popup_grab(state: &mut State) {
         .filter_map(|w| w.upgrade().ok())
         .collect();
     for surface in popups {
-        let popup = match surface.data::<Arc<Mutex<SurfaceData>>>() {
-            Some(arc) => arc.lock().ok().and_then(|sd| sd.xdg_popup.clone()),
-            None => None,
-        };
+        let popup = compositor::with_sol_data(&surface, |sd| sd.xdg_popup.clone()).flatten();
         if let Some(weak) = popup {
             if let Ok(p) = weak.upgrade() {
                 p.popup_done();
