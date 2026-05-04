@@ -21,40 +21,6 @@ pub enum PixelFormat {
     Xrgb8888,
 }
 
-/// Pixel snapshot captured at `wl_surface.commit` time. The Wayland-side
-/// commit dispatch memcpys out of the client's mmap into `pixels`,
-/// queues this struct on `State::pending_shm_snapshots`, and the
-/// post-dispatch hook hands it to the renderer's texture cache where
-/// it's copied into a Vulkan staging buffer.
-///
-/// The point of capturing here rather than at render time is that
-/// some clients (Chrome's repaint path is the long-running offender)
-/// modify the buffer's pixels *after* committing, in violation of the
-/// wl_surface.commit "owned by compositor until release" contract. A
-/// memcpy at render time can race with those post-commit writes and
-/// produce torn pixels — visible as UI flicker, video stutter, and
-/// the "lower edge flashing" we've been chasing.
-///
-/// Lives in `sol-core` rather than `sol-wayland` so the renderer crate
-/// can name it without pulling in a dependency cycle.
-#[derive(Debug)]
-pub struct ShmSnapshot {
-    pub cache_key: u64,
-    pub width: i32,
-    pub height: i32,
-    pub stride: i32,
-    pub format: PixelFormat,
-    pub pixels: Vec<u8>,
-    /// Value of `BufferData::upload_seq` *at the time the snapshot was
-    /// taken*. The texture cache stores this as `entry.uploaded_seq`
-    /// so the render-time skip check (`entry.uploaded_seq ==
-    /// elem.upload_seq`) lines up perfectly. Without it, the cache's
-    /// recorded seq could drift if a snapshot ever fails to apply,
-    /// which would then make every subsequent render fall through to
-    /// the legacy live-mmap memcpy fallback — exactly the race the
-    /// snapshot was meant to close.
-    pub upload_seq: u64,
-}
 
 /// Where a scene element's pixel data actually lives. SHM buffers are
 /// CPU-mapped and the server blits/uploads from the borrowed slice. Dmabuf
@@ -67,26 +33,14 @@ pub enum SceneContent<'a> {
         stride: i32,
         format: PixelFormat,
         /// Monotonic counter bumped each time the source buffer is
-        /// re-committed. Backends compare it against the version they
-        /// last uploaded for `buffer_key`; if equal, the existing GPU
-        /// texture is current and the per-frame `glTexSubImage2D` can
-        /// be skipped. Was the dominant idle cost at 240Hz — cursor /
-        /// waybar / static layer surfaces were re-uploading every
-        /// vblank because the renderer had no way to tell their
-        /// pixels hadn't changed.
+        /// re-committed (gated on attach-or-damage so bare commits
+        /// don't invalidate). Currently only consulted for the
+        /// cursor-sentinel skip path — see the project-memory note
+        /// on upload-skip for why every other SHM surface
+        /// re-uploads from `pixels` on every render. The field
+        /// stays plumbed because re-enabling a broader skip is one
+        /// of the open future-work items.
         upload_seq: u64,
-        /// Whether the renderer can trust the "same `upload_seq` ⇒
-        /// same pixels" invariant for this surface. Set true for
-        /// layer-shell surfaces (wallpaper, waybar, dock, lockscreen)
-        /// and the compositor's cursor sentinel — those don't
-        /// modify SHM bytes between commits in any of the patterns
-        /// we've seen. Set false for `xdg_toplevel` and friends:
-        /// at least Chrome's repaint path appears to violate that
-        /// invariant, manifesting as UI flicker / video stutter
-        /// when we skip uploads on it. False is the safe default;
-        /// the perf cost is one full SHM re-upload per frame for
-        /// the affected surface.
-        trust_seq: bool,
     },
     Dmabuf {
         /// Raw dmabuf fd. Borrowed from the wl_buffer's user-data for one

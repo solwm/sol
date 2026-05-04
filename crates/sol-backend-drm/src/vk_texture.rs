@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
-use sol_core::{CURSOR_SCENE_KEY, RenderTiming, SceneContent, SceneElement, ShmSnapshot};
+use sol_core::{CURSOR_SCENE_KEY, RenderTiming, SceneContent, SceneElement};
 use std::collections::HashMap;
 use std::os::fd::{IntoRawFd, OwnedFd};
 
@@ -84,31 +84,6 @@ pub struct TextureCache {
     set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
     pending: Vec<PendingUpload>,
-    /// Controls whether the SHM upload-skip optimization fires. See
-    /// `TrustMode` for the three states; default `PerElement` honours
-    /// `SceneContent::Shm::trust_seq`.
-    trust_upload_seq: TrustMode,
-}
-
-/// Three-way knob for the SHM upload-skip optimisation. Default is
-/// `PerElement`, which trusts the `trust_seq` flag the Wayland side
-/// sets per-surface. The two override modes are debug aids — set the
-/// `SOL_TRUST_UPLOAD_SEQ` env var to `0` (Off) or `1` (Always) to
-/// force-disable / force-enable, respectively.
-#[derive(Clone, Copy, Debug)]
-enum TrustMode {
-    /// Skip only for the compositor cursor sentinel; everything else
-    /// re-uploads on every render. Conservative; loses the wallpaper
-    /// fast-path. Triggered by `SOL_TRUST_UPLOAD_SEQ=0`.
-    Off,
-    /// Trust `upload_seq` for every SHM surface regardless of role.
-    /// Maximum perf but exposes Chrome-style cache-invalidation bugs.
-    /// Triggered by `SOL_TRUST_UPLOAD_SEQ=1`.
-    Always,
-    /// Honour the per-element `trust_seq` flag from `SceneContent::Shm`
-    /// (true for layer-shell + cursor; false for xdg_toplevel and
-    /// friends). Default; the right balance for typical desktops.
-    PerElement,
 }
 
 impl TextureCache {
@@ -136,25 +111,6 @@ impl TextureCache {
                 .create_descriptor_pool(&pool_info, None)
                 .context("create_descriptor_pool (texture cache)")?
         };
-        // Default `PerElement`: trust the Wayland side's role hint.
-        // Layer-shell surfaces and cursor get the skip; xdg_toplevel
-        // and its descendants always re-upload (Chrome's repaint
-        // pattern violates the "same upload_seq ⇒ same pixels"
-        // invariant). Override via `SOL_TRUST_UPLOAD_SEQ=0` (off) or
-        // `SOL_TRUST_UPLOAD_SEQ=1` (always on, for benchmarking the
-        // upper bound on a Chrome-free workload).
-        let trust_upload_seq = match std::env::var("SOL_TRUST_UPLOAD_SEQ")
-            .ok()
-            .as_deref()
-        {
-            Some("0") => TrustMode::Off,
-            Some("1") => TrustMode::Always,
-            _ => TrustMode::PerElement,
-        };
-        tracing::info!(
-            mode = ?trust_upload_seq,
-            "SHM upload-skip mode (SOL_TRUST_UPLOAD_SEQ=0/1 to override)"
-        );
         Ok(Self {
             stack,
             entries: HashMap::new(),
@@ -162,7 +118,6 @@ impl TextureCache {
             set_layout,
             sampler,
             pending: Vec::new(),
-            trust_upload_seq,
         })
     }
 
@@ -267,47 +222,31 @@ impl TextureCache {
             stride,
             format: _,
             upload_seq,
-            trust_seq,
         } = &elem.content
         else {
             unreachable!();
         };
         let upload_seq = *upload_seq;
         let stride = *stride;
-        let trust_seq = *trust_seq;
 
-        // Upload-skip decision tree:
-        //
-        // 1. The compositor cursor sentinel always gets the skip —
-        //    it's allocated once at startup and provably immutable.
-        // 2. Per-element `trust_seq` is set true at SceneElement
-        //    construction for layer-shell surfaces (wallpaper /
-        //    waybar / overlay) and the client cursor; false for
-        //    xdg_toplevel and friends. This is the seam that lets
-        //    static-pixel surfaces enjoy the skip while keeping
-        //    the Chrome-style repaint path safe.
-        // 3. The env var `SOL_TRUST_UPLOAD_SEQ` overrides:
-        //    - `=1` forces the skip on regardless of `trust_seq` (debug knob,
-        //       useful when measuring the upper bound of the optimization).
-        //    - `=0` forces it off except for the cursor sentinel
-        //       (debug knob, useful when chasing a regression here).
-        //    - unset (default) honours the per-element flag.
-        //
-        // The `upload_seq != 0` guard avoids skipping on the very first
-        // frame for a freshly-attached buffer: an entry can exist with
-        // `uploaded_seq = 0` after creation but before any copy was
-        // recorded.
-        let allow_skip = match self.trust_upload_seq {
-            TrustMode::Off => elem.buffer_key == CURSOR_SCENE_KEY,
-            TrustMode::Always => true,
-            TrustMode::PerElement => trust_seq || elem.buffer_key == CURSOR_SCENE_KEY,
-        };
-        if allow_skip {
+        // Cursor-only upload-skip. The compositor cursor sentinel is
+        // allocated once at startup and never mutated, so reusing the
+        // cached GPU texture is provably safe. Every other SHM
+        // surface re-uploads on every render — the skip
+        // optimisations (universal seq-skip, per-role gate, and
+        // Hyprland-style commit-time snapshot) all produced visible
+        // glitches on this NVIDIA setup; see the project memory note
+        // for the full investigation. Cost is roughly ~32 MB / frame
+        // of wallpaper-class re-upload at 4K, which puts the
+        // compositor at 120-180 fps under shadertoy + Chrome load
+        // instead of 240. Future work direction (per-surface damage
+        // tracking + sub-rect uploads, dmabuf explicit-sync, …)
+        // lives in the same memory note.
+        if elem.buffer_key == CURSOR_SCENE_KEY {
             if let Some(e) = self.entries.get(&elem.buffer_key) {
                 if !e.is_dmabuf
                     && e.width == elem.width
                     && e.height == elem.height
-                    && upload_seq != 0
                     && e.uploaded_seq == upload_seq
                 {
                     return Ok(());
@@ -534,100 +473,6 @@ impl TextureCache {
 
     pub fn get(&self, key: u64) -> Option<&TextureEntry> {
         self.entries.get(&key)
-    }
-
-    /// Hyprland-pattern commit-time snapshot. Called after the
-    /// Wayland dispatch finishes (so we have a clean window with no
-    /// `&mut State` borrow tying our hands), once per snapshot the
-    /// commit handler queued. Allocates / resizes the entry as
-    /// needed, copies the snapshot pixels into the staging buffer,
-    /// and queues a `PendingUpload` so the next `record_uploads`
-    /// emits the `vkCmdCopyBufferToImage`. Dedups against existing
-    /// queued uploads for the same key — multiple commits between
-    /// renders just keep updating the staging contents.
-    pub fn apply_shm_snapshot(&mut self, snap: ShmSnapshot) -> Result<()> {
-        let needs_new = self
-            .entries
-            .get(&snap.cache_key)
-            .map(|e| e.is_dmabuf || e.width != snap.width || e.height != snap.height)
-            .unwrap_or(true);
-        if needs_new {
-            self.evict(snap.cache_key);
-            let entry_data =
-                create_shm_image(&self.stack, snap.width as u32, snap.height as u32)?;
-            let descriptor = self.allocate_descriptor(entry_data.view)?;
-            self.entries.insert(
-                snap.cache_key,
-                TextureEntry {
-                    image: entry_data.image,
-                    view: entry_data.view,
-                    memory: entry_data.memory,
-                    descriptor,
-                    width: snap.width,
-                    height: snap.height,
-                    uploaded_seq: 0,
-                    is_dmabuf: false,
-                    staging: Some(entry_data.staging),
-                },
-            );
-        }
-        let entry = self
-            .entries
-            .get_mut(&snap.cache_key)
-            .expect("inserted just above");
-        let staging = entry
-            .staging
-            .as_ref()
-            .expect("SHM entry must have staging");
-        let tight_row = (snap.width as usize) * 4;
-        let h = snap.height as usize;
-        let total = tight_row * h;
-        if snap.pixels.len() < (snap.stride as usize) * h {
-            bail!(
-                "snapshot pixels {} < stride*height = {}",
-                snap.pixels.len(),
-                (snap.stride as usize) * h
-            );
-        }
-        if (staging.size as usize) < total {
-            bail!(
-                "staging {} bytes < tight_row*height = {}",
-                staging.size,
-                total
-            );
-        }
-        unsafe {
-            for row in 0..h {
-                let src = snap.pixels.as_ptr().add(row * (snap.stride as usize));
-                let dst = staging.mapped.add(row * tight_row);
-                std::ptr::copy_nonoverlapping(src, dst, tight_row);
-            }
-        }
-        let from_layout = if entry.uploaded_seq == 0 {
-            vk::ImageLayout::UNDEFINED
-        } else {
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-        };
-        // Match the bumped value the wayland-side captured into the
-        // snapshot so render-time `prepare_shm` sees seq parity and
-        // skips its fallback memcpy. Tracking the snapshot's seq
-        // directly (rather than incrementing locally) means the
-        // values stay in lock-step even if a snapshot ever fails to
-        // apply — the next successful one will resync.
-        entry.uploaded_seq = snap.upload_seq;
-        // Dedup: only one PendingUpload per key per command buffer.
-        // If a second commit lands before the next render we just
-        // updated the staging contents above; one cmd_copy is
-        // enough to land the latest.
-        if !self.pending.iter().any(|u| u.key == snap.cache_key) {
-            self.pending.push(PendingUpload {
-                key: snap.cache_key,
-                width: snap.width as u32,
-                height: snap.height as u32,
-                from_layout,
-            });
-        }
-        Ok(())
     }
 }
 

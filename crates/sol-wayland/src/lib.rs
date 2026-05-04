@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use sol_backend_drm::DrmPresenter;
 use std::os::fd::AsRawFd;
-use sol_core::{RenderTiming, Scene, SceneContent, SceneElement, ShmSnapshot};
+use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
@@ -436,17 +436,6 @@ pub struct State {
     /// handlers when a client tears down a buffer; drained (and acted
     /// on) inside `render_tick` which has `&mut` access to the backend.
     pub pending_texture_evictions: Vec<u64>,
-    /// SHM-buffer pixel snapshots captured during dispatch handlers,
-    /// drained by the post-dispatch hook into the texture cache.
-    /// Hyprland-style "snapshot at commit" decouples our GPU upload
-    /// from whatever the client does to the mmap after commit —
-    /// without it, a Chrome-class client that violates the
-    /// "don't write to a committed buffer" invariant produces torn
-    /// pixels at render time. The Vec carries the pixel bytes by
-    /// value (memcpy out of mmap inside the commit handler) so the
-    /// drain step is a pure CPU→Vulkan transfer with no exposure
-    /// to live-client memory.
-    pub pending_shm_snapshots: Vec<ShmSnapshot>,
     /// Weak refs to every `wl_surface` with a `zwlr_layer_surface_v1`
     /// role. Dead weaks are pruned on render tick; the role's mapped
     /// flag on `SurfaceData` determines whether we currently draw it.
@@ -2033,16 +2022,6 @@ enum Placed {
         /// to the parent's rounded shape would require a stencil
         /// pass we don't have yet.
         corner_radius: f32,
-        /// Per-role gate for the SHM upload-skip optimization.
-        /// `true` for layer-shell (wallpaper / waybar / lockscreen
-        /// surfaces) where commits are infrequent and pixels are
-        /// stable between them — the renderer can rely on a
-        /// matching `upload_seq` to skip the per-frame re-upload.
-        /// `false` for xdg_toplevel and its descendants because at
-        /// least Chrome's repaint path violates the invariant, and
-        /// trusting it manifests as UI flicker / video stutter.
-        /// Subsurfaces inherit from their root role.
-        trust_seq: bool,
     },
     Backdrop {
         rect: RectF,
@@ -2078,9 +2057,8 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                trust_seq: true,
             });
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0, true);
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
     // Mark the boundary: everything pushed so far (bg + bottom layers
@@ -2209,7 +2187,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                     vsrc,
                     alpha: win_alpha,
                     corner_radius,
-                    trust_seq: false,
                 });
             }
             emit_subsurface_tree(
@@ -2218,7 +2195,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 scaled.x,
                 scaled.y,
                 win_alpha,
-                false,
             );
         }
     };
@@ -2251,9 +2227,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
             vsrc: cw.vsrc,
             alpha: cw.render_alpha,
             corner_radius,
-            // Closing tiles are frozen-buffer copies of toplevels —
-            // same Chrome-glitch risk as live toplevels.
-            trust_seq: false,
         });
     }
 
@@ -2279,9 +2252,8 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                trust_seq: true,
             });
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0, true);
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
 
@@ -2313,7 +2285,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: win.render_alpha,
                         corner_radius: 0.0,
-                        trust_seq: false,
                     });
                 }
                 emit_subsurface_tree(
@@ -2322,7 +2293,6 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                     scaled.x,
                     scaled.y,
                     win.render_alpha,
-                    false,
                 );
             }
         }
@@ -2360,10 +2330,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius,
-                trust_seq: false,
             });
         }
-        emit_subsurface_tree(&mut out, &surface, dx, dy, 1.0, false);
+        emit_subsurface_tree(&mut out, &surface, dx, dy, 1.0);
     }
 
     // 5. Mapped xdg_popups. Stacked above tiled toplevels, Top
@@ -2418,10 +2387,9 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                trust_seq: false,
             });
         }
-        emit_subsurface_tree(&mut out, &surface, buffer_x, buffer_y, 1.0, false);
+        emit_subsurface_tree(&mut out, &surface, buffer_x, buffer_y, 1.0);
     }
 
     // 6. Overlay layer surfaces — always on top, even of fullscreen.
@@ -2435,9 +2403,8 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 vsrc,
                 alpha: 1.0,
                 corner_radius: 0.0,
-                trust_seq: true,
             });
-            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0, true);
+            emit_subsurface_tree(&mut out, &ml.surface, r.x, r.y, 1.0);
         }
     }
 
@@ -2477,14 +2444,8 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                         vsrc,
                         alpha: 1.0,
                         corner_radius: 0.0,
-                        // Client cursors are typically static
-                        // sprites swapped in for hover states; pixel
-                        // changes always come with a real commit.
-                        // Treat the same as compositor cursor for
-                        // skip purposes.
-                        trust_seq: true,
                     });
-                    emit_subsurface_tree(&mut out, &cur, cx, cy, 1.0, true);
+                    emit_subsurface_tree(&mut out, &cur, cx, cy, 1.0);
                 }
             }
         }
@@ -2511,7 +2472,6 @@ fn emit_subsurface_tree(
     parent_x: f32,
     parent_y: f32,
     alpha: f32,
-    trust_seq: bool,
 ) {
     let Some(sd_arc) = parent.data::<Arc<Mutex<SurfaceData>>>() else {
         return;
@@ -2572,10 +2532,9 @@ fn emit_subsurface_tree(
                 // reasoning. Rounded clipping inside the parent
                 // would need a stencil pass.
                 corner_radius: 0.0,
-                trust_seq,
             });
         }
-        emit_subsurface_tree(out, &child, child_x, child_y, alpha, trust_seq);
+        emit_subsurface_tree(out, &child, child_x, child_y, alpha);
     }
 }
 
@@ -2594,9 +2553,9 @@ fn scene_from_buffers<'a>(
     // want (cursor on top).
     scene.border_anchor = border_anchor;
     for p in placed {
-        let (buf, rect, vsrc, alpha, corner_radius, trust_seq) = match p {
-            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius, trust_seq } => {
-                (buf, rect, vsrc, alpha, corner_radius, *trust_seq)
+        let (buf, rect, vsrc, alpha, corner_radius) = match p {
+            Placed::Buffer { buf, rect, vsrc, alpha, corner_radius } => {
+                (buf, rect, vsrc, alpha, corner_radius)
             }
             Placed::Backdrop {
                 rect,
@@ -2658,7 +2617,6 @@ fn scene_from_buffers<'a>(
                     upload_seq: bd
                         .upload_seq
                         .load(std::sync::atomic::Ordering::Relaxed),
-                    trust_seq,
                 },
             });
         } else if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
@@ -2718,8 +2676,6 @@ fn scene_from_buffers<'a>(
                 stride: cursor.width * 4,
                 format: sol_core::PixelFormat::Argb8888,
                 upload_seq: cursor.upload_seq,
-                // Compositor cursor is provably immutable post-init.
-                trust_seq: true,
             },
         });
     }
@@ -3796,26 +3752,6 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
             return Ok(());
         }
     }
-    // Belt-and-suspenders snapshot drain. The post-dispatch hook on
-    // the display socket already drains, but render_tick can fire from
-    // sources that don't go through that socket — animation timer,
-    // DRM page-flip-complete event, idle-blank wake. Draining once
-    // more at the very top of render_tick guarantees that every
-    // commit's snapshot has been pushed into the texture cache
-    // before scene_from_buffers reads upload_seq from BufferData,
-    // so the seq parity check in `prepare_shm` always lines up and
-    // the live-mmap fallback memcpy never fires under steady-state
-    // operation.
-    if let BackendState::Drm(presenter) = &mut comp.backend {
-        let snaps = std::mem::take(&mut comp.state.pending_shm_snapshots);
-        for snap in snaps {
-            if let Err(e) = presenter.apply_shm_snapshot(snap) {
-                tracing::warn!(error = %e, "apply_shm_snapshot (render_tick): {e}");
-            }
-        }
-    } else {
-        comp.state.pending_shm_snapshots.clear();
-    }
     let tick_started = Instant::now();
     let result = render_tick_inner(comp);
     let elapsed_ns = tick_started.elapsed().as_nanos() as u64;
@@ -4061,7 +3997,6 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
                         stride,
                         format,
                         upload_seq: _,
-                        trust_seq: _,
                     } => {
                         canvas.blit_argb(
                             e.x.round() as i32,
@@ -4338,32 +4273,6 @@ fn setup_event_loop(
                 comp.display
                     .flush_clients()
                     .map_err(std::io::Error::other)?;
-                // Apply any commit-time SHM snapshots the dispatch
-                // handlers queued. Doing it here — outside the
-                // dispatch's `&mut State` borrow but before yielding
-                // back to the event loop — gives us simultaneous
-                // access to the texture cache (in `comp.backend`)
-                // and the `pending_shm_snapshots` vec (in
-                // `comp.state`). See `compositor.rs`'s commit
-                // handler for why we capture pixels here rather than
-                // at render time.
-                if let BackendState::Drm(presenter) = &mut comp.backend {
-                    let snaps = std::mem::take(&mut comp.state.pending_shm_snapshots);
-                    for snap in snaps {
-                        if let Err(e) = presenter.apply_shm_snapshot(snap) {
-                            tracing::warn!(
-                                error = %e,
-                                "apply_shm_snapshot failed; surface may render stale"
-                            );
-                        }
-                    }
-                } else {
-                    // Headless backend keeps the snapshots out of the
-                    // way — the canvas reads pixels back through
-                    // BufferData::bytes() from the live mmap, same
-                    // as before.
-                    comp.state.pending_shm_snapshots.clear();
-                }
                 // A client dispatch may have created an idle
                 // inhibitor while the screen was blanked — the
                 // inhibit handler raises `pending_wake` because
@@ -4625,7 +4534,6 @@ fn setup_event_loop(
         presentation_seq: 0,
         exec_once_pgids: Vec::new(),
         pending_texture_evictions: Vec::new(),
-        pending_shm_snapshots: Vec::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
         data_devices: Vec::new(),
