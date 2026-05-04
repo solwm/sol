@@ -1013,12 +1013,22 @@ impl State {
     /// `state.keyboard_focus` is updated by `SeatHandler::focus_changed`
     /// (smithay calls back into us as part of `set_focus`).
     pub fn set_keyboard_focus(&mut self, new: Option<WlSurface>) {
+        tracing::info!(
+            old = ?self.keyboard_focus.as_ref().map(|s| s.id()),
+            new = ?new.as_ref().map(|s| s.id()),
+            "set_keyboard_focus"
+        );
         if surface_eq(self.keyboard_focus.as_ref(), new.as_ref()) {
             return;
         }
         if let Some(kbd) = self.keyboard.clone() {
             let serial = SERIAL_COUNTER.next_serial();
             kbd.set_focus(self, new.clone(), serial);
+            // Smithay's set_focus(None) doesn't fire focus_changed,
+            // so mirror manually for that case.
+            if new.is_none() {
+                self.keyboard_focus = None;
+            }
         } else {
             // No keyboard handle (headless): just mirror the focus
             // ourselves so the rest of the codebase reads what it
@@ -5799,6 +5809,12 @@ fn update_pointer_focus_and_motion(state: &mut State) {
     let now_ms = state.elapsed_ms();
     let cursor = (state.cursor.pos_x, state.cursor.pos_y).into();
     let focus = hit.as_ref().map(|(s, lx, ly)| (s.clone(), (*lx, *ly).into()));
+    if focus_changed {
+        tracing::info!(
+            new_focus = ?new_focus.as_ref().map(|s| s.id()),
+            "pointer focus changed"
+        );
+    }
     pointer.motion(
         state,
         focus,
@@ -5993,6 +6009,13 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
         state.set_keyboard_focus(Some(focus.clone()));
     }
     let Some(pointer) = state.pointer.clone() else { return };
+    tracing::info!(
+        button,
+        pressed,
+        pointer_focus = ?state.pointer_focus.as_ref().map(|s| s.id()),
+        keyboard_focus = ?state.keyboard_focus.as_ref().map(|s| s.id()),
+        "send_pointer_button"
+    );
     let time = state.elapsed_ms();
     let serial = SERIAL_COUNTER.next_serial();
     let button_state = if pressed {
@@ -6022,15 +6045,18 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
 /// don't accidentally double-dispatch.
 fn send_keyboard_key(state: &mut State, keycode: u32, pressed: bool) {
     let Some(kbd) = state.keyboard.clone() else { return };
+    tracing::info!(
+        keycode,
+        pressed,
+        focus = ?state.keyboard_focus.as_ref().map(|s| s.id()),
+        "send_keyboard_key"
+    );
     let time = state.elapsed_ms();
     let key_state = if pressed {
         smithay::backend::input::KeyState::Pressed
     } else {
         smithay::backend::input::KeyState::Released
     };
-    // libinput emits evdev keycodes (0-based); xkbcommon adds 8 for
-    // the X11 wire convention. Smithay's keyboard handle takes the
-    // xkb keycode; on send to wl_keyboard.key it subtracts 8 again.
     let xkb_code = smithay::input::keyboard::Keycode::new(keycode + 8);
     let serial = SERIAL_COUNTER.next_serial();
     let _: Option<()> = kbd.input(
