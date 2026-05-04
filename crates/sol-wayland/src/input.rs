@@ -9,18 +9,20 @@
 //! also revokes these fds when our VT isn't active, which is what fixes
 //! the cross-VT input leak we saw pre-B11.
 
-use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use input::event::Event as LiEvent;
 use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
 use input::event::pointer::{Axis, ButtonState, PointerEvent, PointerScrollEvent};
 use input::{Libinput, LibinputInterface};
-use libseat::Device as SeatDevice;
+// Smithay's Session::open takes its (pinned rustix 1.x) OFlags, not
+// the workspace rustix 0.38.x — they're distinct types at the Rust
+// level. Use smithay's re-export here so the trait method matches.
+use smithay::reexports::rustix::fs::OFlags;
 
-use crate::session::SharedSession;
+use crate::session::{LibSeatSession, Session, SharedSession};
 
 /// Translated from libinput into something the render loop cares about.
 #[derive(Debug)]
@@ -52,59 +54,32 @@ pub enum AxisSource {
     Continuous,
 }
 
-/// libinput's open_restricted / close_restricted glue. Every call goes
-/// through libseat: the daemon opens the device as a privileged user and
-/// hands us the fd, and close_restricted returns it to the daemon so the
-/// kernel revocation ladder stays clean on VT switches.
-///
-/// Keeps a `path -> seat_device` map because libinput closes devices by
-/// fd rather than by (path, id), so we need to find the right SeatDevice
-/// from the fd we handed out earlier.
+/// libinput's open_restricted / close_restricted glue. Every call
+/// goes through smithay's [`LibSeatSession`] which talks to the seat
+/// daemon (logind / seatd). The session keeps its own `RawFd ->
+/// libseat::Device` map so we don't need one of our own — `open`
+/// returns the `OwnedFd` libinput wants directly, and `close` finds
+/// the matching libseat handle by fd and revokes it cleanly.
 struct Interface {
-    session: SharedSession,
-    /// Keyed by raw fd so we can find the SeatDevice on close.
-    open_devices: HashMap<RawFd, SeatDevice>,
-    /// Reverse lookup for logging; not load-bearing.
-    paths: HashMap<RawFd, PathBuf>,
+    session: LibSeatSession,
 }
 
 impl LibinputInterface for Interface {
-    fn open_restricted(&mut self, path: &Path, _flags: i32) -> Result<OwnedFd, i32> {
-        let dev = self
-            .session
-            .borrow_mut()
-            .open_device(path)
-            .map_err(|e| {
-                tracing::warn!(%e, path = %path.display(), "libseat open_device failed");
-                libc::EACCES
-            })?;
-        // We need to give libinput an OwnedFd. libseat's Device holds the
-        // fd as a RawFd; we dup it so the Device stays whole (so we can
-        // return it on close_device later) and libinput gets an owned
-        // copy it will close when it's done.
-        let raw = dev.as_fd().as_raw_fd();
-        let dup = unsafe { libc::dup(raw) };
-        if dup < 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(error = %err, "dup of libseat-opened fd");
-            let _ = self.session.borrow_mut().close_device(dev);
-            return Err(err.raw_os_error().unwrap_or(libc::EIO));
-        }
-        self.open_devices.insert(dup, dev);
-        self.paths.insert(dup, path.to_owned());
-        Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+    fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
+        // Smithay's libseat impl ignores the flags arg, but we pass
+        // through what libinput requested for protocol cleanliness in
+        // case a future smithay version starts honouring it.
+        let oflags = OFlags::from_bits_truncate(flags as u32);
+        self.session.open(path, oflags).map_err(|e| {
+            tracing::warn!(?e, path = %path.display(), "libseat open failed");
+            libc::EACCES
+        })
     }
 
     fn close_restricted(&mut self, fd: OwnedFd) {
-        let raw = fd.as_raw_fd();
-        // libinput is about to close its dup; we close ours via Drop here.
-        drop(fd);
-        if let Some(dev) = self.open_devices.remove(&raw) {
-            if let Err(e) = self.session.borrow_mut().close_device(dev) {
-                tracing::warn!(%e, "libseat close_device");
-            }
+        if let Err(e) = self.session.close(fd) {
+            tracing::warn!(?e, "libseat close");
         }
-        self.paths.remove(&raw);
     }
 }
 
@@ -117,11 +92,7 @@ pub struct InputState {
 
 impl InputState {
     pub fn init(seat_name: &str, session: SharedSession) -> Result<(Self, OwnedFd)> {
-        let iface = Interface {
-            session,
-            open_devices: HashMap::new(),
-            paths: HashMap::new(),
-        };
+        let iface = Interface { session };
         let mut li = Libinput::new_with_udev(iface);
         li.udev_assign_seat(seat_name).map_err(|_| {
             anyhow!(

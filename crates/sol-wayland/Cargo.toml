@@ -21,8 +21,7 @@ input.workspace = true
 libc.workspace = true
 xkbcommon.workspace = true
 ctrlc.workspace = true
-libseat.workspace = true
-smithay = { workspace = true, features = ["wayland_frontend"] }
+smithay = { workspace = true, features = ["wayland_frontend", "backend_session_libseat"] }
 xcursor = "0.3"
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

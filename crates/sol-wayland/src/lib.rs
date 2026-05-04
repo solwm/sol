@@ -29,6 +29,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic};
+// Smithay's Session trait takes its own (re-exported) rustix's OFlags;
+// our workspace `rustix = "0.38"` and smithay's pinned `rustix = "1.x"`
+// are different crates at the type level. Use smithay's re-export at
+// the only callsite that needs it (`run_drm`'s `session.open`).
+use smithay::reexports::rustix::fs::OFlags;
 use sol_backend_drm::DrmPresenter;
 use std::os::fd::AsRawFd;
 use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
@@ -4212,6 +4217,7 @@ fn setup_event_loop(
     input: Option<(InputState, std::os::fd::OwnedFd)>,
     drm_device_path: Option<PathBuf>,
     session: Option<session::SharedSession>,
+    session_notifier: Option<session::LibSeatSessionNotifier>,
     cfg: config::Config,
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, Compositor> =
@@ -4505,32 +4511,19 @@ fn setup_event_loop(
             .map_err(|e| anyhow::anyhow!("insert drm source: {e}"))?;
     }
 
-    // libseat session: dispatch Enable/Disable events, handle DRM
-    // master transitions. Without this source, VT switches would
-    // leave us in a half-disabled state and libseat would block.
-    if let Some(sess) = session.clone() {
-        let poll_fd = {
-            let mut s = sess.borrow_mut();
-            s.poll_fd()?.try_clone_to_owned()?
-        };
+    // libseat session: dispatch ActivateSession/PauseSession events,
+    // handle DRM master transitions. Without this source, VT switches
+    // would leave us in a half-disabled state and libseat would block.
+    // Smithay's `LibSeatSessionNotifier` is itself a calloop
+    // EventSource — no Generic wrapper needed; it dispatches the seat
+    // and emits `SessionEvent::ActivateSession` / `PauseSession` to
+    // the closure below.
+    if let Some(notifier) = session_notifier {
         event_loop
             .handle()
-            .insert_source(
-                Generic::new(poll_fd, Interest::READ, Mode::Level),
-                move |_ready, _fd, comp| {
-                    let events = match comp.state.session.as_ref() {
-                        Some(s) => s
-                            .borrow_mut()
-                            .dispatch_events()
-                            .unwrap_or_default(),
-                        None => return Ok(PostAction::Continue),
-                    };
-                    for ev in events {
-                        handle_session_event(comp, ev);
-                    }
-                    Ok(PostAction::Continue)
-                },
-            )
+            .insert_source(notifier, move |ev, _, comp| {
+                handle_session_event(comp, ev);
+            })
             .map_err(|e| anyhow::anyhow!("insert session source: {e}"))?;
     }
 
@@ -4758,41 +4751,35 @@ fn setup_event_loop(
 }
 
 /// Handle a single libseat event. Keeps both the DRM backend's master
-/// state AND libinput's device fds in sync with our session ownership,
-/// then acks the Disable so the daemon can proceed with the VT switch.
+/// state AND libinput's device fds in sync with our session ownership.
 ///
 /// libinput suspend/resume is mandatory here: logind revokes our
-/// /dev/input/event* fds on Disable, so libinput is left with stale
-/// fds that stop producing events even after we come back. Calling
-/// `suspend` before we ack Disable closes them via our
-/// close_restricted callback, and `resume` on Enable re-opens fresh
-/// ones via open_restricted (which routes through libseat).
-fn handle_session_event(comp: &mut Compositor, ev: libseat::SeatEvent) {
+/// /dev/input/event* fds on PauseSession, so libinput is left with
+/// stale fds that stop producing events even after we come back.
+/// Calling `suspend` before we yield closes them via our
+/// close_restricted callback, and `resume` on ActivateSession re-opens
+/// fresh ones via open_restricted (which routes through libseat).
+///
+/// Smithay's notifier internally calls `seat.disable()` on
+/// PauseSession before emitting the event, so the daemon's ack is
+/// already done by the time we run — we just need to clean up our
+/// own subsystems.
+fn handle_session_event(comp: &mut Compositor, ev: session::SessionEvent) {
     match ev {
-        libseat::SeatEvent::Disable => {
-            tracing::info!("libseat: Disable — suspending input + releasing DRM master");
+        session::SessionEvent::PauseSession => {
+            tracing::info!("libseat: pause — suspending input + releasing DRM master");
             if let Some(input) = comp.state.input.as_mut() {
                 input.li.suspend();
             }
             if let BackendState::Drm(presenter) = &mut comp.backend {
                 presenter.drop_master();
             }
-            if let Some(s) = comp.state.session.as_ref() {
-                let mut s = s.borrow_mut();
-                s.active = false;
-                if let Err(e) = s.ack_disable() {
-                    tracing::warn!(error = %e, "libseat: ack_disable");
-                }
-            }
         }
-        libseat::SeatEvent::Enable => {
-            tracing::info!("libseat: Enable — reacquiring DRM master + resuming input");
-            if let Some(s) = comp.state.session.as_ref() {
-                s.borrow_mut().active = true;
-            }
+        session::SessionEvent::ActivateSession => {
+            tracing::info!("libseat: activate — reacquiring DRM master + resuming input");
             if let BackendState::Drm(presenter) = &mut comp.backend {
                 if let Err(e) = presenter.reacquire_master() {
-                    tracing::warn!(error = %e, "DRM reacquire on Enable");
+                    tracing::warn!(error = %e, "DRM reacquire on activate");
                 }
             }
             if let Some(input) = comp.state.input.as_mut() {
@@ -4945,9 +4932,10 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             // never be able to trap the user on the compositor.
             if pressed && ctrl && alt {
                 if let Some(vt) = vt_number_for_f_key(keycode) {
-                    if let Some(s) = state.session.as_ref() {
-                        if let Err(e) = s.borrow_mut().switch_session(vt) {
-                            tracing::warn!(%e, vt, "libseat switch_session");
+                    if let Some(s) = state.session.as_mut() {
+                        use session::Session as _;
+                        if let Err(e) = s.change_vt(vt) {
+                            tracing::warn!(?e, vt, "libseat change_vt");
                         } else {
                             tracing::info!(vt, "Ctrl+Alt+F{vt}: switching VT");
                         }
@@ -5795,7 +5783,7 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
     let cfg = config::load();
     // 60 mHz is a stand-in; headless has no real output and nothing
     // paces off wl_output.mode here.
-    setup_event_loop(backend, width, height, 60_000, None, None, None, cfg)
+    setup_event_loop(backend, width, height, 60_000, None, None, None, None, cfg)
 }
 
 /// DRM backend, managed via libseat.
@@ -5812,41 +5800,15 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
 ///   5. Hand the session + Wayland bits to setup_event_loop; it wires
 ///      the session poll fd into calloop and handles enable/disable.
 pub fn run_drm(device: &Path) -> Result<()> {
-    let session = session::Session::open().context("libseat: open session")?;
-
-    // Wait for the initial Enable. Under logind the first event can
-    // be delayed by a D-Bus round-trip; a non-blocking dispatch(0)
-    // poll-and-sleep loop can miss the notify and bail. dispatch with
-    // a positive timeout lets libseat block on its own fd until the
-    // daemon sends something. Loop in case other events (e.g. an
-    // unrelated Disable from a prior session, though unusual) arrive
-    // first.
-    {
-        let mut s = session.borrow_mut();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !s.active {
-            let remaining = deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis() as i32;
-            if remaining <= 0 {
-                anyhow::bail!(
-                    "libseat: no Enable event within 5s — the daemon hasn't \
-                     handed us the seat. Make sure sol was launched from \
-                     an active logind session (check `loginctl show-session \
-                     $XDG_SESSION_ID` from the TTY where you're running it)."
-                );
-            }
-            for ev in s
-                .dispatch_events_blocking(remaining)
-                .context("libseat: waiting for Enable")?
-            {
-                if matches!(ev, libseat::SeatEvent::Enable) {
-                    s.active = true;
-                }
-            }
-        }
-        tracing::info!(seat = %s.name(), "libseat session active");
-    }
+    // Smithay's `LibSeatSession::new` does an initial seat dispatch
+    // and sets `is_active()` if the daemon already had an Enable
+    // queued. On systemd hosts launched from an active TTY this is
+    // the common case. `session::open` bails with a helpful error if
+    // it isn't, rather than racing the rest of startup against a
+    // still-disabled seat (opening `/dev/dri` while disabled would
+    // fail in a less-readable way).
+    let (mut session, notifier) =
+        session::open().context("libseat: open session")?;
 
     // Load config first so the user's `mode = WxH@Hz` (if any) drives
     // initial mode selection. The DRM backend's pick_output uses this
@@ -5858,12 +5820,16 @@ pub fn run_drm(device: &Path) -> Result<()> {
         refresh_hz: m.refresh_hz,
     });
 
-    // Open the DRM device through libseat, wrap into a Card, build the
-    // presenter off it.
+    // Open the DRM device through smithay's session, wrap into a
+    // Card, build the presenter off it. Smithay's `LibSeatSession`
+    // tracks the libseat::Device internally keyed by raw fd, so the
+    // OwnedFd we get back is dup-managed and stays alive for the
+    // session's lifetime — no `open_device_keep_fd` hand-rolled
+    // dup-and-store needed.
+    use session::Session as _;
     let drm_fd = session
-        .borrow_mut()
-        .open_device_keep_fd(device)
-        .context("libseat: open DRM device")?;
+        .open(device, OFlags::RDWR | OFlags::CLOEXEC)
+        .map_err(|e| anyhow::anyhow!("libseat: open DRM device: {e:?}"))?;
     let card = sol_backend_drm::Card::from_fd(drm_fd);
     let presenter = DrmPresenter::from_card(card, mode_pref)
         .context("initialise DrmPresenter")?;
@@ -5887,6 +5853,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
         input,
         Some(device.to_path_buf()),
         Some(session),
+        Some(notifier),
         cfg,
     )
 }
