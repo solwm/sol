@@ -3796,6 +3796,26 @@ fn render_tick(comp: &mut Compositor) -> Result<()> {
             return Ok(());
         }
     }
+    // Belt-and-suspenders snapshot drain. The post-dispatch hook on
+    // the display socket already drains, but render_tick can fire from
+    // sources that don't go through that socket — animation timer,
+    // DRM page-flip-complete event, idle-blank wake. Draining once
+    // more at the very top of render_tick guarantees that every
+    // commit's snapshot has been pushed into the texture cache
+    // before scene_from_buffers reads upload_seq from BufferData,
+    // so the seq parity check in `prepare_shm` always lines up and
+    // the live-mmap fallback memcpy never fires under steady-state
+    // operation.
+    if let BackendState::Drm(presenter) = &mut comp.backend {
+        let snaps = std::mem::take(&mut comp.state.pending_shm_snapshots);
+        for snap in snaps {
+            if let Err(e) = presenter.apply_shm_snapshot(snap) {
+                tracing::warn!(error = %e, "apply_shm_snapshot (render_tick): {e}");
+            }
+        }
+    } else {
+        comp.state.pending_shm_snapshots.clear();
+    }
     let tick_started = Instant::now();
     let result = render_tick_inner(comp);
     let elapsed_ns = tick_started.elapsed().as_nanos() as u64;

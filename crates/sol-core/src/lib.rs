@@ -45,6 +45,15 @@ pub struct ShmSnapshot {
     pub stride: i32,
     pub format: PixelFormat,
     pub pixels: Vec<u8>,
+    /// Value of `BufferData::upload_seq` *at the time the snapshot was
+    /// taken*. The texture cache stores this as `entry.uploaded_seq`
+    /// so the render-time skip check (`entry.uploaded_seq ==
+    /// elem.upload_seq`) lines up perfectly. Without it, the cache's
+    /// recorded seq could drift if a snapshot ever fails to apply,
+    /// which would then make every subsequent render fall through to
+    /// the legacy live-mmap memcpy fallback — exactly the race the
+    /// snapshot was meant to close.
+    pub upload_seq: u64,
 }
 
 /// Where a scene element's pixel data actually lives. SHM buffers are

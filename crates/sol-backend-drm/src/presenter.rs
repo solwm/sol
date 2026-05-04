@@ -1238,8 +1238,15 @@ impl Drop for DrmPresenter {
 }
 
 /// Hash the bg slice into a u64 for the blur-cache equality check.
-/// Same convention as the pre-rewrite version: buffer_key + on-screen
-/// rect of every element, plus slice length to disambiguate empty.
+/// Includes buffer_key + on-screen rect (so a moved / resized
+/// wallpaper invalidates) AND a per-element pixel-content hint
+/// (`upload_seq` for SHM, `fd` for dmabuf) so an *animated* wallpaper
+/// also invalidates: pool-style wallpaper apps like swww cycle a
+/// small set of buffers and overwrite their pixels in place between
+/// commits, which keeps `cache_key` stable. Without the seq in the
+/// hash, the blur cache would think nothing changed and keep
+/// sampling a stale capture FBO — visible as the inactive-window
+/// backdrop "lagging behind the wallpaper" by a frame or two.
 fn compute_bg_signature(elems: &[sol_core::SceneElement<'_>]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1250,6 +1257,11 @@ fn compute_bg_signature(elems: &[sol_core::SceneElement<'_>]) -> u64 {
         e.y.to_bits().hash(&mut h);
         e.dst_width.to_bits().hash(&mut h);
         e.dst_height.to_bits().hash(&mut h);
+        match &e.content {
+            SceneContent::Shm { upload_seq, .. } => upload_seq.hash(&mut h),
+            SceneContent::Dmabuf { fd, .. } => fd.hash(&mut h),
+            SceneContent::BlurredBackdrop { .. } => {}
+        }
     }
     h.finish()
 }

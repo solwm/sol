@@ -319,10 +319,16 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 if pixels_changed {
                     if let Some(buf) = sd.current.buffer.as_ref() {
                         if let Some(bd) = buf.data::<crate::shm::BufferData>() {
-                            bd.upload_seq.fetch_add(
-                                1,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            // Bump first, then read the post-bump seq
+                            // into the snapshot — that way the
+                            // texture cache's `entry.uploaded_seq`
+                            // matches whatever scene_from_buffers
+                            // will read out of `BufferData::upload_seq`
+                            // when it builds the next frame's scene.
+                            let seq_after = bd
+                                .upload_seq
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
                             if let (Some(pixels), Some(format)) =
                                 (bd.bytes(), bd.pixel_format())
                             {
@@ -333,6 +339,7 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                     stride: bd.stride,
                                     format,
                                     pixels: pixels.to_vec(),
+                                    upload_seq: seq_after,
                                 });
                             }
                         }

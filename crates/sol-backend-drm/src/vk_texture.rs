@@ -608,9 +608,13 @@ impl TextureCache {
         } else {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
         };
-        // Bump the recorded seq so the render-time prepare_shm
-        // matches and skips duplicate work.
-        entry.uploaded_seq = entry.uploaded_seq.saturating_add(1);
+        // Match the bumped value the wayland-side captured into the
+        // snapshot so render-time `prepare_shm` sees seq parity and
+        // skips its fallback memcpy. Tracking the snapshot's seq
+        // directly (rather than incrementing locally) means the
+        // values stay in lock-step even if a snapshot ever fails to
+        // apply — the next successful one will resync.
+        entry.uploaded_seq = snap.upload_seq;
         // Dedup: only one PendingUpload per key per command buffer.
         // If a second commit lands before the next render we just
         // updated the staging contents above; one cmd_copy is
