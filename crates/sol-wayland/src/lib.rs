@@ -5808,7 +5808,20 @@ fn update_pointer_focus_and_motion(state: &mut State) {
     let Some(pointer) = state.pointer.clone() else { return };
     let now_ms = state.elapsed_ms();
     let cursor = (state.cursor.pos_x, state.cursor.pos_y).into();
-    let focus = hit.as_ref().map(|(s, lx, ly)| (s.clone(), (*lx, *ly).into()));
+    // Smithay's PointerHandle::motion expects `loc` to be the surface's
+    // top-left in compositor space, so smithay can compute
+    // `event.location - loc = surface-local cursor` for the wire event.
+    // `hit_testing` returns the cursor position in surface-local coords
+    // (lx, ly), so the surface origin in compositor space is
+    // `cursor - (lx, ly)`. Passing `(lx, ly)` directly as `loc` (an
+    // earlier mistake) sent every client a near-(0,0) cursor, causing
+    // every click to land at the top-left corner — which on YouTube
+    // is the "Home" link, hence the mysterious "click a video, end up
+    // at home" behaviour the user reported.
+    let focus = hit.as_ref().map(|(s, lx, ly)| {
+        let origin = (state.cursor.pos_x - lx, state.cursor.pos_y - ly).into();
+        (s.clone(), origin)
+    });
     if focus_changed {
         tracing::info!(
             new_focus = ?new_focus.as_ref().map(|s| s.id()),
