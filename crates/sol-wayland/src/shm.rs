@@ -1,236 +1,142 @@
 //! wl_shm + wl_shm_pool + wl_buffer.
 //!
-//! Pools are mmapped read-only from the server's side; clients retain their
-//! own writable mapping via the fd they passed in, so buffer updates propagate
-//! through the shared memory region without server-side copies. Resize is
-//! supported (grow only, per spec); existing wl_buffers keep their original
-//! mapping via their private `Arc<Mmap>` ref, while subsequently-created
-//! buffers allocate against the new, larger mapping.
+//! Backed by smithay's `ShmState`. The `WlShm` global, pool mmap, and
+//! per-buffer wire dispatch (Create/Resize/Destroy) all live in
+//! smithay; we keep a parallel `shm_cache` side table on `State`,
+//! keyed by the `wl_buffer`'s `ObjectId`, that holds the two pieces
+//! of compositor-owned per-buffer state we still need:
+//!
+//! - `cache_key`: stable, never-recycled u64 the DRM presenter uses
+//!   to index its texture cache. We can't key the cache by anything
+//!   the wayland-server crate hands out for free — `WlBuffer`'s
+//!   address is recycled by the heap allocator and the protocol's
+//!   integer ID is recycled by the protocol itself, both of which
+//!   alias old textures to new buffers during rapid resize churn.
+//! - `upload_seq`: bumped on each `wl_surface.commit` that promotes
+//!   a real pixel change. Backends compare against their cached
+//!   per-key value to decide whether to re-upload (currently only
+//!   the cursor sentinel actually consults this — see the
+//!   `project_shm_upload_skip_disabled` memory note).
+//!
+//! Cache entries are populated lazily at commit time in
+//! `compositor.rs` and removed by `BufferHandler::buffer_destroyed`
+//! in `lib.rs`, which also queues the `cache_key` into
+//! `pending_texture_evictions` for the next render tick to act on.
 
-use std::os::fd::OwnedFd;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 
-use memmap2::{Mmap, MmapOptions};
-use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
-    protocol::{
-        wl_buffer::{self, WlBuffer},
-        wl_shm::{self, Format, WlShm},
-        wl_shm_pool::{self, WlShmPool},
-    },
+use smithay::wayland::shm::{
+    BufferAccessError, BufferData as SmithayShmData, ShmBufferUserData, with_buffer_contents,
 };
+use wayland_server::Resource;
+use wayland_server::protocol::wl_buffer::WlBuffer;
+use wayland_server::protocol::wl_shm::Format;
 
-use crate::State;
 use sol_core::PixelFormat;
 
-/// User data attached to a wl_shm_pool. The mmap lives behind a mutex so the
-/// Resize request (which sees only `&PoolData` via the Dispatch signature)
-/// can swap it for a bigger mapping.
-pub struct PoolData {
-    pub inner: Mutex<PoolInner>,
-    /// Kept alive so Resize can re-mmap at a larger size.
-    pub fd: OwnedFd,
-}
-
-pub struct PoolInner {
-    pub mmap: Arc<Mmap>,
-    pub size: usize,
-}
-
-/// User data attached to a wl_buffer. Buffers clone the pool's `Arc<Mmap>` so
-/// they outlive the wl_shm_pool resource if needed.
-pub struct BufferData {
-    pub mmap: Arc<Mmap>,
-    pub offset: i32,
-    pub width: i32,
-    pub height: i32,
-    pub stride: i32,
-    pub format: Format,
-    /// Stable, globally unique ID for the texture cache. Pulled from
-    /// `crate::next_buffer_cache_key` at construction. We can't key
-    /// the cache by `(self as *const _) as u64` — wayland-server
-    /// boxes BufferData in heap memory that gets reused as soon as
-    /// the resource is dropped, and a new buffer landing at the same
-    /// address before the eviction queue drains aliases to the old
-    /// texture. Symptom of that aliasing: two windows briefly render
-    /// the same content during rapid resize/move churn.
+/// Per-buffer compositor-owned state. Lives in `State::shm_cache`
+/// keyed by the `WlBuffer`'s `ObjectId`.
+#[derive(Debug)]
+pub struct ShmCacheEntry {
     pub cache_key: u64,
-    /// Bumped on each wl_surface.commit that promotes this buffer
-    /// from pending to current. Backends compare against their cached
-    /// per-key value to decide whether the SHM upload is redundant.
-    /// Starts at 1 so first-frame uploads (which see a default-zero
-    /// cached value) always run.
     pub upload_seq: AtomicU64,
 }
 
-impl BufferData {
-    pub fn pixel_format(&self) -> Option<PixelFormat> {
-        match self.format {
-            Format::Argb8888 => Some(PixelFormat::Argb8888),
-            Format::Xrgb8888 => Some(PixelFormat::Xrgb8888),
-            _ => None,
+impl ShmCacheEntry {
+    pub fn new() -> Self {
+        Self {
+            cache_key: crate::next_buffer_cache_key(),
+            // Starts at 1 so first-frame uploads (which see a default-
+            // zero cached value) always run.
+            upload_seq: AtomicU64::new(1),
         }
     }
+}
 
-    /// Borrow the pixel bytes for this buffer. Returns None if the buffer's
-    /// range escapes the mapping (malicious or broken client).
-    pub fn bytes(&self) -> Option<&[u8]> {
-        let offset = self.offset as usize;
-        let len = self.stride as usize * self.height as usize;
-        let end = offset.checked_add(len)?;
-        if end > self.mmap.len() {
+impl Default for ShmCacheEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sub-rect metadata returned alongside a borrowed pixel slice.
+/// Mirrors smithay's `BufferData` minus the wayland-server format
+/// wrapping; we translate the format into our own `PixelFormat` enum
+/// so callers outside this module never see the wire-protocol type.
+#[derive(Copy, Clone, Debug)]
+pub struct ShmMeta {
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+    pub format: PixelFormat,
+}
+
+/// True if `buf` is an SHM buffer (vs a dmabuf or other kind).
+/// Used at commit time to gate the `shm_cache` insert and at
+/// hit-test time so dmabuf surfaces fall through to their own
+/// metadata path.
+pub fn is_shm_buffer(buf: &WlBuffer) -> bool {
+    buf.data::<ShmBufferUserData>().is_some()
+}
+
+/// Borrow this wl_buffer's pixel bytes plus its layout metadata.
+/// Returns `None` if the buffer isn't SHM, the format isn't one we
+/// know how to sample, or smithay refused the access (bad pool size).
+///
+/// The returned slice borrows from `buf` for `'b`. Smithay's
+/// `with_buffer_contents` is closure-scoped — it only documents the
+/// pointer as valid for the duration of the call — but the pool's
+/// mmap is held behind an `Arc<Pool>` stored in the wl_buffer's
+/// `ShmBufferUserData`, so it stays alive as long as the `WlBuffer`
+/// resource itself, which outlives `'b`. We bridge from the closure
+/// back to the buffer's borrow with a `transmute`. The compositor is
+/// single-threaded; a client mutating its mapping concurrently with
+/// this read is the same race smithay's own clients race against, and
+/// the worst case is a torn frame, not memory unsafety.
+pub fn shm_pixels<'b>(buf: &'b WlBuffer) -> Option<(&'b [u8], ShmMeta)> {
+    let result = with_buffer_contents(buf, |ptr, len, data: SmithayShmData| {
+        let format = match data.format {
+            Format::Argb8888 => PixelFormat::Argb8888,
+            Format::Xrgb8888 => PixelFormat::Xrgb8888,
+            _ => return None,
+        };
+        let start = data.offset as usize;
+        let extent = (data.stride as usize).checked_mul(data.height as usize)?;
+        let end = start.checked_add(extent)?;
+        if end > len {
             return None;
         }
-        Some(&self.mmap[offset..end])
-    }
-}
-
-impl GlobalDispatch<WlShm, ()> for State {
-    fn bind(
-        _state: &mut Self,
-        _dh: &DisplayHandle,
-        _client: &Client,
-        resource: New<WlShm>,
-        _gd: &(),
-        init: &mut DataInit<'_, Self>,
-    ) {
-        let shm = init.init(resource, ());
-        shm.format(Format::Argb8888);
-        shm.format(Format::Xrgb8888);
-        tracing::info!(id = ?shm.id(), "bind wl_shm");
-    }
-}
-
-impl Dispatch<WlShm, ()> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        shm: &WlShm,
-        request: wl_shm::Request,
-        _data: &(),
-        _dh: &DisplayHandle,
-        init: &mut DataInit<'_, Self>,
-    ) {
-        if let wl_shm::Request::CreatePool { id, fd, size } = request {
-            match mmap_pool(fd, size) {
-                Ok(pool_data) => {
-                    let _ = init.init(id, pool_data);
-                    tracing::debug!(size, "wl_shm.create_pool");
-                }
-                Err(e) => {
-                    shm.post_error(wl_shm::Error::InvalidFd, format!("mmap failed: {e}"));
-                }
-            }
-        }
-    }
-}
-
-fn mmap_pool(fd: OwnedFd, size: i32) -> anyhow::Result<PoolData> {
-    if size <= 0 {
-        anyhow::bail!("non-positive pool size {size}");
-    }
-    let mmap = unsafe { MmapOptions::new().len(size as usize).map(&fd)? };
-    Ok(PoolData {
-        inner: Mutex::new(PoolInner {
-            mmap: Arc::new(mmap),
-            size: size as usize,
-        }),
-        fd,
-    })
-}
-
-impl Dispatch<WlShmPool, PoolData> for State {
-    fn request(
-        _state: &mut Self,
-        _client: &Client,
-        pool: &WlShmPool,
-        request: wl_shm_pool::Request,
-        data: &PoolData,
-        _dh: &DisplayHandle,
-        init: &mut DataInit<'_, Self>,
-    ) {
-        match request {
-            wl_shm_pool::Request::CreateBuffer {
-                id,
-                offset,
-                width,
-                height,
-                stride,
+        // SAFETY: see function-level doc — the pool's mmap outlives
+        // the WlBuffer borrow, and we slice within `[start, end)`
+        // which is bounds-checked above.
+        let slice: &[u8] = unsafe { std::slice::from_raw_parts(ptr.add(start), extent) };
+        let bytes: &'b [u8] = unsafe { std::mem::transmute::<&[u8], &'b [u8]>(slice) };
+        Some((
+            bytes,
+            ShmMeta {
+                width: data.width,
+                height: data.height,
+                stride: data.stride,
                 format,
-            } => {
-                let format = match format.into_result() {
-                    Ok(f) => f,
-                    Err(_) => {
-                        pool.post_error(wl_shm::Error::InvalidFormat, "unknown format");
-                        return;
-                    }
-                };
-                let mmap = {
-                    let inner = data.inner.lock().unwrap();
-                    inner.mmap.clone()
-                };
-                let buf = BufferData {
-                    mmap,
-                    offset,
-                    width,
-                    height,
-                    stride,
-                    format,
-                    cache_key: crate::next_buffer_cache_key(),
-                    upload_seq: AtomicU64::new(1),
-                };
-                let _ = init.init(id, buf);
-                tracing::trace!(width, height, stride, ?format, "wl_shm_pool.create_buffer");
-            }
-            wl_shm_pool::Request::Resize { size } => {
-                if size <= 0 {
-                    pool.post_error(
-                        wl_shm::Error::InvalidStride,
-                        "wl_shm_pool.resize: non-positive size",
-                    );
-                    return;
-                }
-                let new_size = size as usize;
-                let mut inner = data.inner.lock().unwrap();
-                if new_size <= inner.size {
-                    // Spec: resize can only grow. Silently ignore
-                    // shrink — clients sometimes send the same size
-                    // after a buffer destroy; not a protocol error.
-                    return;
-                }
-                match unsafe { MmapOptions::new().len(new_size).map(&data.fd) } {
-                    Ok(new_mmap) => {
-                        inner.mmap = Arc::new(new_mmap);
-                        inner.size = new_size;
-                        tracing::debug!(new_size, "wl_shm_pool.resize applied");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, new_size, "wl_shm_pool.resize: mmap failed");
-                    }
-                }
-            }
-            wl_shm_pool::Request::Destroy => {}
-            _ => {}
+            },
+        ))
+    });
+    match result {
+        Ok(opt) => opt,
+        Err(BufferAccessError::NotManaged) => None,
+        Err(e) => {
+            tracing::warn!(error = ?e, "shm_pixels: unexpected access error");
+            None
         }
     }
 }
 
-impl Dispatch<WlBuffer, BufferData> for State {
-    fn request(
-        state: &mut Self,
-        _client: &Client,
-        _resource: &WlBuffer,
-        request: wl_buffer::Request,
-        data: &BufferData,
-        _dh: &DisplayHandle,
-        _init: &mut DataInit<'_, Self>,
-    ) {
-        if let wl_buffer::Request::Destroy = request {
-            // Queue the cache entry for eviction on the next render
-            // tick using the stable counter-based key (see
-            // BufferData::cache_key for why a pointer won't do).
-            state.pending_texture_evictions.push(data.cache_key);
-        }
-    }
+/// Buffer dimensions for SHM. Cheaper than `shm_pixels` because the
+/// closure doesn't dereference the mmap — used by hit-testing where
+/// we only need the surface's intrinsic area.
+pub fn shm_dims(buf: &WlBuffer) -> Option<(i32, i32)> {
+    with_buffer_contents(buf, |_ptr, _len, data: SmithayShmData| {
+        (data.width, data.height)
+    })
+    .ok()
 }

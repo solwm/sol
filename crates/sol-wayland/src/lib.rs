@@ -35,12 +35,14 @@ use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
-    backend::{ClientData, ClientId, DisconnectReason, GlobalId},
+    backend::{ClientData, ClientId, DisconnectReason, GlobalId, ObjectId},
     protocol::{
-        wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat, wl_shm::WlShm,
+        wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat,
         wl_surface::WlSurface,
     },
 };
+use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::shm::{ShmHandler, ShmState};
 
 mod compositor;
 mod config;
@@ -108,7 +110,6 @@ pub(crate) fn next_buffer_cache_key() -> u64 {
 }
 
 const COMPOSITOR_VERSION: u32 = 6;
-const SHM_VERSION: u32 = 1;
 const OUTPUT_VERSION: u32 = 4;
 const SEAT_VERSION: u32 = 8;
 const XDG_WM_BASE_VERSION: u32 = 5;
@@ -439,10 +440,24 @@ pub struct State {
     /// Same lifecycle rules as `zoomed`.
     pub fullscreened: Option<Weak<WlSurface>>,
     /// Keys of texture cache entries the DRM presenter should evict on
-    /// the next render tick. Filled by `Dispatch<WlBuffer, _>::Destroy`
-    /// handlers when a client tears down a buffer; drained (and acted
-    /// on) inside `render_tick` which has `&mut` access to the backend.
+    /// the next render tick. Filled by `BufferHandler::buffer_destroyed`
+    /// (SHM, via smithay) and the `Dispatch<WlBuffer, DmabufBuffer>`
+    /// `Destroy` handler when a client tears down a buffer; drained
+    /// (and acted on) inside `render_tick` which has `&mut` access to
+    /// the backend.
     pub pending_texture_evictions: Vec<u64>,
+    /// Smithay's `wl_shm` state: owns the global, the per-pool mmap,
+    /// and the per-buffer wire dispatch. Created in `setup_event_loop`
+    /// before the rest of `Globals` so its `global()` ID can populate
+    /// `globals.shm`.
+    pub shm_state: ShmState,
+    /// Per-`wl_buffer` compositor-owned state, keyed by the buffer's
+    /// `ObjectId`. Lazily populated at commit time in `compositor.rs`
+    /// (see `shm::is_shm_buffer` gate); entries removed by
+    /// `BufferHandler::buffer_destroyed`. See `shm.rs` for the
+    /// rationale on why a side table beats trying to share the
+    /// wl_buffer's user-data slot with smithay.
+    pub shm_cache: std::collections::HashMap<ObjectId, shm::ShmCacheEntry>,
     /// Weak refs to every `wl_surface` with a `zwlr_layer_surface_v1`
     /// role. Dead weaks are pruned on render tick; the role's mapped
     /// flag on `SurfaceData` determines whether we currently draw it.
@@ -1137,6 +1152,36 @@ impl ClientData for ClientState {
         tracing::info!(?client_id, ?reason, "client disconnected");
     }
 }
+
+// Smithay shm wiring. `delegate_shm!` attaches the WlShm /
+// WlShmPool / WlBuffer (with smithay's `ShmBufferUserData`)
+// Dispatch impls; we provide `ShmHandler` to hand out the state and
+// `BufferHandler` to learn about destruction. The dmabuf module
+// keeps its own `Dispatch<WlBuffer, DmabufBuffer>` for the dmabuf
+// kind — those two impls coexist because each WlBuffer carries its
+// own user-data type that wayland-server uses to route dispatch.
+impl ShmHandler for State {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+
+impl BufferHandler for State {
+    fn buffer_destroyed(
+        &mut self,
+        buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+    ) {
+        // Only fires for buffer kinds whose Dispatch routes into a
+        // smithay module that calls us — currently just SHM. Dmabuf
+        // eviction still flows through `Dispatch<WlBuffer,
+        // DmabufBuffer>::Destroy` in linux_dmabuf.rs.
+        if let Some(entry) = self.shm_cache.remove(&buffer.id()) {
+            self.pending_texture_evictions.push(entry.cache_key);
+        }
+    }
+}
+
+smithay::delegate_shm!(State);
 
 /// Backend-specific render target. Chosen at startup; does not switch at
 /// runtime. `DrmPresenter` is boxed because it carries the Vulkan
@@ -2546,6 +2591,7 @@ fn emit_subsurface_tree(
 }
 
 fn scene_from_buffers<'a>(
+    state: &'a State,
     placed: &'a [Placed],
     background_count: usize,
     border_anchor: usize,
@@ -2598,15 +2644,24 @@ fn scene_from_buffers<'a>(
                 continue;
             }
         };
-        if let Some(bd) = buf.data::<shm::BufferData>() {
-            let Some(bytes) = bd.bytes() else { continue };
-            let Some(format) = bd.pixel_format() else { continue };
-            let key = bd.cache_key;
-            let (ux, uy, uw, uh) = compute_uv(*vsrc, bd.width, bd.height);
+        if let Some((bytes, meta)) = shm::shm_pixels(buf) {
+            // Cache entry is populated lazily at commit time in
+            // compositor.rs. Missing here would mean we somehow saw a
+            // committed buffer that the commit handler didn't run on
+            // — drop the element rather than allocating a key without
+            // a destruction signal to clean it up.
+            let Some(entry) = state.shm_cache.get(&buf.id()) else {
+                continue;
+            };
+            let key = entry.cache_key;
+            let upload_seq = entry
+                .upload_seq
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let (ux, uy, uw, uh) = compute_uv(*vsrc, meta.width, meta.height);
             scene.elements.push(SceneElement {
                 buffer_key: key,
-                width: bd.width,
-                height: bd.height,
+                width: meta.width,
+                height: meta.height,
                 dst_width: rect.w,
                 dst_height: rect.h,
                 x: rect.x,
@@ -2619,11 +2674,9 @@ fn scene_from_buffers<'a>(
                 corner_radius: *corner_radius,
                 content: SceneContent::Shm {
                     pixels: bytes,
-                    stride: bd.stride,
-                    format,
-                    upload_seq: bd
-                        .upload_seq
-                        .load(std::sync::atomic::Ordering::Relaxed),
+                    stride: meta.stride,
+                    format: meta.format,
+                    upload_seq,
                 },
             });
         } else if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
@@ -3979,6 +4032,7 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     let phase_scene_t = Instant::now();
     let (placed, background_count, border_anchor) = collect_scene(&comp.state, now);
     let mut scene = scene_from_buffers(
+        &comp.state,
         &placed,
         background_count,
         border_anchor,
@@ -3986,8 +4040,12 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
     );
     scene.borders.extend(focus_border(&comp.state));
     let drawn = scene.elements.len();
-    comp.state.metrics.phase_collect_scene_ns +=
-        phase_scene_t.elapsed().as_nanos() as u64;
+    // Capture the elapsed time now but defer the metric write until
+    // the scene's borrow on `comp.state` is released (after the
+    // render arm below). Folding into `Metrics::fold_render_timing`
+    // keeps a similar pattern; this one is a single assignment
+    // rather than a struct-fold, so we keep it inline.
+    let phase_collect_scene_ns = phase_scene_t.elapsed().as_nanos() as u64;
 
     // Phase 5 — render. Hand the Scene to the backend (PNG dump for
     // headless; DRM presenter does texture upload, blur, draw, page
@@ -4075,6 +4133,7 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
             })
         }
     };
+    comp.state.metrics.phase_collect_scene_ns += phase_collect_scene_ns;
     comp.state.metrics.phase_render_ns += phase_render_t.elapsed().as_nanos() as u64;
     render_result?;
 
@@ -4160,9 +4219,16 @@ fn setup_event_loop(
     let mut display: Display<State> = Display::new().context("create wayland display")?;
     let dh = display.handle();
 
+    // Smithay owns the wl_shm global. We construct ShmState first so
+    // its `global()` ID can drop into the rest of `Globals`. ARGB8888
+    // and XRGB8888 are advertised automatically by ShmState::new — no
+    // need to pass them in the formats list.
+    let shm_state = ShmState::new::<State>(&dh, []);
+    let shm_global = shm_state.global();
+
     let globals = Globals {
         compositor: dh.create_global::<State, WlCompositor, ()>(COMPOSITOR_VERSION, ()),
-        shm: dh.create_global::<State, WlShm, ()>(SHM_VERSION, ()),
+        shm: shm_global,
         output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
         seat: dh.create_global::<State, WlSeat, ()>(SEAT_VERSION, ()),
         xdg_wm_base: dh.create_global::<State, XdgWmBase, ()>(XDG_WM_BASE_VERSION, ()),
@@ -4541,6 +4607,8 @@ fn setup_event_loop(
         presentation_seq: 0,
         exec_once_pgids: Vec::new(),
         pending_texture_evictions: Vec::new(),
+        shm_state,
+        shm_cache: std::collections::HashMap::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
         data_devices: Vec::new(),
@@ -5352,8 +5420,8 @@ fn hit_subsurfaces(
 fn surface_buffer_dims(
     buf: &wayland_server::protocol::wl_buffer::WlBuffer,
 ) -> Option<(i32, i32)> {
-    if let Some(bd) = buf.data::<shm::BufferData>() {
-        return Some((bd.width, bd.height));
+    if let Some(dims) = shm::shm_dims(buf) {
+        return Some(dims);
     }
     if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
         return Some((db.width, db.height));

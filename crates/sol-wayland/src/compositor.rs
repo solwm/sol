@@ -304,10 +304,17 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 // upload-skip), but keeping the gate correct here
                 // means we're ready to re-enable a broader skip
                 // path without compositor-side changes.
+                //
+                // Lazily populate the per-buffer cache entry on first
+                // sight: smithay owns the wl_buffer's user-data slot,
+                // so our `cache_key` + `upload_seq` live in a side
+                // table keyed by the buffer's ObjectId. Eviction
+                // happens in `BufferHandler::buffer_destroyed`.
                 if pixels_changed {
                     if let Some(buf) = sd.current.buffer.as_ref() {
-                        if let Some(bd) = buf.data::<crate::shm::BufferData>() {
-                            bd.upload_seq.fetch_add(
+                        if crate::shm::is_shm_buffer(buf) {
+                            let entry = state.shm_cache.entry(buf.id()).or_default();
+                            entry.upload_seq.fetch_add(
                                 1,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
