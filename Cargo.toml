@@ -37,6 +37,14 @@ input = { version = "0.9", features = ["libinput_1_19"] }
 libc = "0.2"
 xkbcommon = "0.8"
 libseat = "0.2"
+# Smithay is being adopted incrementally to replace hand-rolled
+# `wayland-server::Dispatch` impls. PR 0 wires the dep; later PRs
+# migrate one protocol module at a time. Default features are off
+# so each consumer crate opts into exactly the surface area it
+# needs (e.g. `sol-wayland` takes `wayland_frontend` today and
+# `backend_libinput` / `backend_drm` / `backend_session_libseat`
+# in subsequent PRs).
+smithay = { version = "0.7", default-features = false }
 
 sol-backend-drm = { path = "crates/sol-backend-drm" }
 

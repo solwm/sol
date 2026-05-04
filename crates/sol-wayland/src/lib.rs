@@ -15,6 +15,13 @@
     clippy::too_many_arguments
 )]
 
+// Re-export smithay so per-protocol modules can reach it via
+// `crate::smithay::wayland::shm::...` etc as they migrate, without
+// each one needing its own `use smithay::...` and without the rest
+// of the workspace pulling smithay in directly. PR 0 only links it;
+// PR 1 (wl_shm) is the first real consumer.
+pub use smithay;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
