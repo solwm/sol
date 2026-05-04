@@ -42,7 +42,7 @@ use wayland_server::{
     Client, Display, DisplayHandle, Resource, Weak,
     backend::{ClientData, ClientId, DisconnectReason, GlobalId, ObjectId},
     protocol::{
-        wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface,
+        wl_output::WlOutput, wl_surface::WlSurface,
     },
 };
 use smithay::wayland::buffer::BufferHandler;
@@ -51,6 +51,12 @@ use smithay::wayland::compositor::{
     self as smithay_compositor, BufferAssignment, CompositorClientState,
     CompositorHandler, CompositorState, SubsurfaceCachedState, SurfaceAttributes,
 };
+use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, XkbConfig};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
+};
+use smithay::utils::SERIAL_COUNTER;
 
 mod compositor;
 mod config;
@@ -76,7 +82,6 @@ mod viewporter;
 mod xdg_decoration;
 mod xdg_output;
 mod xdg_shell;
-mod xkb;
 
 use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
@@ -88,15 +93,10 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresent
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
-use wayland_server::protocol::{
-    wl_data_device_manager::WlDataDeviceManager,
-    wl_keyboard::{self, WlKeyboard},
-    wl_pointer::{self, WlPointer},
-};
+use wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
-use xkb::KeymapState;
 
 /// Hand out a fresh, never-recycled key for the DRM presenter's
 /// texture cache. Each `shm::BufferData` and `linux_dmabuf::DmabufBuffer`
@@ -114,7 +114,6 @@ pub(crate) fn next_buffer_cache_key() -> u64 {
 }
 
 const OUTPUT_VERSION: u32 = 4;
-const SEAT_VERSION: u32 = 8;
 const XDG_WM_BASE_VERSION: u32 = 5;
 
 /// Screen-space rectangle assigned to a mapped window by the layout.
@@ -369,14 +368,25 @@ pub struct State {
     pub next_serial: u32,
     pub cursor: Cursor,
     pub input: Option<InputState>,
-    pub keymap: Option<KeymapState>,
-    /// wl_pointer resources bound by clients. Cleaned on each tick.
-    pub pointers: Vec<WlPointer>,
-    /// wl_keyboard resources bound by clients.
-    pub keyboards: Vec<WlKeyboard>,
-    /// Surface currently under the cursor, if any.
+    /// Smithay's seat state. Owns the wl_seat global, the per-keyboard
+    /// xkb context, and the per-pointer focus tracking.
+    pub seat_state: SeatState<State>,
+    /// The compositor's single seat. Cloneable; we stash it here so
+    /// `apply_input` and helpers can reach it without threading.
+    pub seat: Seat<State>,
+    /// `KeyboardHandle` returned by `seat.add_keyboard`. None until
+    /// libinput is wired up (DRM backend); headless never adds one.
+    pub keyboard: Option<KeyboardHandle<State>>,
+    /// `PointerHandle` returned by `seat.add_pointer`. Same gating
+    /// as `keyboard`.
+    pub pointer: Option<PointerHandle<State>>,
+    /// Surface currently under the cursor, if any. Mirror of smithay's
+    /// per-pointer focus that we update on every `pointer.motion` so
+    /// readers (popup-grab dismiss, focus-on-click, etc.) don't have
+    /// to crack open the PointerHandle.
     pub pointer_focus: Option<WlSurface>,
-    /// Surface currently receiving keyboard events.
+    /// Surface currently receiving keyboard events. Mirror of smithay's
+    /// keyboard focus, written from `set_keyboard_focus`.
     pub keyboard_focus: Option<WlSurface>,
     /// wl_callback objects clients requested via wl_surface.frame and are
     /// waiting on. We stash them here during commit and fire them from the
@@ -994,53 +1004,26 @@ impl State {
         self.set_keyboard_focus(Some(surface.clone()));
     }
 
-    /// Serialise `pressed_keys` for `wl_keyboard.enter`. Each evdev
-    /// keycode goes out as 4 native-endian bytes — the wire format
-    /// for Wayland `array<u32>`. Order is unspecified by the spec
-    /// (the client just needs the set), so we don't sort.
-    pub(crate) fn pressed_keys_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.pressed_keys.len() * 4);
-        for &k in &self.pressed_keys {
-            bytes.extend_from_slice(&k.to_ne_bytes());
-        }
-        bytes
-    }
-
+    /// Set keyboard focus to the given surface. Smithay's
+    /// `KeyboardHandle::set_focus` does the wl_keyboard.leave +
+    /// wl_keyboard.enter + wl_keyboard.modifiers wire dispatch; the
+    /// per-client modifier state comes from smithay's xkb that
+    /// `KeyboardHandle::input_intercept` keeps in sync with each
+    /// physical key event in `apply_input`. The mirror in
+    /// `state.keyboard_focus` is updated by `SeatHandler::focus_changed`
+    /// (smithay calls back into us as part of `set_focus`).
     pub fn set_keyboard_focus(&mut self, new: Option<WlSurface>) {
         if surface_eq(self.keyboard_focus.as_ref(), new.as_ref()) {
             return;
         }
-        if let Some(old) = self.keyboard_focus.take() {
-            if old.is_alive() {
-                let serial = self.next_serial();
-                for kb in &self.keyboards {
-                    if same_client(kb, &old) {
-                        kb.leave(serial, &old);
-                    }
-                }
-            }
-        }
-        if let Some(new) = new.as_ref() {
-            let serial = self.next_serial();
-            let keys = self.pressed_keys_bytes();
-            for kb in &self.keyboards {
-                if same_client(kb, new) {
-                    kb.enter(serial, new, keys.clone());
-                    // Send current modifier state so the client starts with
-                    // a correct shift/ctrl/etc view of the world.
-                    if let Some(km) = self.keymap.as_ref() {
-                        use xkbcommon::xkb as x;
-                        let serial = self.next_serial_const();
-                        kb.modifiers(
-                            serial,
-                            km.state.serialize_mods(x::STATE_MODS_DEPRESSED),
-                            km.state.serialize_mods(x::STATE_MODS_LATCHED),
-                            km.state.serialize_mods(x::STATE_MODS_LOCKED),
-                            km.state.serialize_layout(x::STATE_LAYOUT_EFFECTIVE),
-                        );
-                    }
-                }
-            }
+        if let Some(kbd) = self.keyboard.clone() {
+            let serial = SERIAL_COUNTER.next_serial();
+            kbd.set_focus(self, new.clone(), serial);
+        } else {
+            // No keyboard handle (headless): just mirror the focus
+            // ourselves so the rest of the codebase reads what it
+            // expects.
+            self.keyboard_focus = new.clone();
         }
         // Remember the focused tile's slot per workspace if it's a
         // STACK tile (any tile that isn't the master / first entry
@@ -1056,8 +1039,6 @@ impl State {
                 }
             }
         }
-
-        self.keyboard_focus = new;
     }
 
     /// If `surface` is a tiled toplevel, return its workspace and
@@ -1079,72 +1060,46 @@ impl State {
         None
     }
 
-    // Cheeky: hand back the current `next_serial` without mutating. Only
-    // used inside `set_keyboard_focus` where we just bumped it above and
-    // need a second matching value for the modifiers event.
-    fn next_serial_const(&self) -> u32 {
-        self.next_serial
-    }
 
     /// Send `wl_keyboard.leave` to the focused client without
-    /// touching `keyboard_focus`. Used by `resize_mode` to suspend
-    /// key delivery while still remembering which surface should
-    /// regain focus on exit. Per spec, leave releases all currently
-    /// pressed keys for that surface, so the client's view of held
-    /// modifiers is reset — we re-broadcast modifier state on
-    /// `keyboard_resume_focused`.
+    /// updating our `keyboard_focus` mirror. Used by `resize_mode`
+    /// to suspend key delivery while still remembering which surface
+    /// should regain focus on exit.
+    ///
+    /// Implementation: clear smithay's keyboard focus (sends leave),
+    /// then write the pre-leave focus back into our mirror so
+    /// `keyboard_resume_focused` knows where to re-target.
     pub fn keyboard_suspend_focused(&mut self) {
         let Some(focus) = self.keyboard_focus.clone() else { return };
         if !focus.is_alive() {
             return;
         }
-        let serial = self.next_serial();
-        for kb in &self.keyboards {
-            if same_client(kb, &focus) {
-                kb.leave(serial, &focus);
-            }
+        if let Some(kbd) = self.keyboard.clone() {
+            let serial = SERIAL_COUNTER.next_serial();
+            kbd.set_focus(self, None, serial);
         }
+        // `focus_changed` callback wrote `keyboard_focus = None`;
+        // restore the mirror so resume() finds the surface.
+        self.keyboard_focus = Some(focus);
     }
 
     /// Counterpart of `keyboard_suspend_focused`: re-attach the
-    /// `wl_keyboard` to `keyboard_focus` and re-send modifier state
-    /// from xkb so a still-physically-held modifier doesn't leave
-    /// the client thinking modifiers are clear when they aren't.
-    /// Empty pressed-keys list — anything actually held by the user
-    /// will produce a release event on the next physical action,
-    /// which clients are tolerant of.
+    /// keyboard to the saved focus surface. Smithay's `set_focus`
+    /// sends enter + modifiers automatically with the right state.
     pub fn keyboard_resume_focused(&mut self) {
         let Some(focus) = self.keyboard_focus.clone() else { return };
         if !focus.is_alive() {
             return;
         }
-        let serial = self.next_serial();
-        let keys = self.pressed_keys_bytes();
-        for kb in &self.keyboards {
-            if same_client(kb, &focus) {
-                kb.enter(serial, &focus, keys.clone());
-            }
+        if let Some(kbd) = self.keyboard.clone() {
+            // Clear our mirror first so set_focus's "no-change" check
+            // (in case smithay's internal focus is also None) doesn't
+            // short-circuit. Smithay's `focus_changed` will rewrite
+            // the mirror to Some(focus) on success.
+            self.keyboard_focus = None;
+            let serial = SERIAL_COUNTER.next_serial();
+            kbd.set_focus(self, Some(focus), serial);
         }
-        if let Some(km) = self.keymap.as_ref() {
-            use xkbcommon::xkb as x;
-            let depressed = km.state.serialize_mods(x::STATE_MODS_DEPRESSED);
-            let latched = km.state.serialize_mods(x::STATE_MODS_LATCHED);
-            let locked = km.state.serialize_mods(x::STATE_MODS_LOCKED);
-            let group = km.state.serialize_layout(x::STATE_LAYOUT_EFFECTIVE);
-            let mods_serial = self.next_serial();
-            for kb in &self.keyboards {
-                if same_client(kb, &focus) {
-                    kb.modifiers(mods_serial, depressed, latched, locked, group);
-                }
-            }
-        }
-    }
-}
-
-fn same_client<A: Resource, B: Resource>(a: &A, b: &B) -> bool {
-    match (a.client(), b.client()) {
-        (Some(ca), Some(cb)) => ca.id() == cb.id(),
-        _ => false,
     }
 }
 
@@ -1279,6 +1234,56 @@ impl IdleInhibitHandler for State {
 }
 
 smithay::delegate_idle_inhibit!(State);
+
+// Smithay seat wiring. `delegate_seat!` claims the wl_seat,
+// wl_pointer, wl_keyboard, wl_touch Dispatch impls. We drive
+// keyboard/pointer events into the corresponding handles from
+// `apply_input`. `cursor_image` is smithay's notification of
+// `wl_pointer.set_cursor` — replaces the SetCursor branch in our
+// previous hand-rolled `Dispatch<WlPointer>` impl.
+impl SeatHandler for State {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<State> {
+        &mut self.seat_state
+    }
+
+    fn focus_changed(&mut self, _seat: &Seat<State>, focused: Option<&WlSurface>) {
+        // Mirror smithay's keyboard focus into `state.keyboard_focus`
+        // so the dozens of reader sites in the rest of this file stay
+        // unchanged. `set_keyboard_focus` is the only writer that
+        // calls `keyboard.set_focus(...)` (which routes here), so the
+        // mirror stays consistent without us forwarding the focus
+        // value twice.
+        self.keyboard_focus = focused.cloned();
+    }
+
+    fn cursor_image(&mut self, _seat: &Seat<State>, image: CursorImageStatus) {
+        // Replaces the `wl_pointer::Request::SetCursor` branch in the
+        // pre-PR-5 seat.rs. Surface = client-supplied cursor surface;
+        // Hidden = client wants the cursor invisible; Named =
+        // client requested the default sprite.
+        match image {
+            CursorImageStatus::Surface(surface) => {
+                self.cursor.client_override_active = true;
+                self.cursor.client_surface = Some(surface.downgrade());
+            }
+            CursorImageStatus::Hidden => {
+                self.cursor.client_override_active = true;
+                self.cursor.client_surface = None;
+            }
+            CursorImageStatus::Named(_) => {
+                self.cursor.client_override_active = false;
+                self.cursor.client_surface = None;
+            }
+        }
+        self.needs_render = true;
+    }
+}
+
+smithay::delegate_seat!(State);
 
 /// Backend-specific render target. Chosen at startup; does not switch at
 /// runtime. `DrmPresenter` is boxed because it carries the Vulkan
@@ -2090,18 +2095,16 @@ fn apply_config_reload(state: &mut State) {
     );
     state.config = new_cfg;
 
-    // wl_keyboard.repeat_info is allowed to be re-sent at any time, so
-    // push the new rate/delay to every already-bound keyboard. Dead
-    // keyboards are skipped via is_alive. Clients pick the new values
-    // up on their next keypress — no event loop dance needed.
+    // wl_keyboard.repeat_info is allowed to be re-sent at any time;
+    // smithay's `change_repeat_info` walks every bound v4+ wl_keyboard
+    // and pushes the new rate/delay. Clients pick it up on their
+    // next keypress — no event loop dance needed.
     if kb_repeat_changed {
-        for kb in state.keyboards.iter() {
-            if kb.version() >= 4 && kb.is_alive() {
-                kb.repeat_info(
-                    state.config.keyboard_repeat_rate,
-                    state.config.keyboard_repeat_delay,
-                );
-            }
+        if let Some(kbd) = state.keyboard.as_ref() {
+            kbd.change_repeat_info(
+                state.config.keyboard_repeat_rate,
+                state.config.keyboard_repeat_delay,
+            );
         }
     }
 
@@ -4551,11 +4554,35 @@ fn setup_event_loop(
     let compositor_global = compositor_state.compositor_global();
     let subcompositor_global = compositor_state.subcompositor_global();
 
+    // Smithay owns the wl_seat global. We add keyboard/pointer
+    // capabilities below once we know whether libinput is wired up
+    // (DRM mode). Headless leaves the seat with empty caps — same
+    // behaviour as the pre-PR-5 hand-rolled bind.
+    let mut seat_state: SeatState<State> = SeatState::new();
+    let mut seat = seat_state.new_wl_seat(&dh, "seat0");
+    let seat_global = seat.global().expect("new_wl_seat global");
+    let mut keyboard_handle: Option<KeyboardHandle<State>> = None;
+    let mut pointer_handle: Option<PointerHandle<State>> = None;
+    if input.is_some() {
+        match seat.add_keyboard(
+            XkbConfig {
+                layout: "us",
+                ..XkbConfig::default()
+            },
+            cfg.keyboard_repeat_delay,
+            cfg.keyboard_repeat_rate,
+        ) {
+            Ok(kb) => keyboard_handle = Some(kb),
+            Err(e) => tracing::warn!(error = ?e, "seat.add_keyboard failed"),
+        }
+        pointer_handle = Some(seat.add_pointer());
+    }
+
     let globals = Globals {
         compositor: compositor_global,
         shm: shm_global,
         output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
-        seat: dh.create_global::<State, WlSeat, ()>(SEAT_VERSION, ()),
+        seat: seat_global,
         xdg_wm_base: dh.create_global::<State, XdgWmBase, ()>(XDG_WM_BASE_VERSION, ()),
         linux_dmabuf: dh.create_global::<State, ZwpLinuxDmabufV1, ()>(
             linux_dmabuf::DMABUF_VERSION,
@@ -4841,19 +4868,6 @@ fn setup_event_loop(
     }
 
     let cursor = Cursor::new(screen_width as f64 / 2.0, screen_height as f64 / 2.0);
-    // Only build the keymap when we have libinput. Headless has no keys to
-    // translate and no clients to hand the fd to in any useful way.
-    let keymap = if input_state.is_some() {
-        match KeymapState::new_us() {
-            Ok(km) => Some(km),
-            Err(e) => {
-                tracing::warn!(error = %e, "xkb keymap init failed; keyboard input disabled");
-                None
-            }
-        }
-    } else {
-        None
-    };
     let state = State {
         display_handle: dh,
         globals,
@@ -4885,9 +4899,10 @@ fn setup_event_loop(
         next_serial: 0,
         cursor,
         input: input_state,
-        keymap,
-        pointers: Vec::new(),
-        keyboards: Vec::new(),
+        seat_state,
+        seat,
+        keyboard: keyboard_handle,
+        pointer: pointer_handle,
         pointer_focus: None,
         keyboard_focus: None,
         pending_frame_callbacks: Vec::new(),
@@ -5119,9 +5134,9 @@ fn handle_session_event(comp: &mut Compositor, ev: session::SessionEvent) {
 /// Wayland client based on current focus.
 fn apply_input(state: &mut State, ev: InputEvent) {
     state.metrics.input_events += 1;
-    // Drop dead resources so we don't try to send to them.
-    state.pointers.retain(|p| p.is_alive());
-    state.keyboards.retain(|k| k.is_alive());
+    // Smithay's KeyboardHandle / PointerHandle track their bound
+    // wl_keyboard / wl_pointer resources internally and prune dead
+    // ones automatically — no per-tick `retain` needed.
 
     match ev {
         InputEvent::PointerMotion { dx, dy } => {
@@ -5202,7 +5217,19 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             // mod is held, and the modifier event we re-send to
             // the client on resume would be wrong.
             if state.resize_mode {
-                let _ = state.keymap.as_mut().map(|km| km.feed_key(keycode, pressed));
+                if let Some(kbd) = state.keyboard.clone() {
+                    let xkb_code =
+                        smithay::input::keyboard::Keycode::new(keycode + 8);
+                    let kstate = if pressed {
+                        smithay::backend::input::KeyState::Pressed
+                    } else {
+                        smithay::backend::input::KeyState::Released
+                    };
+                    // input_intercept updates smithay's xkb without
+                    // forwarding to any client.
+                    let _: ((), bool) =
+                        kbd.input_intercept(state, xkb_code, kstate, |_, _, _| ());
+                }
                 if pressed {
                     match keycode {
                         KEY_ESC => {
@@ -5751,71 +5778,46 @@ fn update_pointer_focus_and_motion(state: &mut State) {
     let hit = surface_under_cursor(state);
     let new_focus = hit.as_ref().map(|(s, _, _)| s.clone());
     let focus_changed = !surface_eq(state.pointer_focus.as_ref(), new_focus.as_ref());
-
     if focus_changed {
         // Per `wl_pointer.set_cursor` spec, the client's cursor
         // choice is bound to the surface that received the most
         // recent `enter` event — the moment the pointer leaves, we
-        // revert to the default sprite. The new client gets the
-        // chance to call set_cursor itself after its own enter.
+        // revert to the default sprite. (Smithay's `cursor_image`
+        // callback re-asserts the override the next time the new
+        // client calls set_cursor.)
         state.cursor.client_override_active = false;
         state.cursor.client_surface = None;
-        if let Some(old) = state.pointer_focus.take() {
-            if old.is_alive() {
-                let serial = state.next_serial();
-                for p in &state.pointers {
-                    if same_client(p, &old) {
-                        p.leave(serial, &old);
-                        pointer_frame(p);
-                    }
-                }
-            }
-        }
-        if let Some((surface, lx, ly)) = hit.as_ref() {
-            let serial = state.next_serial();
-            for p in &state.pointers {
-                if same_client(p, surface) {
-                    p.enter(serial, surface, *lx, *ly);
-                    pointer_frame(p);
-                }
-            }
-        }
-        state.pointer_focus = new_focus;
-    } else if let Some((surface, lx, ly)) = hit.as_ref() {
-        // Ordinary motion within the same surface.
-        let time = state.elapsed_ms();
-        for p in &state.pointers {
-            if same_client(p, surface) {
-                p.motion(time, *lx, *ly);
-                pointer_frame(p);
-            }
-        }
     }
-}
+    state.pointer_focus = new_focus.clone();
 
-fn pointer_frame(p: &WlPointer) {
-    if p.version() >= 5 {
-        p.frame();
-    }
+    // Hand off to smithay's PointerHandle: it tracks per-client
+    // wl_pointer resources and emits enter/leave/motion + frame
+    // grouping based on the focus/location pair we hand it. None
+    // pointer (headless) skips event delivery; we still maintain
+    // `state.pointer_focus` for the rest of the codebase.
+    let Some(pointer) = state.pointer.clone() else { return };
+    let now_ms = state.elapsed_ms();
+    let cursor = (state.cursor.pos_x, state.cursor.pos_y).into();
+    let focus = hit.as_ref().map(|(s, lx, ly)| (s.clone(), (*lx, *ly).into()));
+    pointer.motion(
+        state,
+        focus,
+        &MotionEvent {
+            location: cursor,
+            serial: SERIAL_COUNTER.next_serial(),
+            time: now_ms,
+        },
+    );
+    pointer.frame(state);
 }
 
 /// Forward a libinput scroll event to the focused client as a
 /// wl_pointer axis frame. Scroll always targets the surface currently
-/// under the cursor (`pointer_focus`) — it does not change focus.
-///
-/// Wire format:
-///   - v5+: axis_source(source)
-///   - for each axis with data:
-///       * if the value is 0 and the source is a kinetic one (Finger /
-///         Continuous), emit axis_stop — this is libinput's contract
-///         for end-of-gesture and clients use it to trigger kinetic
-///         deceleration
-///       * otherwise emit axis(time, axis, value)
-///   - wheel sources additionally emit high-res step info:
-///       * v8+: axis_value120(axis, v120) — preferred
-///       * v5..=v7: axis_discrete(axis, v120 / 120) — best-effort
-///         fallback; loses sub-click resolution
-///   - v5+: frame() to commit the group
+/// under the cursor — `PointerHandle` knows that surface internally
+/// from the most recent `motion`, so we don't pass it. Smithay's
+/// `axis(AxisFrame)` issues `axis_source` / `axis` / `axis_stop` /
+/// `axis_value120` / `axis_discrete` based on what's set in the
+/// frame and the bound wl_pointer's version.
 fn send_pointer_axis(
     state: &mut State,
     source: AxisSource,
@@ -5824,63 +5826,39 @@ fn send_pointer_axis(
     v120_v: Option<f64>,
     v120_h: Option<f64>,
 ) {
-    let Some(focus) = state.pointer_focus.clone() else { return };
-    if !focus.is_alive() {
-        return;
-    }
+    let Some(pointer) = state.pointer.clone() else { return };
     let time = state.elapsed_ms();
-    let wl_source = match source {
-        AxisSource::Wheel => wl_pointer::AxisSource::Wheel,
-        AxisSource::Finger => wl_pointer::AxisSource::Finger,
-        AxisSource::Continuous => wl_pointer::AxisSource::Continuous,
+    let smithay_source = match source {
+        AxisSource::Wheel => smithay::backend::input::AxisSource::Wheel,
+        AxisSource::Finger => smithay::backend::input::AxisSource::Finger,
+        AxisSource::Continuous => smithay::backend::input::AxisSource::Continuous,
     };
     let kinetic = matches!(source, AxisSource::Finger | AxisSource::Continuous);
-    for p in &state.pointers {
-        if !same_client(p, &focus) {
-            continue;
+    let mut frame = AxisFrame::new(time).source(smithay_source);
+    if let Some(val) = v_value {
+        if val == 0.0 && kinetic {
+            frame = frame.stop(smithay::backend::input::Axis::Vertical);
+        } else {
+            frame = frame.value(smithay::backend::input::Axis::Vertical, val);
         }
-        let v = p.version();
-        if v >= 5 {
-            p.axis_source(wl_source);
-        }
-        if let Some(val) = v_value {
-            if val == 0.0 && kinetic && v >= 5 {
-                p.axis_stop(time, wl_pointer::Axis::VerticalScroll);
-            } else {
-                p.axis(time, wl_pointer::Axis::VerticalScroll, val);
-            }
-        }
-        if let Some(val) = h_value {
-            if val == 0.0 && kinetic && v >= 5 {
-                p.axis_stop(time, wl_pointer::Axis::HorizontalScroll);
-            } else {
-                p.axis(time, wl_pointer::Axis::HorizontalScroll, val);
-            }
-        }
-        if matches!(source, AxisSource::Wheel) {
-            if let Some(step) = v120_v {
-                if v >= 8 {
-                    p.axis_value120(wl_pointer::Axis::VerticalScroll, step as i32);
-                } else if v >= 5 {
-                    let discrete = (step / 120.0).round() as i32;
-                    if discrete != 0 {
-                        p.axis_discrete(wl_pointer::Axis::VerticalScroll, discrete);
-                    }
-                }
-            }
-            if let Some(step) = v120_h {
-                if v >= 8 {
-                    p.axis_value120(wl_pointer::Axis::HorizontalScroll, step as i32);
-                } else if v >= 5 {
-                    let discrete = (step / 120.0).round() as i32;
-                    if discrete != 0 {
-                        p.axis_discrete(wl_pointer::Axis::HorizontalScroll, discrete);
-                    }
-                }
-            }
-        }
-        pointer_frame(p);
     }
+    if let Some(val) = h_value {
+        if val == 0.0 && kinetic {
+            frame = frame.stop(smithay::backend::input::Axis::Horizontal);
+        } else {
+            frame = frame.value(smithay::backend::input::Axis::Horizontal, val);
+        }
+    }
+    if matches!(source, AxisSource::Wheel) {
+        if let Some(step) = v120_v {
+            frame = frame.v120(smithay::backend::input::Axis::Vertical, step as i32);
+        }
+        if let Some(step) = v120_h {
+            frame = frame.v120(smithay::backend::input::Axis::Horizontal, step as i32);
+        }
+    }
+    pointer.axis(state, frame);
+    pointer.frame(state);
 }
 
 /// True if the cursor's current focus surface is one of our mapped
@@ -6014,69 +5992,55 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
     if pressed && !is_popup_click {
         state.set_keyboard_focus(Some(focus.clone()));
     }
-    let serial = state.next_serial();
+    let Some(pointer) = state.pointer.clone() else { return };
     let time = state.elapsed_ms();
+    let serial = SERIAL_COUNTER.next_serial();
     let button_state = if pressed {
-        wl_pointer::ButtonState::Pressed
+        smithay::backend::input::ButtonState::Pressed
     } else {
-        wl_pointer::ButtonState::Released
+        smithay::backend::input::ButtonState::Released
     };
-    for p in &state.pointers {
-        if same_client(p, &focus) {
-            p.button(serial, time, button, button_state);
-            pointer_frame(p);
-        }
-    }
+    pointer.button(
+        state,
+        &ButtonEvent {
+            button,
+            state: button_state,
+            serial,
+            time,
+        },
+    );
+    pointer.frame(state);
 }
 
+/// Feed a libinput key event into smithay's keyboard. `intercept`
+/// always runs to keep smithay's xkb / pressed-keys state in sync
+/// with physical reality (so a modifier release while focus is dead
+/// doesn't leave xkb thinking it's still held); `forward` runs only
+/// when we want the event delivered to the focused client. Sol's
+/// keybind dispatch in `apply_input` early-returns before calling
+/// this when a binding eats the keypress, so binding handlers
+/// don't accidentally double-dispatch.
 fn send_keyboard_key(state: &mut State, keycode: u32, pressed: bool) {
-    // Always feed the key to xkb — even when focus is dead or missing —
-    // so the modifier state stays consistent with the physical
-    // keyboard. If we skipped the release of a modifier because the
-    // focused client had just died (e.g. user typed Ctrl+D, the shell
-    // exited, the Ctrl release event then arrived with no live focus),
-    // xkb would think that modifier is still held forever. The next
-    // focused client would then receive a `modifiers` event with
-    // stale depressed bits and misinterpret every subsequent keystroke
-    // as Ctrl+<whatever>.
-    let mods = state
-        .keymap
-        .as_mut()
-        .map(|km| km.feed_key(keycode, pressed));
-
-    let Some(focus) = state.keyboard_focus.clone() else { return };
-    if !focus.is_alive() {
-        return;
-    }
+    let Some(kbd) = state.keyboard.clone() else { return };
     let time = state.elapsed_ms();
     let key_state = if pressed {
-        wl_keyboard::KeyState::Pressed
+        smithay::backend::input::KeyState::Pressed
     } else {
-        wl_keyboard::KeyState::Released
+        smithay::backend::input::KeyState::Released
     };
-
-    if let Some(mods) = mods {
-        let changed = state
-            .keymap
-            .as_mut()
-            .map(|km| km.mods_changed(mods))
-            .unwrap_or(false);
-        if changed {
-            let serial = state.next_serial();
-            for kb in &state.keyboards {
-                if same_client(kb, &focus) {
-                    kb.modifiers(serial, mods.depressed, mods.latched, mods.locked, mods.group);
-                }
-            }
-        }
-    }
-
-    let serial = state.next_serial();
-    for kb in &state.keyboards {
-        if same_client(kb, &focus) {
-            kb.key(serial, time, keycode, key_state);
-        }
-    }
+    // libinput emits evdev keycodes (0-based); xkbcommon adds 8 for
+    // the X11 wire convention. Smithay's keyboard handle takes the
+    // xkb keycode; on send to wl_keyboard.key it subtracts 8 again.
+    let xkb_code = smithay::input::keyboard::Keycode::new(keycode + 8);
+    let serial = SERIAL_COUNTER.next_serial();
+    let _: Option<()> = kbd.input(
+        state,
+        xkb_code,
+        key_state,
+        serial,
+        time,
+        |_, _, _| FilterResult::Forward,
+    );
 }
 
 /// Headless backend: software canvas, dumps a PNG every frame.
