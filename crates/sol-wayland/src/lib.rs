@@ -1007,6 +1007,11 @@ impl State {
     }
 
     pub fn set_keyboard_focus(&mut self, new: Option<WlSurface>) {
+        tracing::info!(
+            new = ?new.as_ref().map(|s| s.id()),
+            kb_count = self.keyboards.len(),
+            "set_keyboard_focus called"
+        );
         if surface_eq(self.keyboard_focus.as_ref(), new.as_ref()) {
             return;
         }
@@ -1023,8 +1028,10 @@ impl State {
         if let Some(new) = new.as_ref() {
             let serial = self.next_serial();
             let keys = self.pressed_keys_bytes();
+            let mut sent = 0;
             for kb in &self.keyboards {
                 if same_client(kb, new) {
+                    sent += 1;
                     kb.enter(serial, new, keys.clone());
                     // Send current modifier state so the client starts with
                     // a correct shift/ctrl/etc view of the world.
@@ -1041,6 +1048,7 @@ impl State {
                     }
                 }
             }
+            tracing::info!(sent_enter_to = sent, "set_keyboard_focus dispatched");
         }
         // Remember the focused tile's slot per workspace if it's a
         // STACK tile (any tile that isn't the master / first entry
@@ -1363,13 +1371,25 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
     use std::sync::atomic::Ordering;
 
     // Phase 1 — single pass through smithay's cached_state. Drains
-    // damage and frame_callbacks, takes the buffer assignment, reads
-    // the subsurface offset, and updates our SolSurfaceData under the
-    // surface's outer Mutex (which smithay already holds for us
-    // inside this closure). Captures the role + new current_buffer
-    // for downstream phases that need them without re-entering.
+    // damage and frame_callbacks, reads the (already merged) buffer
+    // assignment, reads the subsurface offset, and updates our
+    // SolSurfaceData under the surface's outer Mutex (which smithay
+    // already holds for us inside this closure). Captures the role +
+    // new current_buffer for downstream phases.
+    //
+    // We do NOT `.take()` the SurfaceAttributes::buffer field —
+    // smithay's `merge_into` (handlers.rs:125) reads `into.buffer`
+    // (the old current value) to decide whether to fire
+    // `wl_buffer.release` when the next attach replaces it. Clearing
+    // it here would short-circuit that release path, leading to the
+    // client's swapchain running out of free buffers and the window
+    // stalling (or visibly stretching while still on its old buffer).
+    // Instead we mirror the assignment into our own
+    // `SolSurfaceData::current_buffer` and detect "fresh attach this
+    // commit" by comparing the WlBuffer ID against our previous
+    // mirrored value.
     struct Snapshot {
-        buffer_assignment: Option<BufferAssignment>,
+        attached_now: bool,
         damaged_now: bool,
         frame_callbacks: Vec<wayland_server::protocol::wl_callback::WlCallback>,
         role: SurfaceRole,
@@ -1378,7 +1398,11 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
     let snap = smithay_compositor::with_states(surface, |states| {
         let mut attrs_guard = states.cached_state.get::<SurfaceAttributes>();
         let attrs = attrs_guard.current();
-        let buffer_assignment = attrs.buffer.take();
+        let buffer_now: Option<wayland_server::protocol::wl_buffer::WlBuffer> =
+            match &attrs.buffer {
+                Some(BufferAssignment::NewBuffer(b)) => Some(b.clone()),
+                Some(BufferAssignment::Removed) | None => None,
+            };
         let damaged_now = !attrs.damage.is_empty();
         attrs.damage.clear();
         let frame_callbacks = std::mem::take(&mut attrs.frame_callbacks);
@@ -1393,35 +1417,29 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
             .get::<Mutex<compositor::SolSurfaceData>>()
             .expect("SolSurfaceData missing — did new_surface run?");
         let mut sd = sd_arc.lock().unwrap();
-        match &buffer_assignment {
-            Some(BufferAssignment::NewBuffer(buf)) => {
-                sd.current_buffer = Some(buf.clone());
-            }
-            Some(BufferAssignment::Removed) => {
-                sd.current_buffer = None;
-            }
-            None => {
-                // No attach this commit (frame-callback ack /
-                // ack_configure). Leave current_buffer untouched.
-            }
-        }
+        // Compare new vs prev to detect "fresh attach this commit".
+        // Smithay's merge_into only updates current.buffer when the
+        // client's pending state had a buffer assignment, so a
+        // difference here always corresponds to a real attach (or a
+        // NULL-attach unmap).
+        let attached_now = match (sd.current_buffer.as_ref(), buffer_now.as_ref()) {
+            (Some(a), Some(b)) => a.id() != b.id(),
+            (None, Some(_)) | (Some(_), None) => true,
+            (None, None) => false,
+        };
+        sd.current_buffer = buffer_now.clone();
         sd.subsurface_offset = (ss_loc.x, ss_loc.y);
         let role = sd.role.clone();
-        let new_current_buffer = sd.current_buffer.clone();
         Snapshot {
-            buffer_assignment,
+            attached_now,
             damaged_now,
             frame_callbacks,
             role,
-            new_current_buffer,
+            new_current_buffer: buffer_now,
         }
     });
 
-    let attached_now = matches!(
-        snap.buffer_assignment,
-        Some(BufferAssignment::NewBuffer(_)) | Some(BufferAssignment::Removed)
-    );
-    let pixels_changed = attached_now || snap.damaged_now;
+    let pixels_changed = snap.attached_now || snap.damaged_now;
 
     // Phase 2 — bump shm_cache upload_seq when the client signalled a
     // real pixel change. The cache is currently cursor-only anyway
@@ -1572,6 +1590,7 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
         crate::layer_shell::send_initial_configure(state, surface);
     }
     if just_mapped_toplevel {
+        tracing::info!(id = ?surface.id(), "commit_surface: just_mapped_toplevel → on_toplevel_mapped");
         state.on_toplevel_mapped(surface);
     }
 
@@ -2323,7 +2342,7 @@ fn send_pending_configures(state: &mut State) {
         tl.configure(w, h, state_bytes.clone());
         xs.configure(serial);
         state.mapped_toplevels[i].pending_size = Some((w, h));
-        tracing::debug!(
+        tracing::info!(
             tile_index = i,
             width = w,
             height = h,
