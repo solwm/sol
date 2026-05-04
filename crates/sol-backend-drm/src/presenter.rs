@@ -572,16 +572,16 @@ impl DrmPresenter {
         // Each pair of barriers transitions the texture between
         // SHADER_READ_ONLY and TRANSFER_DST.
         self.textures.record_uploads(self.command_buffer, timing);
-        // Per-frame FOREIGN_EXT acquire on every client dmabuf actually
-        // sampled this frame. Honours the producer's dma-buf fence so
-        // we don't read partial writes — without it, Chrome's video
-        // can tear at the per-buffer level. Cheap (one barrier batch
-        // per frame regardless of buffer count).
-        self.textures.record_dmabuf_acquires(
-            scene,
-            self.command_buffer,
-            self.stack.queue_family,
-        );
+        // NOTE: we deliberately do *not* issue a per-frame FOREIGN_EXT
+        // acquire barrier on client dmabuf imports. Implicit-sync on
+        // dma-bufs is handled inside the Vulkan importer (Mesa and
+        // NVIDIA both honour the dma-buf fence on first read after
+        // creation), and adding an extra acquire per frame turned out
+        // to (a) serialise on NVIDIA in a way that interacts badly
+        // with the SHM upload-skip path — both wlroots and smithay
+        // omit this barrier for the same reason. The scan-out
+        // FOREIGN_EXT release/acquire below is still in place; that
+        // one is necessary for tearing-free output.
         if let Some(g) = self.gpu_timings.as_ref() {
             g.cmd_after_uploads(self.command_buffer);
         }
