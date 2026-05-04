@@ -5891,6 +5891,37 @@ fn pointer_focus_in_popup_chain(state: &State) -> bool {
     false
 }
 
+/// Walk from `surface` up through `subsurface_parent` chains until we
+/// reach a surface whose role is NOT a subsurface — i.e. the
+/// role-bearing root (XdgToplevel / LayerSurface / XdgPopup). Returns
+/// `None` if the surface is dead or the walk never finds a roleful
+/// ancestor (shouldn't happen in practice). Used by click-to-focus
+/// so we never set keyboard focus to a transient subsurface that's
+/// about to be destroyed.
+fn root_focus_target(surface: &WlSurface) -> Option<WlSurface> {
+    let mut cur = surface.clone();
+    // Bound the walk to defend against any cyclic (illegal) topology;
+    // 16 levels is generous.
+    for _ in 0..16 {
+        if !cur.is_alive() {
+            return None;
+        }
+        let next = compositor::with_sol_data(&cur, |sd| match sd.role {
+            SurfaceRole::Subsurface => sd
+                .subsurface_parent
+                .as_ref()
+                .and_then(|w| w.upgrade().ok()),
+            _ => None,
+        })
+        .flatten();
+        match next {
+            Some(parent) => cur = parent,
+            None => return Some(cur),
+        }
+    }
+    None
+}
+
 fn surface_in_subtree(root: &WlSurface, target: &WlSurface) -> bool {
     let Some(children) = compositor::with_sol_data(root, |sd| {
         sd.subsurface_children
@@ -6006,7 +6037,20 @@ fn send_pointer_button(state: &mut State, button: u32, pressed: bool) {
         s == focus || surface_in_subtree(&s, &focus)
     });
     if pressed && !is_popup_click {
-        state.set_keyboard_focus(Some(focus.clone()));
+        // Walk up from whatever was hit (potentially a subsurface
+        // Chrome / VS Code / Firefox briefly create for transient
+        // hit targets) to the role-bearing root toplevel or layer
+        // surface. Setting keyboard focus to a subsurface that's
+        // about to be destroyed produces a leave/enter dance on the
+        // owning toplevel, which Chrome's input pipeline interprets
+        // as "lost focus" — and our subsequent enter doesn't
+        // re-assert ACTIVATED via xdg_toplevel.configure, so Chrome
+        // stays in its inactive state until the next configure-eligible
+        // event (e.g., layout change).
+        let root = root_focus_target(&focus);
+        if let Some(root) = root {
+            state.set_keyboard_focus(Some(root));
+        }
     }
     let Some(pointer) = state.pointer.clone() else { return };
     tracing::info!(
