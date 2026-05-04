@@ -260,6 +260,19 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
             }
             wl_surface::Request::Commit => {
                 let mut sd = data.lock().unwrap();
+                // Capture the client's "did pixel content actually
+                // change?" signals before the buffer-swap block clears
+                // them. Two ways for the client to say yes: re-attach
+                // (new wl_buffer or same wl_buffer with intent of new
+                // pixels) and/or damage (`wl_surface.damage` /
+                // `damage_buffer` was called since the last commit).
+                // A bare commit (no attach + no damage) is a no-op
+                // for pixels — it's how clients deliver
+                // wl_callback/ack_configure handshakes without asking
+                // us to repaint.
+                let attached_now = sd.pending_attach;
+                let damaged_now = !sd.pending.damage.is_empty();
+                let pixels_changed = attached_now || damaged_now;
                 // Promote pending -> current, but only touch the buffer
                 // if the client actually called wl_surface.attach since
                 // the last commit. A commit without attach is a no-op
@@ -281,26 +294,27 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 };
                 sd.current.damage = std::mem::take(&mut sd.pending.damage);
 
-                // Mark whatever buffer is now current as having fresh
-                // pixels so the renderer's SHM upload path knows to
-                // re-upload. Bumped on EVERY commit-with-buffer (not
-                // just commit-with-attach) — clients are allowed to
-                // write new pixels into a previously-attached SHM
-                // region and signal it via wl_surface.damage without
-                // re-issuing wl_surface.attach. Chrome on Wayland
-                // does this, and the prior attach-only gate stranded
-                // those frames on the cached texture, producing
-                // ~per-vsync UI glitches and YouTube video stutter
-                // in tile mode. Surfaces that are not committing —
-                // the cursor, static layer surfaces, idle clients —
-                // still skip the upload because no commit fires for
-                // them, which is the actual win we're after.
-                if let Some(buf) = sd.current.buffer.as_ref() {
-                    if let Some(bd) = buf.data::<crate::shm::BufferData>() {
-                        bd.upload_seq.fetch_add(
-                            1,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                // Bump upload_seq only when the client signalled a
+                // real pixel change — `attach` (new buffer or
+                // intent-to-replace) OR `damage` since last commit.
+                // The previous "every commit" rule was over-eager:
+                // every frame-callback ack and every ack_configure
+                // bumped the seq, which (with the upload-skip
+                // optimisation enabled) interacts badly with NVIDIA
+                // Vulkan and produces visible glitches in Chrome
+                // and on the lower edge of the layout. Hyprland
+                // uses the same rule (see GLTexture::update —
+                // `if (damage.empty()) return;`) and is glitch-free
+                // on the same hardware, so this is the correct
+                // semantics, not just a workaround.
+                if pixels_changed {
+                    if let Some(buf) = sd.current.buffer.as_ref() {
+                        if let Some(bd) = buf.data::<crate::shm::BufferData>() {
+                            bd.upload_seq.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                     }
                 }
 
