@@ -21,6 +21,32 @@ pub enum PixelFormat {
     Xrgb8888,
 }
 
+/// Pixel snapshot captured at `wl_surface.commit` time. The Wayland-side
+/// commit dispatch memcpys out of the client's mmap into `pixels`,
+/// queues this struct on `State::pending_shm_snapshots`, and the
+/// post-dispatch hook hands it to the renderer's texture cache where
+/// it's copied into a Vulkan staging buffer.
+///
+/// The point of capturing here rather than at render time is that
+/// some clients (Chrome's repaint path is the long-running offender)
+/// modify the buffer's pixels *after* committing, in violation of the
+/// wl_surface.commit "owned by compositor until release" contract. A
+/// memcpy at render time can race with those post-commit writes and
+/// produce torn pixels — visible as UI flicker, video stutter, and
+/// the "lower edge flashing" we've been chasing.
+///
+/// Lives in `sol-core` rather than `sol-wayland` so the renderer crate
+/// can name it without pulling in a dependency cycle.
+#[derive(Debug)]
+pub struct ShmSnapshot {
+    pub cache_key: u64,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+    pub format: PixelFormat,
+    pub pixels: Vec<u8>,
+}
+
 /// Where a scene element's pixel data actually lives. SHM buffers are
 /// CPU-mapped and the server blits/uploads from the borrowed slice. Dmabuf
 /// buffers live on the GPU; the server imports the fd as a `VkImage` on

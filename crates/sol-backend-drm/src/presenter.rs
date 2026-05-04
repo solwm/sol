@@ -300,6 +300,21 @@ impl DrmPresenter {
         self.textures.evict(key);
     }
 
+    /// Apply one Hyprland-style commit-time SHM snapshot. The
+    /// Wayland-side commit handler memcpys the client's mmap into
+    /// `snap.pixels` synchronously, queues `snap` on
+    /// `State::pending_shm_snapshots`, and the post-dispatch hook
+    /// drains that vec by calling this method per entry. The texture
+    /// cache then copies into its staging buffer and queues a
+    /// `vkCmdCopyBufferToImage` for the next `record_uploads` —
+    /// a normal upload, just sourced from a server-owned snapshot
+    /// instead of the live client mmap. This is the load-bearing
+    /// fix for Chrome-class clients that write to their committed
+    /// SHM buffer before we get around to rendering.
+    pub fn apply_shm_snapshot(&mut self, snap: sol_core::ShmSnapshot) -> Result<()> {
+        self.textures.apply_shm_snapshot(snap)
+    }
+
     pub fn is_busy(&self) -> bool {
         self.pending_flip || self.pending_render
     }

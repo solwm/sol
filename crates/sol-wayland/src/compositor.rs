@@ -21,7 +21,7 @@ use wayland_server::{
     },
 };
 
-use crate::State;
+use crate::{ShmSnapshot, State};
 
 /// Roles a surface can take on.
 #[derive(Clone, Debug, Default)]
@@ -294,19 +294,28 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 };
                 sd.current.damage = std::mem::take(&mut sd.pending.damage);
 
-                // Bump upload_seq only when the client signalled a
-                // real pixel change — `attach` (new buffer or
-                // intent-to-replace) OR `damage` since last commit.
-                // The previous "every commit" rule was over-eager:
-                // every frame-callback ack and every ack_configure
-                // bumped the seq, which (with the upload-skip
-                // optimisation enabled) interacts badly with NVIDIA
-                // Vulkan and produces visible glitches in Chrome
-                // and on the lower edge of the layout. Hyprland
-                // uses the same rule (see GLTexture::update —
-                // `if (damage.empty()) return;`) and is glitch-free
-                // on the same hardware, so this is the correct
-                // semantics, not just a workaround.
+                // Bump upload_seq + snapshot the SHM pixels, but only
+                // when the client signalled a real pixel change —
+                // `attach` (new buffer or intent-to-replace) OR
+                // `damage` since last commit. A bare commit is a
+                // pixel-content no-op (frame-callback ack /
+                // ack_configure) and doesn't need either.
+                //
+                // The snapshot here is the load-bearing piece for
+                // glitch-free output on Chrome-class clients that
+                // violate the "don't write to a committed buffer
+                // until release" rule. Reading the mmap at render
+                // time exposes us to whatever the client is
+                // scribbling in there *after* their commit;
+                // memcpy-ing into a server-owned `Vec<u8>` here,
+                // inside the commit dispatch, captures the pixels
+                // before any post-commit client write can race us.
+                // This mirrors Hyprland's `updateSynchronousTexture`
+                // path (Compositor.cpp::commitState calls it inline
+                // and then `dropCurrentBuffer()` releases the
+                // wl_buffer) — they get clean output on the same
+                // NVIDIA hardware, so this is the right pattern.
+                let mut snapshot_to_queue: Option<ShmSnapshot> = None;
                 if pixels_changed {
                     if let Some(buf) = sd.current.buffer.as_ref() {
                         if let Some(bd) = buf.data::<crate::shm::BufferData>() {
@@ -314,6 +323,18 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                                 1,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
+                            if let (Some(pixels), Some(format)) =
+                                (bd.bytes(), bd.pixel_format())
+                            {
+                                snapshot_to_queue = Some(ShmSnapshot {
+                                    cache_key: bd.cache_key,
+                                    width: bd.width,
+                                    height: bd.height,
+                                    stride: bd.stride,
+                                    format,
+                                    pixels: pixels.to_vec(),
+                                });
+                            }
                         }
                     }
                 }
@@ -334,7 +355,28 @@ impl Dispatch<WlSurface, Arc<Mutex<SurfaceData>>> for State {
                 // current reference live) and only after we've released
                 // the SurfaceData lock so any handlers don't re-enter us.
                 let new_buffer_id = sd.current.buffer.as_ref().map(|b| b.id());
+                let current_for_release = if snapshot_to_queue.is_some() {
+                    sd.current.buffer.clone()
+                } else {
+                    None
+                };
                 drop(sd);
+
+                if let Some(snap) = snapshot_to_queue {
+                    state.pending_shm_snapshots.push(snap);
+                    // Hyprland releases the SHM wl_buffer right after
+                    // its synchronous-texture upload (see
+                    // Compositor.cpp::commitState's `dropCurrentBuffer`
+                    // tail); the client can then reuse the memory
+                    // immediately, which is what their pool-of-buffers
+                    // pipeline relies on. We've snapshotted the pixels
+                    // into a server-owned Vec, so it's safe to signal
+                    // release now even though we still hold our strong
+                    // wl_buffer ref for cache lookups.
+                    if let Some(buf) = current_for_release {
+                        buf.release();
+                    }
+                }
                 // old_buffer is Option<Option<WlBuffer>>: outer None means
                 // no attach happened (nothing to release); outer Some
                 // with inner None means we promoted but had no prior

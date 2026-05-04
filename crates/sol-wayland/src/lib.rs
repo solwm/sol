@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use sol_backend_drm::DrmPresenter;
 use std::os::fd::AsRawFd;
-use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
+use sol_core::{RenderTiming, Scene, SceneContent, SceneElement, ShmSnapshot};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Display, DisplayHandle, Resource, Weak,
@@ -436,6 +436,17 @@ pub struct State {
     /// handlers when a client tears down a buffer; drained (and acted
     /// on) inside `render_tick` which has `&mut` access to the backend.
     pub pending_texture_evictions: Vec<u64>,
+    /// SHM-buffer pixel snapshots captured during dispatch handlers,
+    /// drained by the post-dispatch hook into the texture cache.
+    /// Hyprland-style "snapshot at commit" decouples our GPU upload
+    /// from whatever the client does to the mmap after commit —
+    /// without it, a Chrome-class client that violates the
+    /// "don't write to a committed buffer" invariant produces torn
+    /// pixels at render time. The Vec carries the pixel bytes by
+    /// value (memcpy out of mmap inside the commit handler) so the
+    /// drain step is a pure CPU→Vulkan transfer with no exposure
+    /// to live-client memory.
+    pub pending_shm_snapshots: Vec<ShmSnapshot>,
     /// Weak refs to every `wl_surface` with a `zwlr_layer_surface_v1`
     /// role. Dead weaks are pruned on render tick; the role's mapped
     /// flag on `SurfaceData` determines whether we currently draw it.
@@ -4307,6 +4318,32 @@ fn setup_event_loop(
                 comp.display
                     .flush_clients()
                     .map_err(std::io::Error::other)?;
+                // Apply any commit-time SHM snapshots the dispatch
+                // handlers queued. Doing it here — outside the
+                // dispatch's `&mut State` borrow but before yielding
+                // back to the event loop — gives us simultaneous
+                // access to the texture cache (in `comp.backend`)
+                // and the `pending_shm_snapshots` vec (in
+                // `comp.state`). See `compositor.rs`'s commit
+                // handler for why we capture pixels here rather than
+                // at render time.
+                if let BackendState::Drm(presenter) = &mut comp.backend {
+                    let snaps = std::mem::take(&mut comp.state.pending_shm_snapshots);
+                    for snap in snaps {
+                        if let Err(e) = presenter.apply_shm_snapshot(snap) {
+                            tracing::warn!(
+                                error = %e,
+                                "apply_shm_snapshot failed; surface may render stale"
+                            );
+                        }
+                    }
+                } else {
+                    // Headless backend keeps the snapshots out of the
+                    // way — the canvas reads pixels back through
+                    // BufferData::bytes() from the live mmap, same
+                    // as before.
+                    comp.state.pending_shm_snapshots.clear();
+                }
                 // A client dispatch may have created an idle
                 // inhibitor while the screen was blanked — the
                 // inhibit handler raises `pending_wake` because
@@ -4568,6 +4605,7 @@ fn setup_event_loop(
         presentation_seq: 0,
         exec_once_pgids: Vec::new(),
         pending_texture_evictions: Vec::new(),
+        pending_shm_snapshots: Vec::new(),
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
         data_devices: Vec::new(),

@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
-use sol_core::{CURSOR_SCENE_KEY, RenderTiming, SceneContent, SceneElement};
+use sol_core::{CURSOR_SCENE_KEY, RenderTiming, SceneContent, SceneElement, ShmSnapshot};
 use std::collections::HashMap;
 use std::os::fd::{IntoRawFd, OwnedFd};
 
@@ -534,6 +534,96 @@ impl TextureCache {
 
     pub fn get(&self, key: u64) -> Option<&TextureEntry> {
         self.entries.get(&key)
+    }
+
+    /// Hyprland-pattern commit-time snapshot. Called after the
+    /// Wayland dispatch finishes (so we have a clean window with no
+    /// `&mut State` borrow tying our hands), once per snapshot the
+    /// commit handler queued. Allocates / resizes the entry as
+    /// needed, copies the snapshot pixels into the staging buffer,
+    /// and queues a `PendingUpload` so the next `record_uploads`
+    /// emits the `vkCmdCopyBufferToImage`. Dedups against existing
+    /// queued uploads for the same key — multiple commits between
+    /// renders just keep updating the staging contents.
+    pub fn apply_shm_snapshot(&mut self, snap: ShmSnapshot) -> Result<()> {
+        let needs_new = self
+            .entries
+            .get(&snap.cache_key)
+            .map(|e| e.is_dmabuf || e.width != snap.width || e.height != snap.height)
+            .unwrap_or(true);
+        if needs_new {
+            self.evict(snap.cache_key);
+            let entry_data =
+                create_shm_image(&self.stack, snap.width as u32, snap.height as u32)?;
+            let descriptor = self.allocate_descriptor(entry_data.view)?;
+            self.entries.insert(
+                snap.cache_key,
+                TextureEntry {
+                    image: entry_data.image,
+                    view: entry_data.view,
+                    memory: entry_data.memory,
+                    descriptor,
+                    width: snap.width,
+                    height: snap.height,
+                    uploaded_seq: 0,
+                    is_dmabuf: false,
+                    staging: Some(entry_data.staging),
+                },
+            );
+        }
+        let entry = self
+            .entries
+            .get_mut(&snap.cache_key)
+            .expect("inserted just above");
+        let staging = entry
+            .staging
+            .as_ref()
+            .expect("SHM entry must have staging");
+        let tight_row = (snap.width as usize) * 4;
+        let h = snap.height as usize;
+        let total = tight_row * h;
+        if snap.pixels.len() < (snap.stride as usize) * h {
+            bail!(
+                "snapshot pixels {} < stride*height = {}",
+                snap.pixels.len(),
+                (snap.stride as usize) * h
+            );
+        }
+        if (staging.size as usize) < total {
+            bail!(
+                "staging {} bytes < tight_row*height = {}",
+                staging.size,
+                total
+            );
+        }
+        unsafe {
+            for row in 0..h {
+                let src = snap.pixels.as_ptr().add(row * (snap.stride as usize));
+                let dst = staging.mapped.add(row * tight_row);
+                std::ptr::copy_nonoverlapping(src, dst, tight_row);
+            }
+        }
+        let from_layout = if entry.uploaded_seq == 0 {
+            vk::ImageLayout::UNDEFINED
+        } else {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        };
+        // Bump the recorded seq so the render-time prepare_shm
+        // matches and skips duplicate work.
+        entry.uploaded_seq = entry.uploaded_seq.saturating_add(1);
+        // Dedup: only one PendingUpload per key per command buffer.
+        // If a second commit lands before the next render we just
+        // updated the staging contents above; one cmd_copy is
+        // enough to land the latest.
+        if !self.pending.iter().any(|u| u.key == snap.cache_key) {
+            self.pending.push(PendingUpload {
+                key: snap.cache_key,
+                width: snap.width as u32,
+                height: snap.height as u32,
+                from_layout,
+            });
+        }
+        Ok(())
     }
 }
 
