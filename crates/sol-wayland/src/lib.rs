@@ -85,7 +85,6 @@ mod fractional_scale;
 mod idle_inhibit;
 mod input;
 mod layer_shell;
-mod linux_dmabuf;
 mod output;
 mod presentation_time;
 mod primary_selection;
@@ -101,17 +100,21 @@ mod xdg_output;
 use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
 use render::Canvas;
-use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::{Buffer as _, Format as DmabufFormat, Fourcc, Modifier};
+use smithay::wayland::dmabuf::{
+    DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+};
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 
 /// Hand out a fresh, never-recycled key for the DRM presenter's
-/// texture cache. Each `shm::BufferData` and `linux_dmabuf::DmabufBuffer`
+/// texture cache. Each `shm::ShmCacheEntry` and dmabuf cache entry
 /// pulls one at construction. The previous scheme (`(self as *const _)
 /// as u64`) recycled keys whenever the heap allocator put a new buffer
 /// at a freed buffer's address before the eviction queue drained,
@@ -472,10 +475,9 @@ pub struct State {
     pub fullscreened: Option<Weak<WlSurface>>,
     /// Keys of texture cache entries the DRM presenter should evict on
     /// the next render tick. Filled by `BufferHandler::buffer_destroyed`
-    /// (SHM, via smithay) and the `Dispatch<WlBuffer, DmabufBuffer>`
-    /// `Destroy` handler when a client tears down a buffer; drained
-    /// (and acted on) inside `render_tick` which has `&mut` access to
-    /// the backend.
+    /// (smithay calls this for both SHM-backed and dmabuf-backed
+    /// wl_buffers); drained and acted on inside `render_tick` which has
+    /// `&mut` access to the backend.
     pub pending_texture_evictions: Vec<u64>,
     /// Smithay's `wl_shm` state: owns the global, the per-pool mmap,
     /// and the per-buffer wire dispatch. Created in `setup_event_loop`
@@ -494,6 +496,18 @@ pub struct State {
     /// rationale on why a side table beats trying to share the
     /// wl_buffer's user-data slot with smithay.
     pub shm_cache: std::collections::HashMap<ObjectId, shm::ShmCacheEntry>,
+    /// Smithay's `zwp_linux_dmabuf_v1` state: owns the dmabuf global,
+    /// the format/feedback table, the per-buffer `Dispatch<WlBuffer,
+    /// Dmabuf>` impl. Created in `setup_event_loop` before `Globals`.
+    pub dmabuf_state: DmabufState,
+    /// Per-dmabuf-`wl_buffer` cache key, keyed by the buffer's
+    /// `ObjectId`. Mirrors `shm_cache` but for dmabufs: smithay holds
+    /// the `Dmabuf` userdata; we keep our compositor-owned cache key
+    /// alongside so the renderer's texture cache stays unique across
+    /// recycled wl_buffer wire ids. Populated in
+    /// `DmabufHandler::dmabuf_imported`; removed by
+    /// `BufferHandler::buffer_destroyed`.
+    pub dmabuf_cache: std::collections::HashMap<ObjectId, u64>,
     /// libseat session handle. Used by VT-switch keybinds and by the
     /// backend's Enable/Disable transition logic. None in headless.
     pub session: Option<session::SharedSession>,
@@ -947,7 +961,7 @@ pub struct Globals {
     pub output: GlobalId,
     pub seat: GlobalId,
     pub xdg_wm_base: GlobalId,
-    pub linux_dmabuf: GlobalId,
+    pub linux_dmabuf: DmabufGlobal,
     pub xdg_decoration: GlobalId,
     pub layer_shell: GlobalId,
     pub subcompositor: GlobalId,
@@ -1145,13 +1159,16 @@ impl ClientData for ClientState {
     }
 }
 
-// Smithay shm wiring. `delegate_shm!` attaches the WlShm /
-// WlShmPool / WlBuffer (with smithay's `ShmBufferUserData`)
-// Dispatch impls; we provide `ShmHandler` to hand out the state and
-// `BufferHandler` to learn about destruction. The dmabuf module
-// keeps its own `Dispatch<WlBuffer, DmabufBuffer>` for the dmabuf
-// kind — those two impls coexist because each WlBuffer carries its
-// own user-data type that wayland-server uses to route dispatch.
+// Smithay shm + dmabuf wiring. `delegate_shm!` attaches the WlShm /
+// WlShmPool / WlBuffer-with-`ShmBufferUserData` Dispatch impls;
+// `delegate_dmabuf!` attaches the manager + params + feedback +
+// WlBuffer-with-`Dmabuf` Dispatch impls. The two coexist because
+// each wl_buffer resource carries its own user-data type that
+// wayland-server uses to route dispatch. We provide `ShmHandler` /
+// `DmabufHandler` to hand out the respective state and a single
+// `BufferHandler` callback that smithay invokes (from both modules)
+// when any wl_buffer is destroyed — that's our hook to drop the
+// matching cache entry and queue the texture for eviction.
 impl ShmHandler for State {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
@@ -1163,17 +1180,70 @@ impl BufferHandler for State {
         &mut self,
         buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
     ) {
-        // Only fires for buffer kinds whose Dispatch routes into a
-        // smithay module that calls us — currently just SHM. Dmabuf
-        // eviction still flows through `Dispatch<WlBuffer,
-        // DmabufBuffer>::Destroy` in linux_dmabuf.rs.
-        if let Some(entry) = self.shm_cache.remove(&buffer.id()) {
+        let id = buffer.id();
+        if let Some(entry) = self.shm_cache.remove(&id) {
             self.pending_texture_evictions.push(entry.cache_key);
+            return;
+        }
+        if let Some(key) = self.dmabuf_cache.remove(&id) {
+            // Same eviction path as SHM: alacritty / Chrome create a
+            // new dmabuf on every tile resize, so without this the
+            // imported `VkImage` + `VkDeviceMemory` for each old
+            // buffer would leak until sol exits.
+            self.pending_texture_evictions.push(key);
         }
     }
 }
 
 smithay::delegate_shm!(State);
+
+// Smithay dmabuf wiring: `delegate_dmabuf!` claims
+// zwp_linux_dmabuf_v1 + params + feedback + the per-buffer
+// `Dispatch<WlBuffer, Dmabuf>` impl. Our role is `DmabufHandler::
+// dmabuf_imported`: validate the format/plane combination, mint a
+// cache key, then signal `notifier.successful::<State>()` which
+// creates the wl_buffer resource with the `Dmabuf` as userdata
+// (consumed later in collect_scene by `buf.data::<Dmabuf>()`).
+impl DmabufHandler for State {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        // We only render single-plane formats. Multi-plane (NV12,
+        // I420 — i.e. YUV from hardware video decoders) lands the day
+        // we do video pipelines; reject up-front so the client doesn't
+        // think it has a usable buffer it can't actually render.
+        if dmabuf.num_planes() != 1 {
+            tracing::warn!(
+                planes = dmabuf.num_planes(),
+                "dmabuf_imported: rejecting multi-plane buffer"
+            );
+            notifier.failed();
+            return;
+        }
+        let key = next_buffer_cache_key();
+        match notifier.successful::<State>() {
+            Ok(buffer) => {
+                self.dmabuf_cache.insert(buffer.id(), key);
+                tracing::debug!(
+                    cache_key = key,
+                    "dmabuf_imported: wl_buffer created"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "dmabuf_imported: client died before buffer creation");
+            }
+        }
+    }
+}
+
+smithay::delegate_dmabuf!(State);
 
 // Smithay compositor wiring. `delegate_compositor!` claims the
 // wl_compositor / wl_subcompositor / wl_surface / wl_subsurface /
@@ -3434,16 +3504,23 @@ fn scene_from_buffers<'a>(
                     upload_seq,
                 },
             });
-        } else if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
-            // B10.3: single-plane dmabuf only. Multi-plane (YUV etc.) lands
-            // when we care about video, not for alacritty/terminals.
-            let Some(p0) = db.planes.first() else { continue };
-            let key = db.cache_key;
-            let (ux, uy, uw, uh) = compute_uv(*vsrc, db.width, db.height);
+        } else if let Some(dmabuf) = buf.data::<Dmabuf>() {
+            // Single-plane only — multi-plane (YUV, NV12 etc.) is
+            // rejected at import time by `dmabuf_imported`, so any
+            // dmabuf reaching here has exactly one plane.
+            let Some(fd) = dmabuf.handles().next() else { continue };
+            let Some(offset) = dmabuf.offsets().next() else { continue };
+            let Some(stride) = dmabuf.strides().next() else { continue };
+            let width = dmabuf.width() as i32;
+            let height = dmabuf.height() as i32;
+            let fourcc: u32 = dmabuf.format().code as u32;
+            let modifier: u64 = dmabuf.format().modifier.into();
+            let Some(&key) = state.dmabuf_cache.get(&buf.id()) else { continue };
+            let (ux, uy, uw, uh) = compute_uv(*vsrc, width, height);
             scene.elements.push(SceneElement {
                 buffer_key: key,
-                width: db.width,
-                height: db.height,
+                width,
+                height,
                 dst_width: rect.w,
                 dst_height: rect.h,
                 x: rect.x,
@@ -3455,11 +3532,11 @@ fn scene_from_buffers<'a>(
                 alpha: *alpha,
                 corner_radius: *corner_radius,
                 content: SceneContent::Dmabuf {
-                    fd: p0.fd.as_raw_fd(),
-                    fourcc: db.format,
-                    modifier: p0.modifier,
-                    offset: p0.offset,
-                    stride: p0.stride,
+                    fd: fd.as_raw_fd(),
+                    fourcc,
+                    modifier,
+                    offset,
+                    stride,
                 },
             });
         }
@@ -5031,16 +5108,41 @@ fn setup_event_loop(
     let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
     let layer_shell_global = layer_shell_state.shell_global();
 
+    // Smithay owns the zwp_linux_dmabuf_v1 global. We build a v5
+    // global so Mesa's EGL on Wayland gets per-surface feedback (the
+    // alternative is v3, which falls back to llvmpipe — see the
+    // pre-smithay rationale in linux_dmabuf.rs's history). The
+    // feedback's main_device dev_t comes from the DRM device path;
+    // headless mode (no DRM device) advertises a dummy 0 since no
+    // dmabuf clients can do anything useful without a render node
+    // anyway. Format set is XRGB8888 + ARGB8888 with INVALID
+    // (driver-implicit) and LINEAR modifiers — same as pre-PR-9, the
+    // maximally-compatible choice for the renderer's Vulkan importer.
+    let mut dmabuf_state = DmabufState::new();
+    let dmabuf_main_device: libc::dev_t = drm_device_path
+        .as_ref()
+        .and_then(|p| rustix::fs::stat(p).ok())
+        .map(|s| s.st_rdev as libc::dev_t)
+        .unwrap_or(0);
+    let dmabuf_formats = [
+        DmabufFormat { code: Fourcc::Xrgb8888, modifier: Modifier::Invalid },
+        DmabufFormat { code: Fourcc::Argb8888, modifier: Modifier::Invalid },
+        DmabufFormat { code: Fourcc::Xrgb8888, modifier: Modifier::Linear },
+        DmabufFormat { code: Fourcc::Argb8888, modifier: Modifier::Linear },
+    ];
+    let dmabuf_feedback = DmabufFeedbackBuilder::new(dmabuf_main_device, dmabuf_formats)
+        .build()
+        .context("build dmabuf feedback")?;
+    let dmabuf_global = dmabuf_state
+        .create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
+
     let globals = Globals {
         compositor: compositor_global,
         shm: shm_global,
         output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
         seat: seat_global,
         xdg_wm_base: xdg_wm_base_global,
-        linux_dmabuf: dh.create_global::<State, ZwpLinuxDmabufV1, ()>(
-            linux_dmabuf::DMABUF_VERSION,
-            (),
-        ),
+        linux_dmabuf: dmabuf_global,
         xdg_decoration: dh.create_global::<State, ZxdgDecorationManagerV1, ()>(
             xdg_decoration::DECORATION_VERSION,
             (),
@@ -5374,6 +5476,8 @@ fn setup_event_loop(
         shm_state,
         compositor_state,
         shm_cache: std::collections::HashMap::new(),
+        dmabuf_state,
+        dmabuf_cache: std::collections::HashMap::new(),
         idle_inhibit_manager_state,
         session: session.clone(),
         data_device_state,
@@ -6186,8 +6290,8 @@ fn surface_buffer_dims(
     if let Some(dims) = shm::shm_dims(buf) {
         return Some(dims);
     }
-    if let Some(db) = buf.data::<linux_dmabuf::DmabufBuffer>() {
-        return Some((db.width, db.height));
+    if let Some(dmabuf) = buf.data::<Dmabuf>() {
+        return Some((dmabuf.width() as i32, dmabuf.height() as i32));
     }
     None
 }
