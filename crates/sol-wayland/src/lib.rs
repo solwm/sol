@@ -57,6 +57,14 @@ use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
 };
 use smithay::utils::SERIAL_COUNTER;
+use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::data_device::{
+    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus,
+};
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+};
 
 mod compositor;
 mod config;
@@ -93,9 +101,7 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresent
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
-use wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
-use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 
 /// Hand out a fresh, never-recycled key for the DRM presenter's
@@ -589,26 +595,15 @@ pub struct State {
     /// its own 30-second wallpaper-cycle tick. After ~7 restarts
     /// that shows up as "transitions every few seconds."
     pub exec_once_pgids: Vec<libc::pid_t>,
-    /// Every live `wl_data_device` clients have bound. Selection
-    /// changes broadcast to all of them. Cleaned of dead resources
-    /// each time `set_selection` runs.
-    pub data_devices: Vec<wayland_server::protocol::wl_data_device::WlDataDevice>,
-    /// Source backing the current clipboard selection (Ctrl+C). The
-    /// owning client streams paste contents on demand via
-    /// `wl_data_source.send`. Cleared when the source destroys
-    /// itself or another client replaces the selection.
-    pub selection_source:
-        Option<wayland_server::protocol::wl_data_source::WlDataSource>,
-    /// `zwp_primary_selection_device_v1`s clients have bound.
-    /// Counterpart of `data_devices` for the X11-style middle-click
-    /// primary selection.
-    pub primary_devices: Vec<
-        wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
-    >,
-    /// Source backing the primary (middle-click) selection.
-    pub primary_selection_source: Option<
-        wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
-    >,
+    /// Smithay's data-device manager state — owns the
+    /// `wl_data_device_manager` global and tracks per-seat clipboard
+    /// selection sources. Selection routing follows keyboard focus
+    /// via `set_data_device_focus` in `SeatHandler::focus_changed`.
+    pub data_device_state: DataDeviceState,
+    /// Smithay's primary-selection manager state. Same shape as
+    /// `data_device_state`; routing aligned to keyboard focus via
+    /// `set_primary_focus`.
+    pub primary_selection_state: PrimarySelectionState,
     /// Mapped dialog/transient toplevels — `xdg_toplevel`s that
     /// declared a parent via `set_parent` before mapping. Live
     /// outside the master-stack tile layout: they self-size from
@@ -1255,7 +1250,7 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<State>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<State>, focused: Option<&WlSurface>) {
         // Mirror smithay's keyboard focus into `state.keyboard_focus`
         // so the dozens of reader sites in the rest of this file stay
         // unchanged. `set_keyboard_focus` is the only writer that
@@ -1263,6 +1258,15 @@ impl SeatHandler for State {
         // mirror stays consistent without us forwarding the focus
         // value twice.
         self.keyboard_focus = focused.cloned();
+        // Steer the data-device + primary-selection clipboard offers
+        // to whichever client just took keyboard focus. Smithay
+        // resends the active selection's offer to the new focus on
+        // change, which is how Ctrl+V in the newly-focused client
+        // reaches the previously-focused client's data source.
+        let dh = self.display_handle.clone();
+        let client = focused.and_then(|s| s.client());
+        set_data_device_focus(&dh, seat, client.clone());
+        set_primary_focus(&dh, seat, client);
     }
 
     fn cursor_image(&mut self, _seat: &Seat<State>, image: CursorImageStatus) {
@@ -1289,6 +1293,34 @@ impl SeatHandler for State {
 }
 
 smithay::delegate_seat!(State);
+
+// Smithay selection wiring (clipboard + primary selection). Sol
+// doesn't drive server-side selection or DnD, so the handler
+// methods that fire only for compositor-set sources / sol-initiated
+// drags use empty defaults. Selection routing follows keyboard
+// focus via `set_data_device_focus` / `set_primary_focus` in
+// `SeatHandler::focus_changed` (above).
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
+impl ClientDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {}
+
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+smithay::delegate_data_device!(State);
+smithay::delegate_primary_selection!(State);
 
 /// Backend-specific render target. Chosen at startup; does not switch at
 /// runtime. `DrmPresenter` is boxed because it carries the Vulkan
@@ -4583,6 +4615,16 @@ fn setup_event_loop(
         pointer_handle = Some(seat.add_pointer());
     }
 
+    // Smithay's clipboard + primary selection. The globals are
+    // unconditional (clients always advertise wl_data_device_manager
+    // and zwp_primary_selection_device_manager_v1 even on a headless
+    // backend); selection routing follows keyboard focus, which only
+    // exists on DRM, but the protocol itself stays alive.
+    let data_device_state = DataDeviceState::new::<State>(&dh);
+    let data_device_global = data_device_state.global();
+    let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
+    let primary_selection_global = primary_selection_state.global();
+
     let globals = Globals {
         compositor: compositor_global,
         shm: shm_global,
@@ -4602,10 +4644,7 @@ fn setup_event_loop(
             (),
         ),
         subcompositor: subcompositor_global,
-        data_device_manager: dh.create_global::<State, WlDataDeviceManager, ()>(
-            data_device::DATA_DEVICE_MANAGER_VERSION,
-            (),
-        ),
+        data_device_manager: data_device_global,
         xdg_output_manager: dh.create_global::<State, ZxdgOutputManagerV1, ()>(
             xdg_output::XDG_OUTPUT_MANAGER_VERSION,
             (),
@@ -4628,11 +4667,7 @@ fn setup_event_loop(
             (),
         ),
         idle_inhibit: idle_inhibit_global,
-        primary_selection: dh
-            .create_global::<State, ZwpPrimarySelectionDeviceManagerV1, ()>(
-                primary_selection::PRIMARY_SELECTION_VERSION,
-                (),
-            ),
+        primary_selection: primary_selection_global,
     };
     tracing::info!(?globals, "advertised globals");
 
@@ -4939,10 +4974,8 @@ fn setup_event_loop(
         idle_inhibit_manager_state,
         pending_layer_surfaces: Vec::new(),
         session: session.clone(),
-        data_devices: Vec::new(),
-        selection_source: None,
-        primary_devices: Vec::new(),
-        primary_selection_source: None,
+        data_device_state,
+        primary_selection_state,
         mapped_popups: Vec::new(),
         mapped_dialogs: Vec::new(),
         dragging: None,
