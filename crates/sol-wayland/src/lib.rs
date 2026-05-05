@@ -1218,21 +1218,20 @@ impl DmabufHandler for State {
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
-        dmabuf: Dmabuf,
+        _dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // We only render single-plane formats. Multi-plane (NV12,
-        // I420 — i.e. YUV from hardware video decoders) lands the day
-        // we do video pipelines; reject up-front so the client doesn't
-        // think it has a usable buffer it can't actually render.
-        if dmabuf.num_planes() != 1 {
-            tracing::warn!(
-                planes = dmabuf.num_planes(),
-                "dmabuf_imported: rejecting multi-plane buffer"
-            );
-            notifier.failed();
-            return;
-        }
+        // Accept any plane count. Chrome's hardware-decoded video on
+        // Linux produces NV12 (Y plane + UV plane), and rejecting at
+        // import would force Chrome's Ozone to fall back to in-renderer
+        // RGBA conversion mid-stream — that fallback shows up as a
+        // single-frame wallpaper bleed every time YouTube's ABR rotates
+        // a stream segment. We accept and let the renderer sample
+        // plane 0 only (matches pre-smithay behaviour: plane 0 of NV12
+        // is the Y plane, sampled as RGBA — wrong colours in theory,
+        // visually fine in practice for the YouTube case).
+        // Multi-plane sampling proper (YUV→RGB shader, separate plane
+        // imports) lands the day we care about correct video colours.
         let key = next_buffer_cache_key();
         match notifier.successful::<State>() {
             Ok(buffer) => {
