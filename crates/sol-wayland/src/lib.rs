@@ -85,7 +85,6 @@ mod fractional_scale;
 mod idle_inhibit;
 mod input;
 mod layer_shell;
-mod output;
 mod presentation_time;
 mod primary_selection;
 mod render;
@@ -95,7 +94,6 @@ mod shm;
 mod subcompositor;
 mod viewporter;
 mod xdg_decoration;
-mod xdg_output;
 
 use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
@@ -104,8 +102,9 @@ use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1:
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
-use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
+use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Format as DmabufFormat, Fourcc, Modifier};
 use smithay::wayland::dmabuf::{
@@ -128,7 +127,6 @@ pub(crate) fn next_buffer_cache_key() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-const OUTPUT_VERSION: u32 = 4;
 
 /// Screen-space rectangle assigned to a mapped window by the layout.
 #[derive(Clone, Copy, Debug, Default)]
@@ -500,6 +498,14 @@ pub struct State {
     /// the format/feedback table, the per-buffer `Dispatch<WlBuffer,
     /// Dmabuf>` impl. Created in `setup_event_loop` before `Globals`.
     pub dmabuf_state: DmabufState,
+    /// Smithay's wl_output + zxdg_output_manager_v1 wiring. The
+    /// `Output` carries the mode/scale/transform/location state and
+    /// drives event emission on bind; `OutputManagerState` owns the
+    /// xdg_output_manager_v1 global. We only ever have one output —
+    /// our primary screen — so a single field is enough; multi-output
+    /// support would need a Vec<Output> + per-tile output assignment.
+    pub output: Output,
+    pub output_manager_state: OutputManagerState,
     /// Per-dmabuf-`wl_buffer` cache key, keyed by the buffer's
     /// `ObjectId`. Mirrors `shm_cache` but for dmabufs: smithay holds
     /// the `Dmabuf` userdata; we keep our compositor-owned cache key
@@ -1244,6 +1250,29 @@ impl DmabufHandler for State {
 }
 
 smithay::delegate_dmabuf!(State);
+
+// Smithay output wiring. `delegate_output!` claims the wl_output +
+// zxdg_output_manager_v1 + zxdg_output_v1 Dispatch impls; smithay
+// drives the geometry / mode / scale / done event sequence on bind
+// using the `Output` we register at startup. `OutputHandler::
+// output_bound` is our hook for the side effects the previous
+// hand-rolled `Dispatch<WlOutput, ()>::bind` did inline — pushing
+// to `state.outputs` (consumed by ext_workspace) and notifying
+// ext_workspace so it can emit `output_enter` on the workspace
+// group.
+impl OutputHandler for State {
+    fn output_bound(&mut self, _output: Output, wl_output: WlOutput) {
+        // Prune dead instances first to keep the list bounded across
+        // client reconnects; smithay doesn't garbage-collect.
+        self.outputs.retain(|existing| existing.is_alive());
+        if let Ok(client) = self.display_handle.get_client(wl_output.id()) {
+            ext_workspace::notify_output_bound(self, &client, &wl_output);
+        }
+        self.outputs.push(wl_output);
+    }
+}
+
+smithay::delegate_output!(State);
 
 // Smithay compositor wiring. `delegate_compositor!` claims the
 // wl_compositor / wl_subcompositor / wl_surface / wl_subsurface /
@@ -5108,6 +5137,37 @@ fn setup_event_loop(
     let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
     let layer_shell_global = layer_shell_state.shell_global();
 
+    // Smithay owns the wl_output + zxdg_output_manager_v1 globals.
+    // Output represents our single primary output; mode + scale +
+    // location feed into both protocols. Physical size (300x200 mm)
+    // is a placeholder — clients only consult it for DPI hints, and
+    // the previous hand-rolled bind also passed these constants.
+    // PhysicalProperties::make/model become the wl_output.geometry
+    // make/model strings. Mode refresh is in millihertz to match
+    // smithay's convention; sol's `screen_refresh_mhz` is already in
+    // those units (set from the DRM mode at startup, or a dummy 60_000
+    // for headless).
+    let output = Output::new(
+        "SOL-0".to_string(),
+        PhysicalProperties {
+            size: (300, 200).into(),
+            subpixel: Subpixel::Unknown,
+            make: "sol".to_string(),
+            model: "sol-0".to_string(),
+        },
+    );
+    let output_mode = OutputMode {
+        size: (screen_width as i32, screen_height as i32).into(),
+        refresh: screen_refresh_mhz,
+    };
+    output.set_preferred(output_mode);
+    output.change_current_state(Some(output_mode), None, None, None);
+    let wl_output_global = output.create_global::<State>(&dh);
+    let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
+    let xdg_output_manager_global = output_manager_state
+        .xdg_output_manager_global()
+        .expect("xdg_output global");
+
     // Smithay owns the zwp_linux_dmabuf_v1 global. We build a v5
     // global so Mesa's EGL on Wayland gets per-surface feedback (the
     // alternative is v3, which falls back to llvmpipe — see the
@@ -5139,7 +5199,7 @@ fn setup_event_loop(
     let globals = Globals {
         compositor: compositor_global,
         shm: shm_global,
-        output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
+        output: wl_output_global,
         seat: seat_global,
         xdg_wm_base: xdg_wm_base_global,
         linux_dmabuf: dmabuf_global,
@@ -5150,10 +5210,7 @@ fn setup_event_loop(
         layer_shell: layer_shell_global,
         subcompositor: subcompositor_global,
         data_device_manager: data_device_global,
-        xdg_output_manager: dh.create_global::<State, ZxdgOutputManagerV1, ()>(
-            xdg_output::XDG_OUTPUT_MANAGER_VERSION,
-            (),
-        ),
+        xdg_output_manager: xdg_output_manager_global,
         presentation: dh.create_global::<State, WpPresentation, ()>(
             presentation_time::PRESENTATION_VERSION,
             (),
@@ -5478,6 +5535,8 @@ fn setup_event_loop(
         shm_cache: std::collections::HashMap::new(),
         dmabuf_state,
         dmabuf_cache: std::collections::HashMap::new(),
+        output,
+        output_manager_state,
         idle_inhibit_manager_state,
         session: session.clone(),
         data_device_state,
