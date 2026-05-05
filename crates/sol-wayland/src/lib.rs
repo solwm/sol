@@ -84,7 +84,6 @@ mod ext_workspace;
 mod idle_inhibit;
 mod input;
 mod layer_shell;
-mod presentation_time;
 mod primary_selection;
 mod render;
 mod seat;
@@ -97,12 +96,14 @@ use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
-use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::fractional_scale::{
     with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
+};
+use smithay::wayland::presentation::{
+    PresentationFeedbackCachedState, PresentationState, Refresh,
 };
 use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -524,16 +525,13 @@ pub struct State {
     /// tools.
     pub flip_counter: u32,
     pub flip_counter_reset: Option<Instant>,
-    /// `wp_presentation.feedback` objects clients have handed us that
-    /// are waiting for their next `presented` event. Fired at the
-    /// next DRM page-flip-complete (at which point they're dropped).
-    /// Without this protocol, Chrome refuses to pace above 60 Hz.
-    pub pending_presentation: Vec<
-        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::WpPresentationFeedback,
-    >,
     /// Monotonically incrementing counter used as the MSC field in
-    /// `presented`. Clients use it to detect missed vblanks.
+    /// `wp_presentation.presented`. Clients (Chrome's VSyncProvider)
+    /// read it to detect missed vblanks. Per-surface feedback objects
+    /// themselves live on smithay's `PresentationFeedbackCachedState`
+    /// — drained at flip time by `fire_presented`.
     pub presentation_seq: u64,
+    pub presentation_state: PresentationState,
     /// Currently-visible workspace. 1-based. Only toplevels whose
     /// `Window.workspace` matches this render, receive input, and
     /// participate in focus navigation. Layer surfaces (bars,
@@ -1296,6 +1294,13 @@ impl FractionalScaleHandler for State {
 }
 
 smithay::delegate_fractional_scale!(State);
+
+// Smithay wp_presentation wiring. The wire dispatch (manager bind +
+// per-surface feedback request) lives in `PresentationState`; cached
+// feedback callbacks accumulate on each surface's
+// `PresentationFeedbackCachedState`, drained by `fire_presented` at
+// page-flip-complete.
+smithay::delegate_presentation!(State);
 
 // Smithay compositor wiring. `delegate_compositor!` claims the
 // wl_compositor / wl_subcompositor / wl_surface / wl_subsurface /
@@ -2845,6 +2850,63 @@ fn shrink_interior_edges(r: Rect, outer: Rect, gaps_in: i32) -> Rect {
 /// TILED_* all edges + ACTIVATED). MAXIMIZED is what forces clients to
 /// obey the configured size; TILED_* is what tiling-aware clients use to
 /// avoid drawing resize chrome.
+/// Fire `wp_presentation_feedback.presented` on every cached feedback
+/// callback attached to a currently-mapped surface (and its subsurface
+/// tree). Walks `state.mapped_toplevels` and `layer_shell_state.
+/// layer_surfaces()` as roots; smithay's
+/// `with_surface_tree_downward` recurses into subsurfaces. Each
+/// surface's `PresentationFeedbackCachedState::current().callbacks`
+/// is drained and `presented(&output, time, refresh, seq, flags)`
+/// fires on every entry. Time is duration since `state.started`
+/// (matches the CLOCK_MONOTONIC reference smithay advertised at bind);
+/// refresh comes from `state.screen_refresh_mhz`; seq is a per-flip
+/// monotonic counter. Called from the DRM page-flip-complete handler.
+fn fire_presented(state: &mut State, now: std::time::Instant) {
+    use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    let elapsed = now.saturating_duration_since(state.started);
+    state.presentation_seq = state.presentation_seq.wrapping_add(1);
+    let seq = state.presentation_seq;
+    let flags = Kind::Vsync | Kind::HwClock | Kind::HwCompletion;
+    let mhz = state.screen_refresh_mhz.max(1) as u64;
+    let refresh = Refresh::Fixed(std::time::Duration::from_nanos(
+        1_000_000_000_000u64 / mhz,
+    ));
+
+    // Collect roots first so we don't hold the mapped_toplevels /
+    // layer_surfaces borrows across with_surface_tree_downward (which
+    // re-enters compositor::with_states and could deadlock with our
+    // surface-state locks held).
+    let mut roots: Vec<WlSurface> = Vec::new();
+    for w in state.mapped_toplevels.iter() {
+        if let Ok(s) = w.surface.upgrade() {
+            roots.push(s);
+        }
+    }
+    for ls in state.layer_shell_state.layer_surfaces() {
+        roots.push(ls.wl_surface().clone());
+    }
+
+    let output = state.output.clone();
+    for root in roots {
+        smithay_compositor::with_surface_tree_downward(
+            &root,
+            (),
+            |_, _, _| smithay_compositor::TraversalAction::DoChildren(()),
+            |_surface, states, _| {
+                let mut guard = states
+                    .cached_state
+                    .get::<PresentationFeedbackCachedState>();
+                let callbacks = std::mem::take(&mut guard.current().callbacks);
+                drop(guard);
+                for cb in callbacks {
+                    cb.presented(&output, elapsed, refresh, seq, flags);
+                }
+            },
+            |_, _, _| true,
+        );
+    }
+}
+
 fn send_pending_configures(state: &mut State) {
     use wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelStateFlag;
 
@@ -5228,6 +5290,18 @@ fn setup_event_loop(
         FractionalScaleManagerState::new::<State>(&dh);
     let fractional_scale_global = fractional_scale_manager_state.global();
 
+    // Smithay owns wp_presentation. CLOCK_MONOTONIC matches what
+    // sol's Instant-derived timestamps already use; smithay tracks
+    // per-surface PresentationFeedbackCachedState which we drain at
+    // page-flip time inside `fire_presented` (walks the surface tree
+    // for every mapped toplevel + layer surface and calls
+    // `presented(&output, ...)` on each cached callback).
+    let presentation_state = PresentationState::new::<State>(
+        &dh,
+        libc::CLOCK_MONOTONIC as u32,
+    );
+    let presentation_global = presentation_state.global();
+
     // Smithay owns the zwp_linux_dmabuf_v1 global. We build a v5
     // global so Mesa's EGL on Wayland gets per-surface feedback (the
     // alternative is v3, which falls back to llvmpipe — see the
@@ -5271,10 +5345,7 @@ fn setup_event_loop(
         subcompositor: subcompositor_global,
         data_device_manager: data_device_global,
         xdg_output_manager: xdg_output_manager_global,
-        presentation: dh.create_global::<State, WpPresentation, ()>(
-            presentation_time::PRESENTATION_VERSION,
-            (),
-        ),
+        presentation: presentation_global,
         viewporter: viewporter_global,
         fractional_scale: fractional_scale_global,
         ext_workspace: dh.create_global::<State, ExtWorkspaceManagerV1, ()>(
@@ -5448,19 +5519,12 @@ fn setup_event_loop(
                             cb.done(ts);
                         }
                         // Fire wp_presentation.feedback on every
-                        // pending feedback object with a real-time
-                        // vblank timestamp. Chrome uses this for its
+                        // currently-mapped surface's pending feedback
+                        // callbacks. Chrome uses this for its
                         // VSyncProvider; without it, its scheduler
                         // caps at 60 fps regardless of what
                         // wl_output.mode reports.
-                        let refresh_ns = (1_000_000_000u64
-                            / (comp.state.screen_refresh_mhz as u64 / 1000).max(1))
-                            as u32;
-                        presentation_time::fire_presented(
-                            &mut comp.state,
-                            Instant::now(),
-                            refresh_ns,
-                        );
+                        fire_presented(&mut comp.state, Instant::now());
                         // Used to set needs_render unconditionally
                         // here, which kept the compositor at the full
                         // display refresh rate even with no scene
@@ -5579,8 +5643,8 @@ fn setup_event_loop(
         resize_mode: false,
         flip_counter: 0,
         flip_counter_reset: None,
-        pending_presentation: presentation_time::empty(),
         presentation_seq: 0,
+        presentation_state,
         exec_once_pgids: Vec::new(),
         pending_texture_evictions: Vec::new(),
         shm_state,
