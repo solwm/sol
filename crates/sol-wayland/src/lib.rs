@@ -65,10 +65,12 @@ use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
 };
 use smithay::wayland::shell::xdg::{
+    decoration::{XdgDecorationHandler, XdgDecorationState},
     Configure, PopupSurface, PositionerState as XdgPositionerState,
     SurfaceCachedState as XdgSurfaceCachedState, ToplevelSurface, XdgShellHandler,
     XdgShellState,
 };
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::wayland::shell::wlr_layer::{
     Layer as SmithayLayer, LayerSurface as SmithayLayerSurface,
     WlrLayerShellHandler, WlrLayerShellState,
@@ -90,12 +92,10 @@ mod seat;
 mod session;
 mod shm;
 mod subcompositor;
-mod xdg_decoration;
 
 use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
 use render::Canvas;
-use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
@@ -508,6 +508,7 @@ pub struct State {
     pub output: Output,
     pub output_manager_state: OutputManagerState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
+    pub xdg_decoration_state: XdgDecorationState,
     /// Per-dmabuf-`wl_buffer` cache key, keyed by the buffer's
     /// `ObjectId`. Mirrors `shm_cache` but for dmabufs: smithay holds
     /// the `Dmabuf` userdata; we keep our compositor-owned cache key
@@ -1301,6 +1302,37 @@ smithay::delegate_fractional_scale!(State);
 // `PresentationFeedbackCachedState`, drained by `fire_presented` at
 // page-flip-complete.
 smithay::delegate_presentation!(State);
+
+// Smithay zxdg_decoration_manager_v1 wiring. Every notification
+// (new_decoration / request_mode / unset_mode) settles the toplevel
+// to ServerSide regardless of what the client asked for — sol is a
+// tiling compositor and won't honour CSD requests; SSD without an
+// actual title bar is the "skip your CSD path entirely" hint
+// alacritty / Chrome / firefox respect.
+impl XdgDecorationHandler for State {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|st| {
+            st.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+        toplevel.with_pending_state(|st| {
+            st.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|st| {
+            st.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
+smithay::delegate_xdg_decoration!(State);
 
 // Smithay compositor wiring. `delegate_compositor!` claims the
 // wl_compositor / wl_subcompositor / wl_surface / wl_subsurface /
@@ -5302,6 +5334,14 @@ fn setup_event_loop(
     );
     let presentation_global = presentation_state.global();
 
+    // Smithay owns zxdg_decoration_manager_v1. The handler forces
+    // ServerSide on every toplevel — sol is a tiling compositor, so
+    // CSD chrome would clash with tile borders, and we don't draw
+    // SSD title bars either; "ServerSide" + no drawing is what makes
+    // alacritty / Chrome / firefox skip their CSD path entirely.
+    let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
+    let xdg_decoration_global = xdg_decoration_state.global();
+
     // Smithay owns the zwp_linux_dmabuf_v1 global. We build a v5
     // global so Mesa's EGL on Wayland gets per-surface feedback (the
     // alternative is v3, which falls back to llvmpipe — see the
@@ -5337,10 +5377,7 @@ fn setup_event_loop(
         seat: seat_global,
         xdg_wm_base: xdg_wm_base_global,
         linux_dmabuf: dmabuf_global,
-        xdg_decoration: dh.create_global::<State, ZxdgDecorationManagerV1, ()>(
-            xdg_decoration::DECORATION_VERSION,
-            (),
-        ),
+        xdg_decoration: xdg_decoration_global,
         layer_shell: layer_shell_global,
         subcompositor: subcompositor_global,
         data_device_manager: data_device_global,
@@ -5655,6 +5692,7 @@ fn setup_event_loop(
         output,
         output_manager_state,
         fractional_scale_manager_state,
+        xdg_decoration_state,
         idle_inhibit_manager_state,
         session: session.clone(),
         data_device_state,
