@@ -26,8 +26,9 @@ pub fn on_inhibit(state: &mut State, surface: WlSurface) {
     if state.idle {
         state.pending_wake = true;
     }
-    tracing::debug!(
+    tracing::info!(
         count = state.idle_inhibitors.len(),
+        surface = ?surface.id(),
         "idle_inhibit: inhibitor created"
     );
 }
@@ -41,7 +42,7 @@ pub fn on_uninhibit(state: &mut State, surface: WlSurface) {
     state
         .idle_inhibitors
         .retain(|w| w.upgrade().ok().as_ref() != Some(&surface));
-    tracing::debug!(
+    tracing::info!(
         count = state.idle_inhibitors.len(),
         "idle_inhibit: inhibitor destroyed"
     );
