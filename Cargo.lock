@@ -943,6 +943,7 @@ dependencies = [
  "drm-fourcc",
  "errno",
  "indexmap",
+ "input",
  "libc",
  "libseat",
  "profiling",

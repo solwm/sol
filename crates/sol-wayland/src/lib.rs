@@ -84,7 +84,6 @@ mod data_device;
 mod debug_ctl;
 mod ext_workspace;
 mod idle_inhibit;
-mod input;
 mod layer_shell;
 mod primary_selection;
 mod render;
@@ -94,7 +93,12 @@ mod shm;
 mod subcompositor;
 
 use compositor::{SolSurfaceData, SurfaceRole};
-use input::{AxisSource, InputEvent, InputState};
+use smithay::backend::input::{
+    AbsolutePositionEvent, Axis as InputAxis, AxisSource, ButtonState as InputButtonState,
+    InputEvent, KeyState as InputKeyState, KeyboardKeyEvent, PointerAxisEvent,
+    PointerButtonEvent, PointerMotionEvent,
+};
+use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use render::Canvas;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
@@ -387,7 +391,13 @@ pub struct State {
     pub started: Instant,
     pub next_serial: u32,
     pub cursor: Cursor,
-    pub input: Option<InputState>,
+    /// Cloned handle to the libinput context (Arc internally, so the
+    /// clone is cheap). Smithay's `LibinputInputBackend` owns the
+    /// EventSource side once it's been inserted into calloop; we keep
+    /// this clone on State so the libseat session-event handler can
+    /// call `suspend()` on Pause and `resume()` on Activate without
+    /// reaching back into calloop. `None` in headless mode.
+    pub libinput: Option<input::Libinput>,
     /// Smithay's seat state. Owns the wl_seat global, the per-keyboard
     /// xkb context, and the per-pointer focus tracking.
     pub seat_state: SeatState<State>,
@@ -5199,7 +5209,7 @@ fn setup_event_loop(
     screen_width: u32,
     screen_height: u32,
     screen_refresh_mhz: i32,
-    input: Option<(InputState, std::os::fd::OwnedFd)>,
+    input: Option<(LibinputInputBackend, input::Libinput)>,
     drm_device_path: Option<PathBuf>,
     session: Option<session::SharedSession>,
     session_notifier: Option<session::LibSeatSessionNotifier>,
@@ -5479,42 +5489,39 @@ fn setup_event_loop(
         )
         .map_err(|e| anyhow::anyhow!("insert display source: {e}"))?;
 
-    let (input_state, input_fd) = match input {
-        Some((s, fd)) => (Some(s), Some(fd)),
+    let (input_backend, libinput_handle) = match input {
+        Some((b, ctx)) => (Some(b), Some(ctx)),
         None => (None, None),
     };
-    if let Some(fd) = input_fd {
+    if let Some(backend) = input_backend {
         event_loop
             .handle()
-            .insert_source(
-                Generic::new(fd, Interest::READ, Mode::Level),
-                |_ready, _fd, comp| {
-                    let events = match comp.state.input.as_mut() {
-                        Some(i) => i.drain(),
-                        None => return Ok(PostAction::Continue),
-                    };
-                    if !events.is_empty() {
-                        comp.state.last_input_at = Instant::now();
-                        if comp.state.idle {
-                            // Wake the screen on the first input after a
-                            // blank. We don't forward this input to any
-                            // client — a keystroke meant to wake up the
-                            // monitor shouldn't also, say, close the
-                            // currently-focused app because it happened
-                            // to be Alt+Q. Consume-and-drop is what sway
-                            // and hyprland do for the same reason.
-                            comp.state.idle = false;
-                            comp.backend.set_dpms(false);
-                            comp.state.needs_render = true;
-                            return Ok(PostAction::Continue);
-                        }
+            .insert_source(backend, |event, _, comp| {
+                // Wake-on-input: a keystroke / pointer motion arriving
+                // while the screen is blanked should bring it back
+                // without also forwarding the keystroke to any client.
+                // The check has to happen before we route the event,
+                // because the bind handler / focus dispatch see the
+                // forwarded copy and would treat it as a real press.
+                let is_meaningful = matches!(
+                    event,
+                    InputEvent::Keyboard { .. }
+                        | InputEvent::PointerMotion { .. }
+                        | InputEvent::PointerMotionAbsolute { .. }
+                        | InputEvent::PointerButton { .. }
+                        | InputEvent::PointerAxis { .. }
+                );
+                if is_meaningful {
+                    comp.state.last_input_at = Instant::now();
+                    if comp.state.idle {
+                        comp.state.idle = false;
+                        comp.backend.set_dpms(false);
+                        comp.state.needs_render = true;
+                        return;
                     }
-                    for ev in events {
-                        apply_input(&mut comp.state, ev);
-                    }
-                    Ok(PostAction::Continue)
-                },
-            )
+                }
+                apply_input(&mut comp.state, event);
+            })
             .map_err(|e| anyhow::anyhow!("insert input source: {e}"))?;
     }
 
@@ -5653,7 +5660,7 @@ fn setup_event_loop(
         started: Instant::now(),
         next_serial: 0,
         cursor,
-        input: input_state,
+        libinput: libinput_handle,
         seat_state,
         seat,
         keyboard: keyboard_handle,
@@ -5858,8 +5865,8 @@ fn handle_session_event(comp: &mut Compositor, ev: session::SessionEvent) {
     match ev {
         session::SessionEvent::PauseSession => {
             tracing::info!("libseat: pause — suspending input + releasing DRM master");
-            if let Some(input) = comp.state.input.as_mut() {
-                input.li.suspend();
+            if let Some(li) = comp.state.libinput.as_mut() {
+                li.suspend();
             }
             if let BackendState::Drm(presenter) = &mut comp.backend {
                 presenter.drop_master();
@@ -5872,8 +5879,8 @@ fn handle_session_event(comp: &mut Compositor, ev: session::SessionEvent) {
                     tracing::warn!(error = %e, "DRM reacquire on activate");
                 }
             }
-            if let Some(input) = comp.state.input.as_mut() {
-                if input.li.resume().is_err() {
+            if let Some(li) = comp.state.libinput.as_mut() {
+                if li.resume().is_err() {
                     tracing::warn!("libinput resume failed — input may be dead");
                 }
             }
@@ -5892,14 +5899,16 @@ fn handle_session_event(comp: &mut Compositor, ev: session::SessionEvent) {
 /// Apply one translated libinput event to the state. Updates the cursor,
 /// sets `needs_render`, and forwards pointer/key events to the right
 /// Wayland client based on current focus.
-fn apply_input(state: &mut State, ev: InputEvent) {
+fn apply_input(state: &mut State, ev: InputEvent<LibinputInputBackend>) {
     state.metrics.input_events += 1;
     // Smithay's KeyboardHandle / PointerHandle track their bound
     // wl_keyboard / wl_pointer resources internally and prune dead
     // ones automatically — no per-tick `retain` needed.
 
     match ev {
-        InputEvent::PointerMotion { dx, dy } => {
+        InputEvent::PointerMotion { event } => {
+            let dx = event.delta_x();
+            let dy = event.delta_y();
             state.cursor.pos_x = (state.cursor.pos_x + dx)
                 .clamp(0.0, state.screen_width as f64 - 1.0);
             state.cursor.pos_y = (state.cursor.pos_y + dy)
@@ -5907,25 +5916,34 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             state.needs_render = true;
             update_pointer_focus_and_motion(state);
         }
-        InputEvent::PointerMotionAbsolute { x_mm, y_mm } => {
-            state.cursor.pos_x = x_mm.clamp(0.0, state.screen_width as f64 - 1.0);
-            state.cursor.pos_y = y_mm.clamp(0.0, state.screen_height as f64 - 1.0);
+        InputEvent::PointerMotionAbsolute { event } => {
+            // Libinput's `x()`/`y()` on absolute pointer events give
+            // device coordinates that the absolute-positioning class
+            // already maps to the output extent, not raw mm. Clamp to
+            // screen anyway for safety against an out-of-spec device.
+            let x = event.x();
+            let y = event.y();
+            state.cursor.pos_x = x.clamp(0.0, state.screen_width as f64 - 1.0);
+            state.cursor.pos_y = y.clamp(0.0, state.screen_height as f64 - 1.0);
             state.needs_render = true;
             update_pointer_focus_and_motion(state);
         }
-        InputEvent::PointerButton { button, pressed } => {
+        InputEvent::PointerButton { event } => {
+            let button = event.button_code();
+            let pressed = event.state() == InputButtonState::Pressed;
             send_pointer_button(state, button, pressed);
         }
-        InputEvent::PointerAxis {
-            source,
-            v_value,
-            h_value,
-            v120_v,
-            v120_h,
-        } => {
-            send_pointer_axis(state, source, v_value, h_value, v120_v, v120_h);
+        InputEvent::PointerAxis { event } => {
+            send_pointer_axis(state, &event);
         }
-        InputEvent::Key { keycode, pressed } => {
+        InputEvent::Keyboard { event } => {
+            // Smithay returns an XKB-style keycode (libinput raw +8).
+            // Sol's keybind / modifier-tracking constants are libinput
+            // raw codes (KEY_LEFTALT etc. from input-event-codes.h),
+            // so subtract 8 to get back to the wire format the rest
+            // of the pipeline expects.
+            let keycode = event.key_code().raw().saturating_sub(8);
+            let pressed = event.state() == InputKeyState::Pressed;
             // Apply user-declared scancode remaps before anything else
             // so modifier tracking, config bindings, and the forwarded
             // key all see the rewritten code. This is what makes
@@ -6108,6 +6126,11 @@ fn apply_input(state: &mut State, ev: InputEvent) {
             }
             send_keyboard_key(state, keycode, pressed);
         }
+        // Touch, gesture, tablet, switch, device-added/removed —
+        // not wired through to clients today. DeviceAdded/Removed
+        // arrive at startup + hot-plug; smithay's own logging
+        // already covers them.
+        _ => {}
     }
 }
 
@@ -6591,43 +6614,40 @@ fn update_pointer_focus_and_motion(state: &mut State) {
 /// `axis(AxisFrame)` issues `axis_source` / `axis` / `axis_stop` /
 /// `axis_value120` / `axis_discrete` based on what's set in the
 /// frame and the bound wl_pointer's version.
-fn send_pointer_axis(
+fn send_pointer_axis<E: PointerAxisEvent<LibinputInputBackend>>(
     state: &mut State,
-    source: AxisSource,
-    v_value: Option<f64>,
-    h_value: Option<f64>,
-    v120_v: Option<f64>,
-    v120_h: Option<f64>,
+    event: &E,
 ) {
     let Some(pointer) = state.pointer.clone() else { return };
     let time = state.elapsed_ms();
-    let smithay_source = match source {
-        AxisSource::Wheel => smithay::backend::input::AxisSource::Wheel,
-        AxisSource::Finger => smithay::backend::input::AxisSource::Finger,
-        AxisSource::Continuous => smithay::backend::input::AxisSource::Continuous,
-    };
+    let source = event.source();
     let kinetic = matches!(source, AxisSource::Finger | AxisSource::Continuous);
-    let mut frame = AxisFrame::new(time).source(smithay_source);
+    let mut frame = AxisFrame::new(time).source(source);
+    let v_value = event.amount(InputAxis::Vertical);
+    let h_value = event.amount(InputAxis::Horizontal);
     if let Some(val) = v_value {
         if val == 0.0 && kinetic {
-            frame = frame.stop(smithay::backend::input::Axis::Vertical);
+            frame = frame.stop(InputAxis::Vertical);
         } else {
-            frame = frame.value(smithay::backend::input::Axis::Vertical, val);
+            frame = frame.value(InputAxis::Vertical, val);
         }
     }
     if let Some(val) = h_value {
         if val == 0.0 && kinetic {
-            frame = frame.stop(smithay::backend::input::Axis::Horizontal);
+            frame = frame.stop(InputAxis::Horizontal);
         } else {
-            frame = frame.value(smithay::backend::input::Axis::Horizontal, val);
+            frame = frame.value(InputAxis::Horizontal, val);
         }
     }
+    // v120 is wheel-only — libinput's high-resolution discrete step
+    // count, 120 units per logical click. Finger/Continuous sources
+    // synthesize value-zero stops instead.
     if matches!(source, AxisSource::Wheel) {
-        if let Some(step) = v120_v {
-            frame = frame.v120(smithay::backend::input::Axis::Vertical, step as i32);
+        if let Some(step) = event.amount_v120(InputAxis::Vertical) {
+            frame = frame.v120(InputAxis::Vertical, step as i32);
         }
-        if let Some(step) = v120_h {
-            frame = frame.v120(smithay::backend::input::Axis::Horizontal, step as i32);
+        if let Some(step) = event.amount_v120(InputAxis::Horizontal) {
+            frame = frame.v120(InputAxis::Horizontal, step as i32);
         }
     }
     pointer.axis(state, frame);
@@ -6921,20 +6941,34 @@ pub fn run_drm(device: &Path) -> Result<()> {
     let refresh_mhz = presenter.refresh_hz() as i32 * 1000;
     tracing::info!(width = w, height = h, refresh_mhz, "drm backend");
 
-    // libinput is DRM-only: a headless PNG dump has nowhere to point a cursor.
-    let input = match InputState::init("seat0", session.clone()) {
-        Ok(pair) => Some(pair),
-        Err(e) => {
-            tracing::warn!(error = %e, "libinput init failed; running without input");
-            None
+    // libinput is DRM-only: a headless PNG dump has nowhere to point
+    // a cursor. Smithay's `LibinputInputBackend` wraps the libinput
+    // context as a calloop `EventSource`; we build the context here
+    // (routing device opens through smithay's `LibinputSessionInterface`
+    // → libseat) so suspend/resume on VT switches works, then hand
+    // both the backend (for calloop) and a cloned context handle (for
+    // suspend/resume on session events) over to setup_event_loop.
+    let input_pair: Option<(LibinputInputBackend, input::Libinput)> = (|| {
+        let mut li = input::Libinput::new_with_udev::<
+            LibinputSessionInterface<session::SharedSession>,
+        >(session.clone().into());
+        if li.udev_assign_seat("seat0").is_err() {
+            tracing::warn!(
+                "libinput udev_assign_seat(seat0) failed; running without input"
+            );
+            return None;
         }
-    };
+        let context_clone = li.clone();
+        let backend = LibinputInputBackend::new(li);
+        tracing::info!(seat = "seat0", "libinput attached (via libseat)");
+        Some((backend, context_clone))
+    })();
     setup_event_loop(
         BackendState::Drm(Box::new(presenter)),
         w,
         h,
         refresh_mhz,
-        input,
+        input_pair,
         Some(device.to_path_buf()),
         Some(session),
         Some(notifier),
