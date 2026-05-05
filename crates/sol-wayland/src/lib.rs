@@ -69,6 +69,10 @@ use smithay::wayland::shell::xdg::{
     SurfaceCachedState as XdgSurfaceCachedState, ToplevelSurface, XdgShellHandler,
     XdgShellState,
 };
+use smithay::wayland::shell::wlr_layer::{
+    Layer as SmithayLayer, LayerSurface as SmithayLayerSurface,
+    WlrLayerShellHandler, WlrLayerShellState,
+};
 
 mod compositor;
 mod config;
@@ -103,7 +107,6 @@ use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_man
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
-use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::ZwlrLayerShellV1;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 
@@ -484,10 +487,6 @@ pub struct State {
     /// rationale on why a side table beats trying to share the
     /// wl_buffer's user-data slot with smithay.
     pub shm_cache: std::collections::HashMap<ObjectId, shm::ShmCacheEntry>,
-    /// Weak refs to every `wl_surface` with a `zwlr_layer_surface_v1`
-    /// role. Dead weaks are pruned on render tick; the role's mapped
-    /// flag on `SurfaceData` determines whether we currently draw it.
-    pub pending_layer_surfaces: Vec<Weak<WlSurface>>,
     /// libseat session handle. Used by VT-switch keybinds and by the
     /// backend's Enable/Disable transition logic. None in headless.
     pub session: Option<session::SharedSession>,
@@ -612,6 +611,12 @@ pub struct State {
     /// `delegate_xdg_shell!`; the role-attachment + configure logic
     /// lives in our `XdgShellHandler` impl.
     pub xdg_shell_state: XdgShellState,
+    /// Smithay's wlr-layer-shell manager state. Owns the
+    /// `zwlr_layer_shell_v1` global and tracks the live
+    /// `LayerSurface` list. The pre-PR-8 `pending_layer_surfaces`
+    /// Vec is gone; iterating layer surfaces now goes through
+    /// `layer_shell_state.layer_surfaces()`.
+    pub layer_shell_state: WlrLayerShellState,
     /// Mapped dialog/transient toplevels — `xdg_toplevel`s that
     /// declared a parent via `set_parent` before mapping. Live
     /// outside the master-stack tile layout: they self-size from
@@ -968,8 +973,7 @@ impl State {
     /// rofi while it's actively waiting for the user to pick a
     /// command would defeat the point of running rofi.
     pub fn on_toplevel_mapped(&mut self, surface: &WlSurface) {
-        use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
-        use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::KeyboardInteractivity;
+        use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 
         // A new TILE mapping means the user wanted to bring up
         // another window in the layout, which they can't see while
@@ -998,8 +1002,7 @@ impl State {
         let layers = layer_shell::mapped_layers(self, screen);
         let exclusive_layer_focused = layers.iter().any(|m| {
             matches!(m.layer, Layer::Top | Layer::Overlay)
-                && m.keyboard_interactivity
-                    == KeyboardInteractivity::Exclusive as u32
+                && m.keyboard_interactivity == KeyboardInteractivity::Exclusive
         });
         if exclusive_layer_focused {
             return;
@@ -1517,6 +1520,61 @@ impl XdgShellHandler for State {
 
 smithay::delegate_xdg_shell!(State);
 
+// Smithay wlr-layer-shell wiring. `delegate_layer_shell!` claims
+// the zwlr_layer_shell_v1 + zwlr_layer_surface_v1 Dispatch; smithay
+// tracks the live LayerSurface list and double-buffers anchor +
+// margin + size + exclusive_zone + keyboard_interactivity in
+// `LayerSurfaceCachedState`. We mark the role on SolSurfaceData so
+// commit_surface knows when to send the initial configure (after
+// the client's first commit-without-buffer per spec) and when to
+// flip `mapped: true` (after the buffered commit lands).
+impl WlrLayerShellHandler for State {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: SmithayLayerSurface,
+        _output: Option<wayland_server::protocol::wl_output::WlOutput>,
+        layer: SmithayLayer,
+        namespace: String,
+    ) {
+        let wl_surface = surface.wl_surface().clone();
+        compositor::with_sol_data_mut(&wl_surface, |sd| {
+            sd.role = SurfaceRole::LayerSurface {
+                mapped: false,
+                initial_configure_sent: false,
+            };
+            sd.zwlr_layer_surface = Some(surface.shell_surface().downgrade());
+        });
+        self.needs_render = true;
+        tracing::info!(
+            ?namespace,
+            ?layer,
+            id = ?wl_surface.id(),
+            "layer surface created"
+        );
+    }
+
+    fn ack_configure(
+        &mut self,
+        _surface: WlSurface,
+        _configure: smithay::wayland::shell::wlr_layer::LayerSurfaceConfigure,
+    ) {
+        // Smithay records the ack; nothing for us to do here.
+    }
+
+    fn layer_destroyed(&mut self, surface: SmithayLayerSurface) {
+        // Cleanup happens lazily via the dead-weak filter in
+        // `mapped_layers`; nothing pressing here.
+        let _ = surface;
+        self.needs_render = true;
+    }
+}
+
+smithay::delegate_layer_shell!(State);
+
 /// Backend-specific render target. Chosen at startup; does not switch at
 /// runtime. `DrmPresenter` is boxed because it carries the Vulkan
 /// device / GBM scan-out / texture-cache state and is a couple of
@@ -1716,7 +1774,8 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
     // into `with_states`, so it must run with no SolSurfaceData lock
     // held. We already dropped ours when `with_states` returned.
     if matches!(snap.role, SurfaceRole::LayerSurface { .. }) {
-        crate::layer_shell::promote_layer_state(surface);
+        // Smithay double-buffers LayerSurfaceCachedState
+        // automatically; no manual promote step needed.
     }
 
     // Phase 4 — role-specific map/unmap transitions. Read role flags,
@@ -2184,8 +2243,7 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
 /// focused. This matches sway/wlroots behavior and is what makes
 /// launchers and lockscreens capture input reliably.
 fn rebalance_keyboard_focus(state: &mut State) {
-    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
-    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::KeyboardInteractivity;
+    use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 
     let screen = Rect {
         x: 0,
@@ -2198,7 +2256,7 @@ fn rebalance_keyboard_focus(state: &mut State) {
     let layers = layer_shell::mapped_layers(state, screen);
     let exclusive_layer = layers.iter().rev().find(|m| {
         matches!(m.layer, Layer::Top | Layer::Overlay)
-            && m.keyboard_interactivity == KeyboardInteractivity::Exclusive as u32
+            && m.keyboard_interactivity == KeyboardInteractivity::Exclusive
     });
     if let Some(ml) = exclusive_layer {
         // Steal focus unconditionally; exclusive means exclusive.
@@ -2716,7 +2774,7 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
         h: state.screen_height as i32,
     };
 
-    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
+    use smithay::wayland::shell::wlr_layer::Layer;
     let layers = layer_shell::mapped_layers(state, screen);
 
     // 1. Background + Bottom layer surfaces. Layer-shell surfaces
@@ -4879,6 +4937,10 @@ fn setup_event_loop(
     let xdg_shell_state = XdgShellState::new::<State>(&dh);
     let xdg_wm_base_global = xdg_shell_state.global();
 
+    // Smithay owns the zwlr_layer_shell_v1 global.
+    let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
+    let layer_shell_global = layer_shell_state.shell_global();
+
     let globals = Globals {
         compositor: compositor_global,
         shm: shm_global,
@@ -4893,10 +4955,7 @@ fn setup_event_loop(
             xdg_decoration::DECORATION_VERSION,
             (),
         ),
-        layer_shell: dh.create_global::<State, ZwlrLayerShellV1, ()>(
-            layer_shell::LAYER_SHELL_VERSION,
-            (),
-        ),
+        layer_shell: layer_shell_global,
         subcompositor: subcompositor_global,
         data_device_manager: data_device_global,
         xdg_output_manager: dh.create_global::<State, ZxdgOutputManagerV1, ()>(
@@ -5226,11 +5285,11 @@ fn setup_event_loop(
         compositor_state,
         shm_cache: std::collections::HashMap::new(),
         idle_inhibit_manager_state,
-        pending_layer_surfaces: Vec::new(),
         session: session.clone(),
         data_device_state,
         primary_selection_state,
         xdg_shell_state,
+        layer_shell_state,
         mapped_popups: Vec::new(),
         mapped_dialogs: Vec::new(),
         dragging: None,
@@ -5789,7 +5848,7 @@ fn spawn_client(state: &State, program: &str, args: &[&str], label: &str) {
 /// layer surfaces. Returns the surface plus cursor position in
 /// surface-local coords.
 fn surface_under_cursor(state: &State) -> Option<(WlSurface, f64, f64)> {
-    use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1::Layer;
+    use smithay::wayland::shell::wlr_layer::Layer;
     let screen = Rect {
         x: 0,
         y: 0,
