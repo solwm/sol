@@ -92,7 +92,6 @@ mod seat;
 mod session;
 mod shm;
 mod subcompositor;
-mod viewporter;
 mod xdg_decoration;
 
 use compositor::{SolSurfaceData, SurfaceRole};
@@ -101,10 +100,10 @@ use render::Canvas;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
-use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Format as DmabufFormat, Fourcc, Modifier};
 use smithay::wayland::dmabuf::{
@@ -1274,6 +1273,14 @@ impl OutputHandler for State {
 
 smithay::delegate_output!(State);
 
+// Smithay owns wp_viewporter wire dispatch — the manager + per-
+// viewport (set_source / set_destination / destroy) live in
+// `ViewporterState`. The cached viewport state is reachable via
+// `with_states(.., |s| s.cached_state.get::<ViewportCachedState>())`;
+// we mirror it into SolSurfaceData inside commit_surface so the
+// renderer's per-surface readers keep working unchanged.
+smithay::delegate_viewporter!(State);
+
 // Smithay compositor wiring. `delegate_compositor!` claims the
 // wl_compositor / wl_subcompositor / wl_surface / wl_subsurface /
 // wl_region / wl_callback Dispatch impls. We provide the handler
@@ -1877,6 +1884,21 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
         let xdg_geom = xdg_state.geometry.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
         drop(xdg_guard);
 
+        // Mirror smithay's wp_viewporter `ViewportCachedState` (set
+        // by SetSource / SetDestination in smithay's per-viewport
+        // Dispatch path) into our SolSurfaceData. The renderer reads
+        // viewport_src to crop the buffer's UV rect and viewport_dst
+        // for the surface's logical size — see the doc comment in
+        // the deleted viewporter.rs for the destination-vs-output-
+        // rect distinction Chrome's Ozone relies on.
+        let mut vp_guard = states.cached_state.get::<ViewportCachedState>();
+        let vp_state = *vp_guard.current();
+        drop(vp_guard);
+        let viewport_src = vp_state
+            .src
+            .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
+        let viewport_dst = vp_state.dst.map(|s| (s.w, s.h));
+
         let sd_arc = states
             .data_map
             .get::<Mutex<compositor::SolSurfaceData>>()
@@ -1900,6 +1922,8 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
         sd.xdg_min_size = xdg_min;
         sd.xdg_max_size = xdg_max;
         sd.xdg_window_geometry = xdg_geom;
+        sd.viewport_src = viewport_src;
+        sd.viewport_dst = viewport_dst;
         let role = sd.role.clone();
         Snapshot {
             attached_now,
@@ -5168,6 +5192,15 @@ fn setup_event_loop(
         .xdg_output_manager_global()
         .expect("xdg_output global");
 
+    // Smithay owns wp_viewporter. The wire dispatch (set_source /
+    // set_destination / destroy) writes to a per-surface
+    // `ViewportCachedState` accessible via with_states; we mirror it
+    // into SolSurfaceData::viewport_{src,dst} inside commit_surface
+    // so the renderer's existing per-surface readers don't need to
+    // change.
+    let viewporter_state = ViewporterState::new::<State>(&dh);
+    let viewporter_global = viewporter_state.global();
+
     // Smithay owns the zwp_linux_dmabuf_v1 global. We build a v5
     // global so Mesa's EGL on Wayland gets per-surface feedback (the
     // alternative is v3, which falls back to llvmpipe — see the
@@ -5215,10 +5248,7 @@ fn setup_event_loop(
             presentation_time::PRESENTATION_VERSION,
             (),
         ),
-        viewporter: dh.create_global::<State, WpViewporter, ()>(
-            viewporter::VIEWPORTER_VERSION,
-            (),
-        ),
+        viewporter: viewporter_global,
         fractional_scale: dh
             .create_global::<State, WpFractionalScaleManagerV1, ()>(
                 fractional_scale::FRACTIONAL_SCALE_VERSION,
