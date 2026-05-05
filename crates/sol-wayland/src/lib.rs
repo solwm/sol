@@ -1497,6 +1497,57 @@ impl XdgShellHandler for State {
         }
     }
 
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        // Client-driven fullscreen — Chrome / Firefox / mpv send this
+        // when the user clicks the fullscreen button on a video.
+        // Route it through the same `state.fullscreened` slot the
+        // keybind toggle uses so apply_layout makes the tile cover
+        // the whole screen and collect_scene draws it above Top
+        // layer surfaces. Mutually exclusive with zoom (same as
+        // toggle_fullscreen).
+        let wl_surface = surface.wl_surface().clone();
+        let is_tile = self
+            .mapped_toplevels
+            .iter()
+            .any(|w| w.surface.upgrade().ok().as_ref() == Some(&wl_surface));
+        if !is_tile {
+            // Floats / dialogs aren't allowed to take the screen.
+            // Send a plain configure so the client unblocks.
+            surface.send_configure();
+            return;
+        }
+        self.fullscreened = Some(wl_surface.downgrade());
+        self.zoomed = None;
+        self.needs_render = true;
+        // apply_layout will run on the next tick and call
+        // send_pending_configures, which sends a configure with the
+        // new size; the client's set_fullscreen request gets answered
+        // there. No need to send_configure here.
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let was_fs = self
+            .fullscreened
+            .as_ref()
+            .and_then(|w| w.upgrade().ok())
+            .as_ref()
+            == Some(wl_surface);
+        if was_fs {
+            self.fullscreened = None;
+            self.needs_render = true;
+            // apply_layout's next pass will reconfigure the tile back
+            // to its master-stack rect.
+        } else {
+            // Wasn't fullscreen on our side — just unblock the client.
+            surface.send_configure();
+        }
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         unmap_toplevel(self, surface.wl_surface());
     }
