@@ -38,6 +38,7 @@ use ash::vk;
 use drm::control::{
     Device as ControlDevice, FbCmd2Flags, Mode, PageFlipFlags, framebuffer, property,
 };
+use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier};
 use sol_core::{PixelFormat, RenderTiming, Scene, SceneBorder, SceneContent};
 
 use crate::vk_blur::{BlurChain, set_viewport_scissor, transition as transition_blur, bytes_of};
@@ -46,7 +47,7 @@ use crate::vk_pipe::{BackdropPC, Pipelines, QuadPC, SolidPC};
 use crate::vk_stack::{SharedStack, VkStack};
 use crate::vk_swap::GbmSwap;
 use crate::vk_texture::TextureCache;
-use crate::{Card, ModePreference, OutputSelection, pick_output};
+use crate::{ModePreference, OutputSelection, drm_device_fd_from_owned, pick_output};
 
 /// Snapshot of the CRTC state that was active before we grabbed master,
 /// pushed back on `Drop` so the TTY restores cleanly. Same shape as the
@@ -58,7 +59,18 @@ struct SavedCrtc {
 }
 
 pub struct DrmPresenter {
-    card: Card,
+    /// Smithay's DrmDevice handle. Implements drm-rs's
+    /// `BasicDevice + ControlDevice` traits so all the
+    /// existing `set_crtc` / `page_flip` / `add_planar_framebuffer`
+    /// / `set_property` calls dispatch as before; what we get on top
+    /// is master-lock acquire/release on drop and a calloop
+    /// `EventSource` (`DrmDeviceNotifier`, returned from `from_fd`).
+    drm: DrmDevice,
+    /// Cloneable refcounted handle to the same fd, owned by the gbm
+    /// device. Kept on the presenter so master state matches between
+    /// the rendering side (Vulkan import) and the modeset side.
+    #[allow(dead_code)]
+    drm_fd: DrmDeviceFd,
     sel: OutputSelection,
     width: u32,
     height: u32,
@@ -110,13 +122,24 @@ pub struct DrmPresenter {
 }
 
 impl DrmPresenter {
-    pub fn from_card(card: Card, mode_pref: Option<ModePreference>) -> Result<Self> {
-        let sel = pick_output(&card, mode_pref)?;
+    /// Build a presenter from a libseat-opened DRM fd. Returns the
+    /// presenter together with the smithay-supplied calloop event
+    /// source for page-flip/vblank events; the caller inserts the
+    /// notifier into its event loop and routes `DrmEvent::VBlank`
+    /// firings into `flip_complete()`.
+    pub fn from_fd(
+        fd: OwnedFd,
+        mode_pref: Option<ModePreference>,
+    ) -> Result<(Self, DrmDeviceNotifier)> {
+        let drm_fd = drm_device_fd_from_owned(fd);
+        let (drm, notifier) = DrmDevice::new(drm_fd.clone(), false)
+            .map_err(|e| anyhow!("DrmDevice::new: {e}"))?;
+        let sel = pick_output(&drm, mode_pref)?;
         let (w_i16, h_i16) = sel.mode.size();
         let width = w_i16 as u32;
         let height = h_i16 as u32;
 
-        let saved_crtc = match card.get_crtc(sel.crtc) {
+        let saved_crtc = match drm.get_crtc(sel.crtc) {
             Ok(info) => Some(SavedCrtc {
                 mode: info.mode(),
                 fb: info.framebuffer(),
@@ -129,7 +152,7 @@ impl DrmPresenter {
         };
 
         let stack = VkStack::new()?;
-        let swap = GbmSwap::new(stack.clone(), &card, width, height)?;
+        let swap = GbmSwap::new(stack.clone(), drm_fd.clone(), width, height)?;
         let pipelines = Pipelines::new(stack.clone())?;
         let textures = TextureCache::new(
             stack.clone(),
@@ -185,7 +208,8 @@ impl DrmPresenter {
         }
 
         let mut presenter = Self {
-            card,
+            drm,
+            drm_fd,
             sel,
             width,
             height,
@@ -209,7 +233,7 @@ impl DrmPresenter {
             last_blur_params: (0, 0),
         };
         presenter.initial_modeset()?;
-        Ok(presenter)
+        Ok((presenter, notifier))
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -228,7 +252,7 @@ impl DrmPresenter {
     pub fn reacquire_master(&mut self) -> Result<()> {
         if let Some(idx) = self.swap.scanned {
             let fb = self.add_or_get_fb(idx)?;
-            self.card
+            self.drm
                 .set_crtc(
                     self.sel.crtc,
                     Some(fb),
@@ -251,11 +275,11 @@ impl DrmPresenter {
     pub fn set_dpms(&mut self, blank: bool) -> Result<()> {
         if self.dpms_prop.is_none() {
             let props = self
-                .card
+                .drm
                 .get_properties(self.sel.connector)
                 .context("get connector properties for DPMS")?;
             for (handle, _) in props.iter() {
-                let info = match self.card.get_property(*handle) {
+                let info = match self.drm.get_property(*handle) {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
@@ -270,14 +294,14 @@ impl DrmPresenter {
             return Ok(());
         };
         let value = if blank { 3 } else { 0 };
-        self.card
+        self.drm
             .set_property(self.sel.connector, handle, value)
             .context("drm set DPMS")?;
 
         if !blank {
             if let Some(idx) = self.swap.scanned {
                 let fb = self.add_or_get_fb(idx)?;
-                self.card
+                self.drm
                     .set_crtc(
                         self.sel.crtc,
                         Some(fb),
@@ -317,27 +341,10 @@ impl DrmPresenter {
         self.pending_render
     }
 
-    pub fn drm_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsFd;
-        self.card.as_fd()
-    }
-
-    /// Drain DRM events. For each page-flip-complete event, settle slot
-    /// state via `flip_complete()`. Returns true if at least one
-    /// page-flip event was consumed so the caller can fire frame
-    /// callbacks.
-    pub fn drain_events(&mut self) -> Result<bool> {
-        let mut saw_flip = false;
-        for ev in self.card.receive_events()? {
-            if matches!(ev, drm::control::Event::PageFlip(_)) {
-                saw_flip = true;
-            }
-        }
-        if saw_flip {
-            self.flip_complete();
-        }
-        Ok(saw_flip)
-    }
+    // DRM event drain is owned by smithay's `DrmDeviceNotifier`
+    // (returned alongside the presenter from `from_fd`). The caller
+    // inserts it as a calloop EventSource and routes
+    // `DrmEvent::VBlank` firings into `flip_complete()` directly.
 
     pub fn flip_complete(&mut self) {
         self.swap.flip_complete();
@@ -362,7 +369,7 @@ impl DrmPresenter {
             return Ok(*fb);
         }
         let fb = self
-            .card
+            .drm
             .add_planar_framebuffer(&slot.bo, FbCmd2Flags::MODIFIERS)
             .context("drm add_planar_framebuffer")?;
         self.fb_cache.insert(key, fb);
@@ -456,7 +463,7 @@ impl DrmPresenter {
         }
 
         let fb = self.add_or_get_fb(idx)?;
-        self.card
+        self.drm
             .set_crtc(
                 self.sel.crtc,
                 Some(fb),
@@ -1142,7 +1149,7 @@ impl DrmPresenter {
         let fb = self.add_or_get_fb(slot_idx)?;
         timing.present_add_fb_ns += t_fb.elapsed().as_nanos() as u64;
         let t_flip = Instant::now();
-        self.card
+        self.drm
             .page_flip(self.sel.crtc, fb, PageFlipFlags::EVENT, None)
             .context("page_flip (inline)")?;
         timing.present_page_flip_ns += t_flip.elapsed().as_nanos() as u64;
@@ -1170,7 +1177,7 @@ impl DrmPresenter {
             t.present_add_fb_ns = t_fb.elapsed().as_nanos() as u64;
 
             let t_flip = Instant::now();
-            self.card
+            self.drm
                 .page_flip(self.sel.crtc, fb, PageFlipFlags::EVENT, None)
                 .context("page_flip after fence signal")?;
             t.present_page_flip_ns = t_flip.elapsed().as_nanos() as u64;
@@ -1207,7 +1214,7 @@ impl Drop for DrmPresenter {
                 from_height = self.height,
                 "restoring prior CRTC state (on high-bandwidth modes the DP link may take 10-15s to re-train)"
             );
-            if let Err(e) = self.card.set_crtc(
+            if let Err(e) = self.drm.set_crtc(
                 self.sel.crtc,
                 saved.fb,
                 saved.position,

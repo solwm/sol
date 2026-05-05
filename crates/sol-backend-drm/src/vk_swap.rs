@@ -16,9 +16,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
 use gbm::{AsRaw, BufferObjectFlags, Format as GbmFormat};
+use smithay::backend::drm::DrmDeviceFd;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
-use crate::Card;
 use crate::vk_stack::SharedStack;
 
 /// Slot count for the scan-out ring. Three is the minimum that lets the
@@ -60,7 +60,7 @@ pub struct Slot {
 #[allow(dead_code)] // gbm/width/height kept for future modeset / resize hooks
 pub struct GbmSwap {
     stack: SharedStack,
-    pub gbm: gbm::Device<Card>,
+    pub gbm: gbm::Device<DrmDeviceFd>,
     pub width: u32,
     pub height: u32,
     pub slots: Vec<Slot>,
@@ -73,8 +73,13 @@ pub struct GbmSwap {
 }
 
 impl GbmSwap {
-    pub fn new(stack: SharedStack, card: &Card, width: u32, height: u32) -> Result<Self> {
-        let gbm = gbm::Device::new(card.clone()).context("gbm::Device::new")?;
+    pub fn new(
+        stack: SharedStack,
+        drm_fd: DrmDeviceFd,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let gbm = gbm::Device::new(drm_fd).context("gbm::Device::new")?;
         let mut slots = Vec::with_capacity(SWAP_SLOTS);
         for i in 0..SWAP_SLOTS {
             // Two-step allocation. First try without `LINEAR`: NVIDIA's GBM
@@ -138,9 +143,9 @@ impl GbmSwap {
                 needs_foreign_acquire: false,
             });
         }
-        // Card is borrowed only to build the gbm::Device; we don't add
-        // DRM framebuffers here (presenter does it lazily on first use).
-        let _ = card;
+        // The DrmDeviceFd we got is consumed by gbm::Device above —
+        // no further DRM ops happen here (presenter adds framebuffers
+        // lazily on first scan-out via add_or_get_fb).
         Ok(Self {
             stack,
             gbm,

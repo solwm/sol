@@ -9,22 +9,28 @@
 //! What this crate is responsible for:
 //! - DRM device introspection (`describe_device`, `pick_output`).
 //! - Mode preference parsing (`ModePreference`, `parse_mode_pref`).
-//! - The `Card` wrapper that hands a DRM fd to drm-rs through its
-//!   trait set.
 //! - The Vulkan stack, GBM-backed scan-out swap, graphics pipelines,
 //!   texture cache, and blur FBOs (in their `vk_*` modules).
 //! - The presenter that ties everything together (`presenter::DrmPresenter`).
+//!
+//! DRM device lifecycle now goes through smithay's `DrmDevice` /
+//! `DrmDeviceFd` / `DrmDeviceNotifier`: the device handle implements
+//! drm-rs's `BasicDevice + ControlDevice` so the existing set_crtc /
+//! page_flip / add_planar_framebuffer call sites keep working
+//! unchanged, while the master-lock acquire/release and calloop
+//! page-flip event source are smithay's responsibility.
 
 #![allow(clippy::collapsible_if)]
 
 use std::fs::{File, OpenOptions};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use drm::Device as BasicDevice;
 use drm::control::{Device as ControlDevice, ModeTypeFlags, connector};
+use smithay::backend::drm::{DrmDevice, DrmDeviceFd};
+use smithay::utils::DeviceFd;
 
 mod presenter;
 mod vk_blur;
@@ -35,42 +41,39 @@ mod vk_swap;
 mod vk_texture;
 
 pub use presenter::DrmPresenter;
+pub use smithay::backend::drm::{DrmEvent, DrmDeviceNotifier};
 
-/// Wrapper that makes `File` satisfy drm-rs's trait set. drm-rs relies on
-/// implementors to provide an FD and lets the traits dispatch ioctls.
-#[derive(Debug, Clone)]
-pub struct Card(Arc<File>);
-
-impl Card {
-    /// Open the DRM device directly. Requires the caller to have access
-    /// to `/dev/dri/cardN`; on a regular user that means `video` group
-    /// membership, or sudo. The main `sol` binary takes the libseat
-    /// path instead via `Card::from_fd`.
-    pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open {}", path.display()))?;
-        Ok(Card(Arc::new(file)))
-    }
-
-    /// Wrap an already-opened DRM fd (typically obtained via
-    /// `libseat::open_device`, which runs as the daemon's user and
-    /// hands us the fd via the seat protocol). Lets sol run as an
-    /// unprivileged user without any group membership.
-    pub fn from_fd(fd: std::os::fd::OwnedFd) -> Self {
-        Card(Arc::new(File::from(fd)))
-    }
+/// Build a smithay `DrmDeviceFd` from an already-opened DRM fd.
+/// Acquires the master lock as a side effect (released when the
+/// last clone drops). Used by the presenter at startup and by the
+/// inspection helpers below.
+fn drm_device_fd_from_owned(fd: OwnedFd) -> DrmDeviceFd {
+    DrmDeviceFd::new(DeviceFd::from(fd))
 }
 
-impl AsFd for Card {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
-    }
+/// Open `/dev/dri/cardN` directly (no libseat). Used by the
+/// `describe_device` CLI introspection path which doesn't need
+/// rendering. Requires `video` group membership or sudo for write
+/// access; the main sol binary takes the libseat path instead.
+fn open_drm_for_inspection(path: &Path) -> Result<DrmDevice> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let owned: OwnedFd = file.into();
+    let drm_fd = drm_device_fd_from_owned(owned);
+    let (device, _notifier) = DrmDevice::new(drm_fd, false)
+        .map_err(|e| anyhow!("DrmDevice::new for inspection: {e}"))?;
+    Ok(device)
 }
-impl BasicDevice for Card {}
-impl ControlDevice for Card {}
+
+// File / Arc imports retained because `open_drm_for_inspection` uses
+// `OpenOptions`; everything else routes through `DrmDeviceFd` now.
+#[allow(dead_code)]
+type _UnusedFile = File;
+#[allow(dead_code)]
+type _UnusedArc<T> = Arc<T>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct OutputSelection {
@@ -110,7 +113,7 @@ fn parse_mode_pref(s: &str) -> Option<ModePreference> {
 /// Describe what's connected without touching master. Safe to run while
 /// another compositor (Hyprland, whatever) holds DRM master on the same VT.
 pub fn describe_device(device: &Path) -> Result<()> {
-    let card = Card::open(device)?;
+    let card = open_drm_for_inspection(device)?;
     let res = card.resource_handles().context("resource_handles")?;
 
     println!("device: {}", device.display());
@@ -152,7 +155,7 @@ pub fn describe_device(device: &Path) -> Result<()> {
 }
 
 pub fn pick_output(
-    card: &Card,
+    card: &impl ControlDevice,
     config_pref: Option<ModePreference>,
 ) -> Result<OutputSelection> {
     // Parse SOL_MODE if set. An unparseable value is rejected up front —

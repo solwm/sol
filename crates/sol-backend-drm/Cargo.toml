@@ -13,6 +13,8 @@ gbm.workspace = true
 ash.workspace = true
 rustix.workspace = true
 sol-core.workspace = true
+smithay = { workspace = true, features = ["backend_drm"] }
+calloop.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true

@@ -5211,6 +5211,7 @@ fn setup_event_loop(
     screen_refresh_mhz: i32,
     input: Option<(LibinputInputBackend, input::Libinput)>,
     drm_device_path: Option<PathBuf>,
+    drm_notifier: Option<sol_backend_drm::DrmDeviceNotifier>,
     session: Option<session::SharedSession>,
     session_notifier: Option<session::LibSeatSessionNotifier>,
     cfg: config::Config,
@@ -5525,25 +5526,24 @@ fn setup_event_loop(
             .map_err(|e| anyhow::anyhow!("insert input source: {e}"))?;
     }
 
-    // DRM fd: kernel delivers page-flip-complete events here after a
-    // page_flip ioctl lands on vblank. Keeping the wait async (instead
-    // of the old blocking wait_for_page_flip at the end of every
+    // DRM page-flip / vblank events. Smithay's `DrmDeviceNotifier`
+    // is a calloop EventSource that emits `DrmEvent::VBlank` per
+    // page-flip-complete; the callback settles slot state via
+    // `flip_complete()` and then runs the same per-flip work the
+    // pre-smithay `Generic` source did. Keeping the wait async (vs
+    // the old blocking wait_for_page_flip at the end of every
     // render) is what lets us stay responsive — if a client stalls
     // inside render_scene, the compositor no longer gets wedged.
-    if let BackendState::Drm(presenter) = &backend {
-        let drm_fd = presenter.drm_fd().try_clone_to_owned()?;
+    if let Some(notifier) = drm_notifier {
         event_loop
             .handle()
-            .insert_source(
-                Generic::new(drm_fd, Interest::READ, Mode::Level),
-                |_ready, _fd, comp| {
-                    let saw_flip = if let BackendState::Drm(p) = &mut comp.backend {
-                        p.drain_events().unwrap_or(false)
-                    } else {
-                        return Ok(PostAction::Continue);
-                    };
-                    if saw_flip {
-                        comp.state.metrics.page_flips += 1;
+            .insert_source(notifier, |event, _, comp| {
+                let saw_flip = matches!(event, sol_backend_drm::DrmEvent::VBlank(_));
+                if saw_flip {
+                    if let BackendState::Drm(p) = &mut comp.backend {
+                        p.flip_complete();
+                    }
+                    comp.state.metrics.page_flips += 1;
                         // Real refresh cadence: the gap between the
                         // *previous* flip-complete event and this one
                         // is what the monitor actually displayed at.
@@ -5606,10 +5606,8 @@ fn setup_event_loop(
                             None => comp.state.flip_counter_reset = Some(now),
                             _ => {}
                         }
-                    }
-                    Ok(PostAction::Continue)
-                },
-            )
+                }
+            })
             .map_err(|e| anyhow::anyhow!("insert drm source: {e}"))?;
     }
 
@@ -6887,7 +6885,9 @@ pub fn run_headless(png_path: PathBuf, width: u32, height: u32) -> Result<()> {
     let cfg = config::load();
     // 60 mHz is a stand-in; headless has no real output and nothing
     // paces off wl_output.mode here.
-    setup_event_loop(backend, width, height, 60_000, None, None, None, None, cfg)
+    setup_event_loop(
+        backend, width, height, 60_000, None, None, None, None, None, cfg,
+    )
 }
 
 /// DRM backend, managed via libseat.
@@ -6924,18 +6924,18 @@ pub fn run_drm(device: &Path) -> Result<()> {
         refresh_hz: m.refresh_hz,
     });
 
-    // Open the DRM device through smithay's session, wrap into a
-    // Card, build the presenter off it. Smithay's `LibSeatSession`
-    // tracks the libseat::Device internally keyed by raw fd, so the
-    // OwnedFd we get back is dup-managed and stays alive for the
+    // Open the DRM device through smithay's session, hand the fd to
+    // the presenter which wraps it in smithay's `DrmDevice` and hands
+    // back a calloop `EventSource` (`DrmDeviceNotifier`) for vblank
+    // delivery. Smithay's `LibSeatSession` tracks the libseat::Device
+    // internally keyed by raw fd, so the OwnedFd stays alive for the
     // session's lifetime — no `open_device_keep_fd` hand-rolled
     // dup-and-store needed.
     use session::Session as _;
     let drm_fd = session
         .open(device, OFlags::RDWR | OFlags::CLOEXEC)
         .map_err(|e| anyhow::anyhow!("libseat: open DRM device: {e:?}"))?;
-    let card = sol_backend_drm::Card::from_fd(drm_fd);
-    let presenter = DrmPresenter::from_card(card, mode_pref)
+    let (presenter, drm_notifier) = DrmPresenter::from_fd(drm_fd, mode_pref)
         .context("initialise DrmPresenter")?;
     let (w, h) = presenter.size();
     let refresh_mhz = presenter.refresh_hz() as i32 * 1000;
@@ -6970,6 +6970,7 @@ pub fn run_drm(device: &Path) -> Result<()> {
         refresh_mhz,
         input_pair,
         Some(device.to_path_buf()),
+        Some(drm_notifier),
         Some(session),
         Some(notifier),
         cfg,
