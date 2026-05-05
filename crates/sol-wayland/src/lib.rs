@@ -241,6 +241,13 @@ pub struct Window {
     /// ticks don't re-send configures when the layout target's
     /// dims haven't changed.
     pub pending_size: Option<(i32, i32)>,
+    /// Most recent FULLSCREEN flag we sent in a configure. Lets
+    /// `send_pending_configures` re-send a configure when the
+    /// fullscreen state flips even if the configured size didn't
+    /// change (e.g. a tile that already happened to be the screen
+    /// size unfullscreening — the client still needs to see the flag
+    /// transition to drop its fullscreen UI).
+    pub pending_fullscreen: bool,
     /// True after `apply_layout` changed `rect` but before the client
     /// committed a buffer at the new configured size. While set,
     /// `tick_animations` holds `render_rect` at its previous value
@@ -1887,6 +1894,7 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
                                 vel_border_alpha: 0.0,
                                 swap_active: false,
                                 pending_size: None,
+                                pending_fullscreen: false,
                                 pending_layout: false,
                                 workspace: state.active_ws,
                             });
@@ -2048,6 +2056,7 @@ pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
                 vel_border_alpha: 0.0,
                 swap_active: false,
                 pending_size: None,
+                pending_fullscreen: false,
                 pending_layout: false,
                 workspace: dlg.workspace,
             });
@@ -2700,19 +2709,34 @@ fn shrink_interior_edges(r: Rect, outer: Rect, gaps_in: i32) -> Rect {
 fn send_pending_configures(state: &mut State) {
     use wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelStateFlag;
 
-    let mut todo: Vec<(usize, i32, i32)> = Vec::new();
+    let fullscreened = state
+        .fullscreened
+        .as_ref()
+        .and_then(|w| w.upgrade().ok());
+
+    // First pass: collect (i, target_w, target_h, is_fullscreen). We
+    // include tiles whose pending_size matches their rect but whose
+    // fullscreen-flag state has flipped, so a no-resize toggle (e.g.
+    // unfullscreen back to a tile that happens to be the same size as
+    // the screen) still sends a configure with the corrected state
+    // bitmask — Chrome won't transition out of fullscreen without it.
+    let mut todo: Vec<(usize, i32, i32, bool)> = Vec::new();
     for (i, win) in state.mapped_toplevels.iter().enumerate() {
         let target = (win.rect.w, win.rect.h);
-        if win.pending_size != Some(target) {
-            todo.push((i, target.0, target.1));
+        let is_fs = fullscreened
+            .as_ref()
+            .zip(win.surface.upgrade().ok().as_ref())
+            .map(|(fs, s)| fs == s)
+            .unwrap_or(false);
+        let size_changed = win.pending_size != Some(target);
+        let fs_changed = win.pending_fullscreen != is_fs;
+        if size_changed || fs_changed {
+            todo.push((i, target.0, target.1, is_fs));
         }
     }
-    for (i, w, h) in todo {
+    for (i, w, h, is_fs) in todo {
         let win = &state.mapped_toplevels[i];
         let Ok(surface) = win.surface.upgrade() else { continue };
-        // Look up the smithay ToplevelSurface for this wl_surface.
-        // Cloning is cheap (it's an Arc-style handle); we drop it
-        // before mutating mapped_toplevels.
         let toplevel = state
             .xdg_shell_state
             .toplevel_surfaces()
@@ -2722,21 +2746,36 @@ fn send_pending_configures(state: &mut State) {
         let Some(toplevel) = toplevel else { continue };
         toplevel.with_pending_state(|tlstate| {
             tlstate.size = Some((w, h).into());
-            tlstate.states.set(ToplevelStateFlag::Maximized);
             tlstate.states.set(ToplevelStateFlag::Activated);
-            tlstate.states.set(ToplevelStateFlag::TiledLeft);
-            tlstate.states.set(ToplevelStateFlag::TiledRight);
-            tlstate.states.set(ToplevelStateFlag::TiledTop);
-            tlstate.states.set(ToplevelStateFlag::TiledBottom);
+            if is_fs {
+                // Fullscreen overrides tile/maximize state per the
+                // xdg-shell spec — clients gate their JS-side
+                // fullscreen UI on this exact flag, not on the size.
+                tlstate.states.set(ToplevelStateFlag::Fullscreen);
+                tlstate.states.unset(ToplevelStateFlag::Maximized);
+                tlstate.states.unset(ToplevelStateFlag::TiledLeft);
+                tlstate.states.unset(ToplevelStateFlag::TiledRight);
+                tlstate.states.unset(ToplevelStateFlag::TiledTop);
+                tlstate.states.unset(ToplevelStateFlag::TiledBottom);
+            } else {
+                tlstate.states.unset(ToplevelStateFlag::Fullscreen);
+                tlstate.states.set(ToplevelStateFlag::Maximized);
+                tlstate.states.set(ToplevelStateFlag::TiledLeft);
+                tlstate.states.set(ToplevelStateFlag::TiledRight);
+                tlstate.states.set(ToplevelStateFlag::TiledTop);
+                tlstate.states.set(ToplevelStateFlag::TiledBottom);
+            }
         });
         let serial = toplevel.send_configure();
         state.mapped_toplevels[i].pending_size = Some((w, h));
+        state.mapped_toplevels[i].pending_fullscreen = is_fs;
         tracing::debug!(
             tile_index = i,
             width = w,
             height = h,
+            fullscreen = is_fs,
             ?serial,
-            "sent xdg_toplevel.configure (tiled+maximized)"
+            "sent xdg_toplevel.configure"
         );
     }
 
