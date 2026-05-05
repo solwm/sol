@@ -81,7 +81,6 @@ mod data_device;
 #[cfg(feature = "debug-ctl")]
 mod debug_ctl;
 mod ext_workspace;
-mod fractional_scale;
 mod idle_inhibit;
 mod input;
 mod layer_shell;
@@ -98,11 +97,13 @@ use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
 use render::Canvas;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
-use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::fractional_scale::{
+    with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
+};
 use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Format as DmabufFormat, Fourcc, Modifier};
@@ -505,6 +506,7 @@ pub struct State {
     /// support would need a Vec<Output> + per-tile output assignment.
     pub output: Output,
     pub output_manager_state: OutputManagerState,
+    pub fractional_scale_manager_state: FractionalScaleManagerState,
     /// Per-dmabuf-`wl_buffer` cache key, keyed by the buffer's
     /// `ObjectId`. Mirrors `shm_cache` but for dmabufs: smithay holds
     /// the `Dmabuf` userdata; we keep our compositor-owned cache key
@@ -1280,6 +1282,20 @@ smithay::delegate_output!(State);
 // we mirror it into SolSurfaceData inside commit_surface so the
 // renderer's per-surface readers keep working unchanged.
 smithay::delegate_viewporter!(State);
+
+// Smithay wp_fractional_scale wiring. The handler runs once per
+// `get_fractional_scale`; we set preferred_scale=1.0 because sol
+// drives integer 1× everywhere today. Smithay handles the protocol's
+// 120-fixed-point conversion + preferred_scale event.
+impl FractionalScaleHandler for State {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        smithay_compositor::with_states(&surface, |states| {
+            with_fractional_scale(states, |fs| fs.set_preferred_scale(1.0));
+        });
+    }
+}
+
+smithay::delegate_fractional_scale!(State);
 
 // Smithay compositor wiring. `delegate_compositor!` claims the
 // wl_compositor / wl_subcompositor / wl_surface / wl_subsurface /
@@ -5201,6 +5217,17 @@ fn setup_event_loop(
     let viewporter_state = ViewporterState::new::<State>(&dh);
     let viewporter_global = viewporter_state.global();
 
+    // Smithay owns wp_fractional_scale_manager_v1. The handler's
+    // new_fractional_scale runs once per get_fractional_scale and is
+    // where we set the preferred scale per-surface. sol drives integer
+    // 1.0× everywhere today, so the handler unconditionally sets 1.0
+    // (smithay multiplies by 120 per the protocol's fixed-point
+    // convention before sending preferred_scale). Per-output / HiDPI
+    // scaling plugs in here when we add it.
+    let fractional_scale_manager_state =
+        FractionalScaleManagerState::new::<State>(&dh);
+    let fractional_scale_global = fractional_scale_manager_state.global();
+
     // Smithay owns the zwp_linux_dmabuf_v1 global. We build a v5
     // global so Mesa's EGL on Wayland gets per-surface feedback (the
     // alternative is v3, which falls back to llvmpipe — see the
@@ -5249,11 +5276,7 @@ fn setup_event_loop(
             (),
         ),
         viewporter: viewporter_global,
-        fractional_scale: dh
-            .create_global::<State, WpFractionalScaleManagerV1, ()>(
-                fractional_scale::FRACTIONAL_SCALE_VERSION,
-                (),
-            ),
+        fractional_scale: fractional_scale_global,
         ext_workspace: dh.create_global::<State, ExtWorkspaceManagerV1, ()>(
             ext_workspace::EXT_WORKSPACE_MANAGER_VERSION,
             (),
@@ -5567,6 +5590,7 @@ fn setup_event_loop(
         dmabuf_cache: std::collections::HashMap::new(),
         output,
         output_manager_state,
+        fractional_scale_manager_state,
         idle_inhibit_manager_state,
         session: session.clone(),
         data_device_state,
