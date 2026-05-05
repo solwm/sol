@@ -33,15 +33,23 @@ pub fn on_inhibit(state: &mut State, surface: WlSurface) {
     );
 }
 
-/// Called from `IdleInhibitHandler::uninhibit`. Drops every entry that
-/// matches the surface. A client that creates two inhibitors on the
-/// same surface and then destroys one will see both removed here —
-/// matches our hand-rolled behaviour where dead `Weak`s would also
-/// be filtered out wholesale on the next `any_active` poll.
+/// Called from `IdleInhibitHandler::uninhibit`. Removes a *single*
+/// entry matching the surface — the inhibitor list carries one entry
+/// per `zwp_idle_inhibitor_v1` resource, and Chrome (and other
+/// browsers) routinely create multiple inhibitors on the same
+/// `wl_surface` (page-level wakelock + media-element wakelock + …).
+/// A whole-surface `retain` here would drop them all on the first
+/// destroy, leaving us with `count=0` while Chrome still holds an
+/// active inhibitor — the screen blanks mid-video. We strip the
+/// first match to keep multiplicity correct.
 pub fn on_uninhibit(state: &mut State, surface: WlSurface) {
-    state
+    if let Some(idx) = state
         .idle_inhibitors
-        .retain(|w| w.upgrade().ok().as_ref() != Some(&surface));
+        .iter()
+        .position(|w| w.upgrade().ok().as_ref() == Some(&surface))
+    {
+        state.idle_inhibitors.swap_remove(idx);
+    }
     tracing::info!(
         count = state.idle_inhibitors.len(),
         "idle_inhibit: inhibitor destroyed"
