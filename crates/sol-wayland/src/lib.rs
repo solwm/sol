@@ -37,7 +37,6 @@ use smithay::reexports::rustix::fs::OFlags;
 use sol_backend_drm::DrmPresenter;
 use std::os::fd::AsRawFd;
 use sol_core::{RenderTiming, Scene, SceneContent, SceneElement};
-use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::{
     Client, Display, DisplayHandle, Resource, Weak,
     backend::{ClientData, ClientId, DisconnectReason, GlobalId, ObjectId},
@@ -65,6 +64,11 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
 };
+use smithay::wayland::shell::xdg::{
+    Configure, PopupSurface, PositionerState as XdgPositionerState,
+    SurfaceCachedState as XdgSurfaceCachedState, ToplevelSurface, XdgShellHandler,
+    XdgShellState,
+};
 
 mod compositor;
 mod config;
@@ -89,7 +93,6 @@ mod subcompositor;
 mod viewporter;
 mod xdg_decoration;
 mod xdg_output;
-mod xdg_shell;
 
 use compositor::{SolSurfaceData, SurfaceRole};
 use input::{AxisSource, InputEvent, InputState};
@@ -120,7 +123,6 @@ pub(crate) fn next_buffer_cache_key() -> u64 {
 }
 
 const OUTPUT_VERSION: u32 = 4;
-const XDG_WM_BASE_VERSION: u32 = 5;
 
 /// Screen-space rectangle assigned to a mapped window by the layout.
 #[derive(Clone, Copy, Debug, Default)]
@@ -604,6 +606,12 @@ pub struct State {
     /// `data_device_state`; routing aligned to keyboard focus via
     /// `set_primary_focus`.
     pub primary_selection_state: PrimarySelectionState,
+    /// Smithay's xdg-shell manager state. Owns the `xdg_wm_base`
+    /// global and tracks the live `ToplevelSurface` /
+    /// `PopupSurface` lists. Clients reach here via
+    /// `delegate_xdg_shell!`; the role-attachment + configure logic
+    /// lives in our `XdgShellHandler` impl.
+    pub xdg_shell_state: XdgShellState,
     /// Mapped dialog/transient toplevels — `xdg_toplevel`s that
     /// declared a parent via `set_parent` before mapping. Live
     /// outside the master-stack tile layout: they self-size from
@@ -1322,6 +1330,193 @@ impl PrimarySelectionHandler for State {
 smithay::delegate_data_device!(State);
 smithay::delegate_primary_selection!(State);
 
+// Smithay xdg-shell wiring. `delegate_xdg_shell!` claims the
+// xdg_wm_base / xdg_surface / xdg_toplevel / xdg_popup /
+// xdg_positioner Dispatch impls. Smithay drives min/max size
+// double-buffering through SurfaceCachedState; we mirror those into
+// SolSurfaceData on commit (in `commit_surface`) so the rest of the
+// compositor reads them via the same field accessor it always did.
+impl XdgShellHandler for State {
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell_state
+    }
+
+    fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Mirror what our pre-PR-7 GetToplevel branch did: stamp role,
+        // stash xdg_toplevel/xdg_surface weaks for `apply_layout`'s
+        // configure path, send an unconstrained initial configure.
+        let wl_surface = surface.wl_surface().clone();
+        compositor::with_sol_data_mut(&wl_surface, |sd| {
+            sd.role = SurfaceRole::XdgToplevel { mapped: false };
+            sd.xdg_toplevel = Some(surface.xdg_toplevel().downgrade());
+            // sd.xdg_surface is unused after the xdg-shell migration
+            // (smithay's send_configure handles xs.configure for us);
+            // leave it None.
+        });
+        // configure(0, 0, no-states) tells the client "pick your
+        // preferred size for now" — dialogs get to use their
+        // intrinsic dims; tiled toplevels get a sized + MAXIMIZED
+        // configure from `apply_layout` once they map.
+        surface.with_pending_state(|state| {
+            state.size = None;
+            state.states.unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            state.states.unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::TiledLeft);
+            state.states.unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::TiledRight);
+            state.states.unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::TiledTop);
+            state.states.unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::TiledBottom);
+            state.states.unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
+        });
+        surface.send_configure();
+        tracing::debug!(id = ?wl_surface.id(), "initial xdg_toplevel.configure");
+    }
+
+    fn new_popup(&mut self, surface: PopupSurface, positioner: XdgPositionerState) {
+        let wl_surface = surface.wl_surface().clone();
+        let geom = positioner.get_geometry();
+        let parent_surface = surface
+            .get_parent_surface();
+        compositor::with_sol_data_mut(&wl_surface, |sd| {
+            sd.role = SurfaceRole::XdgPopup {
+                mapped: false,
+                offset: (geom.loc.x, geom.loc.y),
+                size: (geom.size.w, geom.size.h),
+            };
+            sd.xdg_popup = Some(surface.xdg_popup().downgrade());
+            sd.xdg_popup_parent = parent_surface.as_ref().map(|s| s.downgrade());
+        });
+        surface.with_pending_state(|state| {
+            state.geometry = geom;
+            state.positioner = positioner;
+        });
+        surface.send_configure().ok();
+        tracing::debug!(
+            x = geom.loc.x,
+            y = geom.loc.y,
+            w = geom.size.w,
+            h = geom.size.h,
+            has_parent = parent_surface.is_some(),
+            "xdg_popup configured"
+        );
+    }
+
+    fn move_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wayland_server::protocol::wl_seat::WlSeat,
+        _serial: smithay::utils::Serial,
+    ) {
+        // GTK dialogs send this when the user click-and-drags the CSD
+        // titlebar. Floating dialogs honour it; tiles can't be moved
+        // from the layout, so the helper silently no-ops there.
+        start_dialog_drag(self, surface.wl_surface());
+    }
+
+    fn grab(
+        &mut self,
+        surface: PopupSurface,
+        _seat: wayland_server::protocol::wl_seat::WlSeat,
+        _serial: smithay::utils::Serial,
+    ) {
+        // Track the grabbing popup so a click outside its tree
+        // dismisses the chain via popup_done.
+        self.popup_grab = Some(surface.xdg_popup().downgrade());
+    }
+
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: XdgPositionerState,
+        token: u32,
+    ) {
+        let wl_surface = surface.wl_surface().clone();
+        let geom = positioner.get_geometry();
+        compositor::with_sol_data_mut(&wl_surface, |sd| {
+            sd.role = SurfaceRole::XdgPopup {
+                mapped: matches!(
+                    sd.role,
+                    SurfaceRole::XdgPopup { mapped: true, .. }
+                ),
+                offset: (geom.loc.x, geom.loc.y),
+                size: (geom.size.w, geom.size.h),
+            };
+        });
+        surface.with_pending_state(|state| {
+            state.geometry = geom;
+            state.positioner = positioner;
+        });
+        surface.send_repositioned(token);
+        let _ = surface.send_configure();
+    }
+
+    fn ack_configure(
+        &mut self,
+        _surface: WlSurface,
+        _configure: Configure,
+    ) {
+        // Smithay records the ack; nothing for us to do here.
+    }
+
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface().clone();
+        let parent_surface = surface.parent();
+        compositor::with_sol_data_mut(&wl_surface, |sd| {
+            sd.xdg_toplevel_parent = parent_surface.as_ref().map(|s| s.downgrade());
+        });
+        tracing::info!(
+            id = ?wl_surface.id(),
+            parent = ?parent_surface.as_ref().map(|s| s.id()),
+            "toplevel set_parent"
+        );
+        reclassify_window(self, &wl_surface);
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        // Title is stored in smithay's XdgToplevelSurfaceData
+        // role-attribute mutex; read it via with_states.
+        let title = smithay_compositor::with_states(surface.wl_surface(), |s| {
+            s.data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|m| m.lock().unwrap().title.clone())
+        });
+        if let Some(title) = title {
+            tracing::info!(id = ?surface.wl_surface().id(), %title, "toplevel title");
+        }
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        let app_id = smithay_compositor::with_states(surface.wl_surface(), |s| {
+            s.data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|m| m.lock().unwrap().app_id.clone())
+        });
+        if let Some(app_id) = app_id {
+            tracing::info!(id = ?surface.wl_surface().id(), %app_id, "toplevel app_id");
+        }
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        unmap_toplevel(self, surface.wl_surface());
+    }
+
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        let wl_surface = surface.wl_surface();
+        self.mapped_popups
+            .retain(|w| w.upgrade().ok().as_ref() != Some(wl_surface));
+        if self
+            .popup_grab
+            .as_ref()
+            .and_then(|w| w.upgrade().ok())
+            .map(|p| p.id() == surface.xdg_popup().id())
+            .unwrap_or(false)
+        {
+            self.popup_grab = None;
+        }
+        self.needs_render = true;
+    }
+}
+
+smithay::delegate_xdg_shell!(State);
+
 /// Backend-specific render target. Chosen at startup; does not switch at
 /// runtime. `DrmPresenter` is boxed because it carries the Vulkan
 /// device / GBM scan-out / texture-cache state and is a couple of
@@ -1428,6 +1623,12 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
         frame_callbacks: Vec<wayland_server::protocol::wl_callback::WlCallback>,
         role: SurfaceRole,
         new_current_buffer: Option<wayland_server::protocol::wl_buffer::WlBuffer>,
+        /// True if the client's xdg_toplevel min/max-size or window
+        /// geometry changed in this commit. The dialog-vs-tile
+        /// classification depends on `is_fixed_size_floater` reading
+        /// `min == max`, so reclassify_window must run after the
+        /// mirror updates.
+        xdg_size_hints_changed: bool,
     }
     let snap = smithay_compositor::with_states(surface, |states| {
         let mut attrs_guard = states.cached_state.get::<SurfaceAttributes>();
@@ -1446,6 +1647,21 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
         let ss_loc = ss_guard.current().location;
         drop(ss_guard);
 
+        // Mirror smithay's xdg-shell `SurfaceCachedState` (geometry,
+        // min_size, max_size — set by SetWindowGeometry / SetMinSize
+        // / SetMaxSize in smithay's Dispatch path) into our
+        // SolSurfaceData. Keeps the readers in
+        // `is_fixed_size_floater`, popup placement, and hit-testing
+        // unchanged; xdg-shell migration touches only how the values
+        // arrive, not how they're consumed.
+        let mut xdg_guard =
+            states.cached_state.get::<XdgSurfaceCachedState>();
+        let xdg_state = xdg_guard.current();
+        let xdg_min = (xdg_state.min_size.w, xdg_state.min_size.h);
+        let xdg_max = (xdg_state.max_size.w, xdg_state.max_size.h);
+        let xdg_geom = xdg_state.geometry.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
+        drop(xdg_guard);
+
         let sd_arc = states
             .data_map
             .get::<Mutex<compositor::SolSurfaceData>>()
@@ -1461,8 +1677,14 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
             (None, Some(_)) | (Some(_), None) => true,
             (None, None) => false,
         };
+        let xdg_size_hints_changed = sd.xdg_min_size != xdg_min
+            || sd.xdg_max_size != xdg_max
+            || sd.xdg_window_geometry != xdg_geom;
         sd.current_buffer = buffer_now.clone();
         sd.subsurface_offset = (ss_loc.x, ss_loc.y);
+        sd.xdg_min_size = xdg_min;
+        sd.xdg_max_size = xdg_max;
+        sd.xdg_window_geometry = xdg_geom;
         let role = sd.role.clone();
         Snapshot {
             attached_now,
@@ -1470,6 +1692,7 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
             frame_callbacks,
             role,
             new_current_buffer: buffer_now,
+            xdg_size_hints_changed,
         }
     });
 
@@ -1626,6 +1849,15 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
     if just_mapped_toplevel {
         state.on_toplevel_mapped(surface);
     }
+    // If the client just changed its size constraints / window
+    // geometry, the dialog-vs-tile classification might differ
+    // (e.g., min == max sets in → demote to dialog). Reclassify
+    // is idempotent: a no-op if the slot already matches.
+    if snap.xdg_size_hints_changed
+        && matches!(snap.role, SurfaceRole::XdgToplevel { .. })
+    {
+        reclassify_window(state, surface);
+    }
 
     // Phase 6 — frame callbacks. Defer firing until the next
     // successful render: firing them here would let clients commit
@@ -1741,17 +1973,26 @@ fn weak_eq(a: Option<&Weak<WlSurface>>, b: Option<&Weak<WlSurface>>) -> bool {
 }
 
 fn send_unconstrained_configure(state: &mut State, surface: &WlSurface) {
-    let Some((tl, xs)) = compositor::with_sol_data(surface, |sd| {
-        let tl = sd.xdg_toplevel.as_ref().and_then(|w| w.upgrade().ok())?;
-        let xs = sd.xdg_surface.as_ref().and_then(|w| w.upgrade().ok())?;
-        Some((tl, xs))
-    })
-    .flatten() else {
+    use wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelStateFlag;
+    let Some(toplevel) = state
+        .xdg_shell_state
+        .toplevel_surfaces()
+        .iter()
+        .find(|t| t.wl_surface() == surface)
+        .cloned()
+    else {
         return;
     };
-    tl.configure(0, 0, Vec::new());
-    let serial = state.next_serial();
-    xs.configure(serial);
+    toplevel.with_pending_state(|tlstate| {
+        tlstate.size = None;
+        tlstate.states.unset(ToplevelStateFlag::Maximized);
+        tlstate.states.unset(ToplevelStateFlag::TiledLeft);
+        tlstate.states.unset(ToplevelStateFlag::TiledRight);
+        tlstate.states.unset(ToplevelStateFlag::TiledTop);
+        tlstate.states.unset(ToplevelStateFlag::TiledBottom);
+        tlstate.states.unset(ToplevelStateFlag::Activated);
+    });
+    let _ = toplevel.send_configure();
 }
 
 /// Kick off a compositor-driven interactive move for a dialog —
@@ -2348,7 +2589,7 @@ fn shrink_interior_edges(r: Rect, outer: Rect, gaps_in: i32) -> Rect {
 /// obey the configured size; TILED_* is what tiling-aware clients use to
 /// avoid drawing resize chrome.
 fn send_pending_configures(state: &mut State) {
-    let state_bytes = xdg_shell::tile_state_bytes();
+    use wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelStateFlag;
 
     let mut todo: Vec<(usize, i32, i32)> = Vec::new();
     for (i, win) in state.mapped_toplevels.iter().enumerate() {
@@ -2360,23 +2601,32 @@ fn send_pending_configures(state: &mut State) {
     for (i, w, h) in todo {
         let win = &state.mapped_toplevels[i];
         let Ok(surface) = win.surface.upgrade() else { continue };
-        let Some((tl, xs)) = compositor::with_sol_data(&surface, |sd| {
-            let tl = sd.xdg_toplevel.as_ref()?.upgrade().ok()?;
-            let xs = sd.xdg_surface.as_ref()?.upgrade().ok()?;
-            Some((tl, xs))
-        })
-        .flatten() else {
-            continue;
-        };
-        let serial = state.next_serial();
-        tl.configure(w, h, state_bytes.clone());
-        xs.configure(serial);
+        // Look up the smithay ToplevelSurface for this wl_surface.
+        // Cloning is cheap (it's an Arc-style handle); we drop it
+        // before mutating mapped_toplevels.
+        let toplevel = state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|t| t.wl_surface() == &surface)
+            .cloned();
+        let Some(toplevel) = toplevel else { continue };
+        toplevel.with_pending_state(|tlstate| {
+            tlstate.size = Some((w, h).into());
+            tlstate.states.set(ToplevelStateFlag::Maximized);
+            tlstate.states.set(ToplevelStateFlag::Activated);
+            tlstate.states.set(ToplevelStateFlag::TiledLeft);
+            tlstate.states.set(ToplevelStateFlag::TiledRight);
+            tlstate.states.set(ToplevelStateFlag::TiledTop);
+            tlstate.states.set(ToplevelStateFlag::TiledBottom);
+        });
+        let serial = toplevel.send_configure();
         state.mapped_toplevels[i].pending_size = Some((w, h));
         tracing::debug!(
             tile_index = i,
             width = w,
             height = h,
-            serial,
+            ?serial,
             "sent xdg_toplevel.configure (tiled+maximized)"
         );
     }
@@ -4625,12 +4875,16 @@ fn setup_event_loop(
     let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
     let primary_selection_global = primary_selection_state.global();
 
+    // Smithay owns the xdg_wm_base global.
+    let xdg_shell_state = XdgShellState::new::<State>(&dh);
+    let xdg_wm_base_global = xdg_shell_state.global();
+
     let globals = Globals {
         compositor: compositor_global,
         shm: shm_global,
         output: dh.create_global::<State, WlOutput, ()>(OUTPUT_VERSION, ()),
         seat: seat_global,
-        xdg_wm_base: dh.create_global::<State, XdgWmBase, ()>(XDG_WM_BASE_VERSION, ()),
+        xdg_wm_base: xdg_wm_base_global,
         linux_dmabuf: dh.create_global::<State, ZwpLinuxDmabufV1, ()>(
             linux_dmabuf::DMABUF_VERSION,
             (),
@@ -4976,6 +5230,7 @@ fn setup_event_loop(
         session: session.clone(),
         data_device_state,
         primary_selection_state,
+        xdg_shell_state,
         mapped_popups: Vec::new(),
         mapped_dialogs: Vec::new(),
         dragging: None,

@@ -17,7 +17,7 @@
 use std::sync::Mutex;
 
 use wayland_protocols::xdg::shell::server::{
-    xdg_popup::XdgPopup, xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel,
+    xdg_popup::XdgPopup, xdg_toplevel::XdgToplevel,
 };
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 use wayland_server::Weak;
@@ -87,11 +87,10 @@ pub struct SolSurfaceData {
     /// Keeping a strong ref means we still have a valid texture
     /// source until the next attach replaces it.
     pub current_buffer: Option<wayland_server::protocol::wl_buffer::WlBuffer>,
-    /// Populated by xdg_surface.get_toplevel so the compositor can send
-    /// directive configure events during layout without threading the
-    /// XdgToplevel handle through every code path.
+    /// Populated in `XdgShellHandler::new_toplevel` so the compositor
+    /// can send directive configure events during layout without
+    /// threading the XdgToplevel handle through every code path.
     pub xdg_toplevel: Option<Weak<XdgToplevel>>,
-    pub xdg_surface: Option<Weak<XdgSurface>>,
     /// Populated by zwlr_layer_shell_v1.get_layer_surface — same purpose
     /// as the xdg handles above, but for layer surfaces so apply_layout
     /// can configure the bar/launcher/wallpaper.
