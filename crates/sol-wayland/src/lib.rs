@@ -2707,7 +2707,10 @@ fn master_stack_layout(n: usize, screen: Rect, master_ratio: f32) -> Vec<Rect> {
             // already clamps, this is a belt-and-braces.
             let r = master_ratio.clamp(0.1, 0.9);
             let mid = (screen.w as f32 * r).round() as i32;
-            let mid = mid.clamp(1, screen.w - 1);
+            // Upper bound floored at 1: a layer surface claiming an
+            // exclusive zone as wide as the screen can shrink the usable
+            // area to a single column, and clamp(1, 0) panics.
+            let mid = mid.clamp(1, (screen.w - 1).max(1));
             let master = Rect {
                 x: screen.x,
                 y: screen.y,
@@ -2716,12 +2719,14 @@ fn master_stack_layout(n: usize, screen: Rect, master_ratio: f32) -> Vec<Rect> {
             };
             let stack_w = screen.w - mid;
             let stack_x = screen.x + mid;
-            let stack_n = (n - 1) as i32;
+            // i64 so `h * i` can't overflow no matter how many tiles a
+            // client maps; each quotient is back within i32 range.
+            let stack_n = (n - 1) as i64;
             let mut out = Vec::with_capacity(n);
             out.push(master);
-            for i in 0..(n - 1) as i32 {
-                let y0 = screen.y + (screen.h * i) / stack_n;
-                let y1 = screen.y + (screen.h * (i + 1)) / stack_n;
+            for i in 0..stack_n {
+                let y0 = screen.y + ((screen.h as i64 * i) / stack_n) as i32;
+                let y1 = screen.y + ((screen.h as i64 * (i + 1)) / stack_n) as i32;
                 out.push(Rect {
                     x: stack_x,
                     y: y0,
