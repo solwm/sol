@@ -415,12 +415,12 @@ impl TextureCache {
         }
 
         // Wayland hands us a borrowed RawFd; dup it because Vulkan
-        // takes ownership on import success.
-        use std::os::fd::FromRawFd;
-        let dup = unsafe {
-            libc_dup(fds[0]).context("dup dmabuf fd")?
+        // takes ownership on import success. CLOEXEC so clients
+        // spawned while the import is alive don't inherit the fd.
+        let owned = {
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fds[0]) };
+            rustix::io::fcntl_dupfd_cloexec(borrowed, 0).context("dup dmabuf fd")?
         };
-        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
 
         let image_data = import_dmabuf_external(
             &self.stack,
@@ -758,22 +758,4 @@ fn import_dmabuf_external(
         view,
         memory,
     })
-}
-
-unsafe fn libc_dup(fd: std::os::fd::RawFd) -> Result<i32> {
-    let r = unsafe { libc_dup_impl(fd) };
-    if r < 0 {
-        Err(anyhow!("dup({fd}): {}", std::io::Error::last_os_error()))
-    } else {
-        Ok(r)
-    }
-}
-
-// Minimal shim so we don't drag the full libc crate dep in here for one
-// call. `dup` is `int dup(int)` in <unistd.h>.
-unsafe extern "C" {
-    fn dup(fd: i32) -> i32;
-}
-unsafe fn libc_dup_impl(fd: i32) -> i32 {
-    unsafe { dup(fd) }
 }
