@@ -1096,20 +1096,46 @@ impl DrmPresenter {
             let exp = export_sync_fd(&self.stack, sem);
             timing.cpu_export_sync_fd_ns += t_export.elapsed().as_nanos() as u64;
             match exp {
-                Ok(fd) => {
+                Ok(Some(fd)) => {
                     self.in_flight_slot = Some(slot_idx);
                     self.pending_render = true;
                     Ok(Some(fd))
                 }
+                Ok(None) => {
+                    // Legal "-1" payload: the GPU already finished and
+                    // the export consumed the signal. Nothing to poll;
+                    // flip inline. The fence wait is a formality (the
+                    // submit is provably complete) but keeps every
+                    // flip path uniformly behind the fence.
+                    unsafe {
+                        let _ = self.stack.device.wait_for_fences(
+                            &[self.frame_fence],
+                            true,
+                            u64::MAX,
+                        );
+                    }
+                    self.inline_flip(slot_idx, timing)
+                }
                 Err(e) => {
                     // Export failed mid-flight — fall back to a wait
                     // and inline page_flip so the frame still lands.
+                    // The pending signal on the binary semaphore was
+                    // never consumed, so signalling it again next
+                    // frame would be invalid: recreate it (or drop to
+                    // the synchronous path if even that fails).
                     tracing::warn!(error = %e, "vkGetSemaphoreFdKHR failed; inline page_flip");
                     unsafe {
                         let _ = self.stack.device.wait_for_fences(
                             &[self.frame_fence],
                             true,
                             u64::MAX,
+                        );
+                        self.stack.device.destroy_semaphore(sem, None);
+                    }
+                    self.sync_semaphore = create_export_semaphore(&self.stack);
+                    if self.sync_semaphore.is_none() {
+                        tracing::warn!(
+                            "sync semaphore recreation failed; staying on the synchronous flip path"
                         );
                     }
                     self.inline_flip(slot_idx, timing)
@@ -1451,7 +1477,15 @@ fn create_export_semaphore(stack: &VkStack) -> Option<vk::Semaphore> {
     Some(sem)
 }
 
-fn export_sync_fd(stack: &VkStack, sem: vk::Semaphore) -> Result<OwnedFd> {
+/// Export the semaphore's pending signal as a sync FD.
+///
+/// `Ok(None)` is the spec's "-1: payload already signaled" case — the
+/// export still consumes the payload (copy transference has wait
+/// semantics), there's just no fd to poll because there's nothing to
+/// wait for. Only `Err` means the payload was NOT consumed; the caller
+/// must recreate the semaphore or the next frame's signal would
+/// re-signal an already-signaled binary semaphore.
+fn export_sync_fd(stack: &VkStack, sem: vk::Semaphore) -> Result<Option<OwnedFd>> {
     use std::os::fd::FromRawFd;
     let info = vk::SemaphoreGetFdInfoKHR::default()
         .semaphore(sem)
@@ -1463,7 +1497,7 @@ fn export_sync_fd(stack: &VkStack, sem: vk::Semaphore) -> Result<OwnedFd> {
             .map_err(|e| anyhow!("vkGetSemaphoreFdKHR: {e:?}"))?
     };
     if raw < 0 {
-        anyhow::bail!("vkGetSemaphoreFdKHR returned negative FD ({raw})");
+        return Ok(None);
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
 }
