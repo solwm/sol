@@ -3783,11 +3783,15 @@ fn compute_uv(
         Some((x, y, w, h)) if buf_w > 0 && buf_h > 0 => {
             let bw = buf_w as f64;
             let bh = buf_h as f64;
-            let ux = (x / bw).clamp(0.0, 1.0) as f32;
-            let uy = (y / bh).clamp(0.0, 1.0) as f32;
-            let uw = (w / bw).clamp(0.0, 1.0) as f32;
-            let uh = (h / bh).clamp(0.0, 1.0) as f32;
-            (ux, uy, uw, uh)
+            let ux = (x / bw).clamp(0.0, 1.0);
+            let uy = (y / bh).clamp(0.0, 1.0);
+            // Clamp extents against what's left after the offset so
+            // ux+uw / uy+uh can't exceed 1.0 — independently clamped
+            // components still let a src like (0.9·bw, 0.9·bw) sample
+            // past the texture edge.
+            let uw = (w / bw).clamp(0.0, 1.0 - ux);
+            let uh = (h / bh).clamp(0.0, 1.0 - uy);
+            (ux as f32, uy as f32, uw as f32, uh as f32)
         }
         _ => (0.0, 0.0, 1.0, 1.0),
     }
