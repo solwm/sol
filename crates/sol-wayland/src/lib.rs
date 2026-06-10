@@ -2423,6 +2423,16 @@ pub(crate) fn unmap_toplevel(state: &mut State, surface: &WlSurface) {
     state
         .fullscreened_per_workspace
         .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
+    // And for the stack-focus / master-swap memories — their readers
+    // re-validate on lookup, so stale weaks aren't dangerous, but
+    // pruning here keeps every per-workspace map on the same
+    // lifecycle.
+    state
+        .last_stack_focus_per_workspace
+        .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
+    state
+        .last_master_swap_partner_per_workspace
+        .retain(|_, w| w.upgrade().ok().as_ref() != Some(surface));
 
     // Snapshot the dying tile for the close animation: clone its
     // last buffer (Strong WlBuffer), capture render_rect + alpha
