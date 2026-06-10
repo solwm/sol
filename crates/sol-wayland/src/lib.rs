@@ -953,8 +953,6 @@ pub struct Cursor {
     /// Chrome over a fullscreen video, after a few seconds idle).
     /// Both flags off → render the default sprite.
     pub client_surface: Option<Weak<WlSurface>>,
-    pub client_hot_x: i32,
-    pub client_hot_y: i32,
 }
 
 impl Cursor {
@@ -971,8 +969,6 @@ impl Cursor {
             hot_y: sprite.hot_y,
             client_override_active: false,
             client_surface: None,
-            client_hot_x: 0,
-            client_hot_y: 0,
             upload_seq: 1,
         }
     }
@@ -3506,10 +3502,19 @@ fn collect_scene(state: &State, now: Instant) -> (Vec<Placed>, usize, usize) {
                 (buf, sd.viewport_src, dims)
             }) {
                 if let (Some(buf), Some((w, h))) = (buf, dims) {
-                    let cx = state.cursor.pos_x as f32
-                        - state.cursor.client_hot_x as f32;
-                    let cy = state.cursor.pos_y as f32
-                        - state.cursor.client_hot_y as f32;
+                    // Hotspot lives in smithay's per-surface data_map
+                    // (written by its wl_pointer.set_cursor dispatch).
+                    // Read it fresh each frame so an I-beam/crosshair
+                    // cursor anchors at its hotspot, not its corner.
+                    let hot = smithay_compositor::with_states(&cur, |states| {
+                        states
+                            .data_map
+                            .get::<smithay::input::pointer::CursorImageSurfaceData>()
+                            .map(|m| m.lock().unwrap().hotspot)
+                    })
+                    .unwrap_or_default();
+                    let cx = state.cursor.pos_x as f32 - hot.x as f32;
+                    let cy = state.cursor.pos_y as f32 - hot.y as f32;
                     out.push(Placed::Buffer {
                         buf,
                         rect: RectF {
