@@ -1283,37 +1283,45 @@ fn record_scanout_acquire(
     slot: &crate::vk_swap::Slot,
     queue_family: u32,
 ) {
-    let (src_qf, dst_qf, old_layout) = if slot.needs_foreign_acquire {
-        (
-            vk::QUEUE_FAMILY_FOREIGN_EXT,
-            queue_family,
-            vk::ImageLayout::GENERAL,
-        )
+    // The release/acquire halves of a queue-family ownership transfer
+    // must specify *identical* oldLayout/newLayout (the transition
+    // executes once, between the two halves). So the QFOT pair is
+    // recorded with no transition (GENERAL → GENERAL, matching
+    // `record_scanout_release`) and the render-layout change happens
+    // in a separate plain barrier chained after the acquire — the
+    // wlroots pattern.
+    if slot.needs_foreign_acquire {
+        let acquire = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags2::empty())
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::empty())
+            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .dst_queue_family_index(queue_family)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(slot.image)
+            .subresource_range(color_range_scanout());
+        let dep =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&acquire));
+        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+    }
+    let old_layout = if slot.needs_foreign_acquire {
+        vk::ImageLayout::GENERAL
     } else {
-        (
-            vk::QUEUE_FAMILY_IGNORED,
-            vk::QUEUE_FAMILY_IGNORED,
-            vk::ImageLayout::UNDEFINED,
-        )
+        vk::ImageLayout::UNDEFINED
     };
-    let barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+    let to_render = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
         .src_access_mask(vk::AccessFlags2::empty())
         .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .src_queue_family_index(src_qf)
-        .dst_queue_family_index(dst_qf)
         .old_layout(old_layout)
         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .image(slot.image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-    let dep = vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+        .subresource_range(color_range_scanout());
+    let dep =
+        vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_render));
     unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 }
 
@@ -1328,25 +1336,46 @@ fn record_scanout_release(
     slot: &crate::vk_swap::Slot,
     queue_family: u32,
 ) {
-    let barrier = vk::ImageMemoryBarrier2::default()
+    // Mirror of `record_scanout_acquire`: plain transition to GENERAL
+    // first, then the QFOT release with no layout change so both
+    // halves of the transfer match.
+    let to_general = vk::ImageMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
         .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::empty())
+        .old_layout(slot.layout)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .image(slot.image)
+        .subresource_range(color_range_scanout());
+    let dep =
+        vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_general));
+    unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+
+    let release = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::empty())
         .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
         .dst_access_mask(vk::AccessFlags2::empty())
         .src_queue_family_index(queue_family)
         .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-        .old_layout(slot.layout)
+        .old_layout(vk::ImageLayout::GENERAL)
         .new_layout(vk::ImageLayout::GENERAL)
         .image(slot.image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-    let dep = vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+        .subresource_range(color_range_scanout());
+    let dep =
+        vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&release));
     unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+}
+
+fn color_range_scanout() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
 }
 
 #[allow(dead_code)] // kept for ad-hoc debug paths; scan-out boundaries use the FOREIGN-aware helpers above
