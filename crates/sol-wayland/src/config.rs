@@ -406,6 +406,36 @@ pub fn load() -> Config {
     }
 }
 
+/// Reload variant of `load`: returns `None` when the file can't be
+/// read instead of falling back to the built-in defaults. Editors
+/// save via rename-over, so the inotify watch can fire inside a
+/// window where the path briefly doesn't exist — the caller keeps
+/// the running config rather than silently reverting the user's
+/// live keybinds to the defaults. (Consequence: deleting sol.conf
+/// doesn't reset to defaults until restart.)
+pub fn try_load() -> Option<Config> {
+    let path = config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let cfg = parse(&text);
+            tracing::info!(
+                path = %path.display(),
+                bindings = cfg.bindings.len(),
+                "config loaded"
+            );
+            Some(cfg)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "config reload read failed; keeping the running config"
+            );
+            None
+        }
+    }
+}
+
 pub fn config_path() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {

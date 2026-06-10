@@ -2649,7 +2649,11 @@ fn install_config_watcher(
 ///   We log a warning so the user knows their edit won't take
 ///   effect until restart.
 fn apply_config_reload(state: &mut State) {
-    let new_cfg = config::load();
+    // Keep the running config when the re-read fails — see
+    // `config::try_load` for why this must not fall back to defaults.
+    let Some(new_cfg) = config::try_load() else {
+        return;
+    };
 
     if new_cfg.mode != state.config.mode {
         match new_cfg.mode {
