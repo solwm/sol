@@ -333,10 +333,16 @@ impl TextureCache {
             );
         }
         unsafe {
-            for row in 0..h {
-                let src = pixels.as_ptr().add(row * stride as usize);
-                let dst = staging.mapped.add(row * dst_row);
-                std::ptr::copy_nonoverlapping(src, dst, tight_row);
+            if stride as usize == tight_row {
+                // Tightly packed (the common case) — one memcpy for
+                // the whole buffer instead of one per row.
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), staging.mapped, total);
+            } else {
+                for row in 0..h {
+                    let src = pixels.as_ptr().add(row * stride as usize);
+                    let dst = staging.mapped.add(row * dst_row);
+                    std::ptr::copy_nonoverlapping(src, dst, tight_row);
+                }
             }
         }
 
