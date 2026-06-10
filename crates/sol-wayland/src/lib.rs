@@ -217,6 +217,14 @@ pub struct Window {
     /// `ws_alpha * render_alpha * (focused ? 1.0 : inactive_alpha)`.
     pub render_alpha: f32,
     pub vel_alpha: f32,
+    /// The value `render_alpha` is currently springing toward,
+    /// written by `tick_animations` each pass (1.0 normally, 0.0 for
+    /// tiles faded out behind a zoom/fullscreen spotlight).
+    /// `has_active_animation` compares against this instead of a
+    /// hardcoded 1.0 — otherwise tiles settled at 0.0 read as
+    /// "animating forever" and keep the compositor rendering at full
+    /// refresh rate while a spotlight is up.
+    pub alpha_target: f32,
     /// Uniform scale around `render_rect`'s center for the open
     /// animation: starts at 0.7, springs to 1.0. The drawn rect is
     /// `render_rect` scaled by this factor about its center, so
@@ -2073,6 +2081,7 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
                                 velocity: RectF::default(),
                                 render_alpha: 0.0,
                                 vel_alpha: 0.0,
+                                alpha_target: 1.0,
                                 render_scale: 0.7,
                                 vel_scale: 0.0,
                                 border_alpha: 0.0,
@@ -2232,6 +2241,7 @@ pub(crate) fn reclassify_window(state: &mut State, surface: &WlSurface) {
                 // alpha-fade-in here would look jarring.
                 render_alpha: 1.0,
                 vel_alpha: 0.0,
+                alpha_target: 1.0,
                 render_scale: 1.0,
                 vel_scale: 0.0,
                 // Promoted dialog → tile: skip the open border-fade
@@ -4013,6 +4023,9 @@ fn tick_animations(state: &mut State, now: Instant) -> bool {
         } else {
             1.0
         };
+        // Record it so has_active_animation knows what "settled"
+        // means for this tile (see the field doc on Window).
+        win.alpha_target = alpha_target;
         // Fade springs (open animation: alpha + scale → 1.0) use
         // the dedicated fade tuning, border-alpha keeps the base.
         for (cur, vel, tgt, k, c) in [
@@ -4157,7 +4170,7 @@ fn has_active_animation(state: &State) -> bool {
             || v.y.abs() > VEL_EPS
             || v.w.abs() > VEL_EPS
             || v.h.abs() > VEL_EPS
-            || (1.0 - w.render_alpha).abs() > A_EPS
+            || (w.alpha_target - w.render_alpha).abs() > A_EPS
             || w.vel_alpha.abs() > A_EPS
             || (1.0 - w.render_scale).abs() > A_EPS
             || w.vel_scale.abs() > A_EPS
