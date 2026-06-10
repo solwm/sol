@@ -61,6 +61,12 @@ pub fn install(
     // before bind is safe.
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
+    // The runtime dir is already 0700, but the socket grants
+    // arbitrary exec — owner-only perms regardless of umask.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     listener.set_nonblocking(true)?;
     tracing::info!(path = %socket_path.display(), "debug-ctl listening");
 
@@ -139,6 +145,17 @@ fn handle_readable(stream: &UnixStream, comp: &mut Compositor) -> PostAction {
             }
             Ok(n) => {
                 if let Some(ctl) = comp.state.debug_ctl.as_mut() {
+                    // Lines are drained below as newlines arrive; a
+                    // peer streaming bytes with no newline would grow
+                    // this without bound. No sane command is anywhere
+                    // near 1 MiB — disconnect instead.
+                    const RECV_BUF_MAX: usize = 1 << 20;
+                    if ctl.recv_buf.len() + n > RECV_BUF_MAX {
+                        tracing::warn!("debug-ctl: line exceeds 1 MiB; disconnecting");
+                        ctl.conn_active = false;
+                        ctl.recv_buf.clear();
+                        return PostAction::Remove;
+                    }
                     ctl.recv_buf.extend_from_slice(&chunk[..n]);
                 }
             }

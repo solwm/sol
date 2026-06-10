@@ -5876,13 +5876,21 @@ fn setup_event_loop(
     // $XDG_RUNTIME_DIR/sol-ctl-<wayland-display>.sock.
     #[cfg(feature = "debug-ctl")]
     {
-        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let ctl_path = runtime_dir.join(format!("sol-ctl-{}.sock", socket_name));
-        match debug_ctl::install(&event_loop.handle(), loop_signal.clone(), ctl_path) {
-            Ok(ctl) => compositor.state.debug_ctl = Some(ctl),
-            Err(e) => tracing::warn!(error = %e, "debug-ctl install failed"),
+        // The socket accepts spawn commands (arbitrary exec as the
+        // compositor user), so it must only ever live inside the 0700
+        // per-user runtime dir — never a world-writable /tmp fallback
+        // where any local user could connect.
+        match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            Some(runtime_dir) => {
+                let ctl_path = runtime_dir.join(format!("sol-ctl-{}.sock", socket_name));
+                match debug_ctl::install(&event_loop.handle(), loop_signal.clone(), ctl_path) {
+                    Ok(ctl) => compositor.state.debug_ctl = Some(ctl),
+                    Err(e) => tracing::warn!(error = %e, "debug-ctl install failed"),
+                }
+            }
+            None => tracing::warn!(
+                "debug-ctl: XDG_RUNTIME_DIR unset; refusing to bind the control socket"
+            ),
         }
     }
     if let Err(e) = ctrlc::set_handler(move || {
