@@ -22,6 +22,10 @@ pub enum PixelFormat {
 }
 
 
+/// Most planes a dmabuf can carry per the zwp_linux_dmabuf_v1
+/// protocol (and per DRM AddFB2).
+pub const MAX_DMABUF_PLANES: usize = 4;
+
 /// Where a scene element's pixel data actually lives. SHM buffers are
 /// CPU-mapped and the server blits/uploads from the borrowed slice. Dmabuf
 /// buffers live on the GPU; the server imports the fd as a `VkImage` on
@@ -43,13 +47,22 @@ pub enum SceneContent<'a> {
         upload_seq: u64,
     },
     Dmabuf {
-        /// Raw dmabuf fd. Borrowed from the wl_buffer's user-data for one
-        /// frame; the fd stays open for the full wl_buffer lifetime.
-        fd: std::os::fd::RawFd,
+        /// Number of planes actually present in the buffer (1..=4).
+        /// Only the first `num_planes` entries of the arrays below are
+        /// meaningful. The renderer samples plane 0 as RGBA (the NV12
+        /// plane-0-as-luma tradeoff is deliberate — see
+        /// `dmabuf_imported`), but the import path needs every memory
+        /// plane's layout when the buffer's DRM modifier uses more
+        /// than one (e.g. Intel CCS aux planes).
+        num_planes: usize,
+        /// Raw dmabuf fds per plane. Borrowed from the wl_buffer's
+        /// user-data for one frame; they stay open for the full
+        /// wl_buffer lifetime.
+        fds: [std::os::fd::RawFd; MAX_DMABUF_PLANES],
+        offsets: [u32; MAX_DMABUF_PLANES],
+        strides: [u32; MAX_DMABUF_PLANES],
         fourcc: u32,
         modifier: u64,
-        offset: u32,
-        stride: u32,
     },
     /// Frosted-glass backdrop: the presenter samples the already-rendered
     /// framebuffer at this element's screen rect, runs `passes` rounds of

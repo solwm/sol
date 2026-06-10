@@ -1251,7 +1251,7 @@ fn compute_bg_signature(elems: &[sol_core::SceneElement<'_>]) -> u64 {
         e.dst_height.to_bits().hash(&mut h);
         match &e.content {
             SceneContent::Shm { upload_seq, .. } => upload_seq.hash(&mut h),
-            SceneContent::Dmabuf { fd, .. } => fd.hash(&mut h),
+            SceneContent::Dmabuf { fds, .. } => fds[0].hash(&mut h),
             SceneContent::BlurredBackdrop { .. } => {}
         }
     }

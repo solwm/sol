@@ -84,6 +84,12 @@ pub struct TextureCache {
     set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
     pending: Vec<PendingUpload>,
+    /// buffer_keys whose dmabuf import failed. The wl_buffer (and its
+    /// key) are immutable once created, so retrying can't succeed —
+    /// without this the dup + create_image + warn cycle repeats every
+    /// frame for as long as the buffer stays in the scene. Cleared by
+    /// `evict` when the buffer dies.
+    failed_imports: std::collections::HashSet<u64>,
 }
 
 impl TextureCache {
@@ -118,6 +124,7 @@ impl TextureCache {
             set_layout,
             sampler,
             pending: Vec::new(),
+            failed_imports: std::collections::HashSet::new(),
         })
     }
 
@@ -160,6 +167,7 @@ impl TextureCache {
     /// dispatch — there's a tick between the destroy and the next
     /// render so by the time we actually free, the GPU is past it.
     pub fn evict(&mut self, key: u64) {
+        self.failed_imports.remove(&key);
         let Some(entry) = self.entries.remove(&key) else {
             return;
         };
@@ -196,11 +204,25 @@ impl TextureCache {
         for elem in &scene.elements {
             let res = match &elem.content {
                 SceneContent::Shm { .. } => self.prepare_shm(elem),
-                SceneContent::Dmabuf { .. } => self.prepare_dmabuf(elem, timing),
+                SceneContent::Dmabuf { .. } => {
+                    if self.failed_imports.contains(&elem.buffer_key) {
+                        continue;
+                    }
+                    self.prepare_dmabuf(elem, timing)
+                }
                 SceneContent::BlurredBackdrop { .. } => Ok(()),
             };
             if let Err(e) = res {
-                tracing::warn!(error = %e, key = elem.buffer_key, "scene element skipped");
+                if matches!(elem.content, SceneContent::Dmabuf { .. }) {
+                    self.failed_imports.insert(elem.buffer_key);
+                    tracing::warn!(
+                        error = %e,
+                        key = elem.buffer_key,
+                        "dmabuf import failed; buffer marked dead, not retrying"
+                    );
+                } else {
+                    tracing::warn!(error = %e, key = elem.buffer_key, "scene element skipped");
+                }
             }
         }
         // Snapshot end-of-frame cache occupancy (cheap: HashMap len +
@@ -297,6 +319,12 @@ impl TextureCache {
                 want
             );
         }
+        // smithay's wl_shm dispatch already enforces stride >= width*4,
+        // but the row copy below is unsafe — keep it locally sound
+        // rather than trusting a different crate's protocol validation.
+        if (stride as usize) < tight_row {
+            bail!("shm stride {stride} < tight row {tight_row}");
+        }
         if (staging.size as usize) < total {
             bail!(
                 "staging buffer {} bytes < dst {}",
@@ -333,11 +361,12 @@ impl TextureCache {
         timing: &mut RenderTiming,
     ) -> Result<()> {
         let SceneContent::Dmabuf {
-            fd,
+            num_planes,
+            fds,
+            offsets,
+            strides,
             fourcc: _,
             modifier,
-            offset,
-            stride,
         } = &elem.content
         else {
             unreachable!();
@@ -350,11 +379,46 @@ impl TextureCache {
         }
         self.evict(elem.buffer_key);
 
+        // How many memory-plane layouts the explicit-modifier create
+        // needs. The modifier is raw client input: anything the driver
+        // didn't advertise for our texture format is rejected here —
+        // feeding an unsupported modifier into
+        // `VkImageDrmFormatModifierExplicitCreateInfoEXT` is undefined
+        // behaviour, not just a failed create.
+        //
+        // DRM_FORMAT_MOD_INVALID (the implicit-modifier path — we
+        // advertise it in the dmabuf feedback) is never in the driver
+        // list; keep the long-standing single-plane passthrough for it
+        // since real clients on this path have worked for the life of
+        // the project. If a driver rejects it, the create fails cleanly
+        // and the buffer lands in `failed_imports`.
+        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+        let layout_planes = if *modifier == DRM_FORMAT_MOD_INVALID {
+            1
+        } else {
+            match self.stack.texture_modifier_planes.get(modifier) {
+                Some(&n) => n as usize,
+                None => bail!(
+                    "client dmabuf modifier 0x{modifier:016x} not supported by the driver"
+                ),
+            }
+        };
+        if layout_planes > *num_planes {
+            bail!(
+                "modifier 0x{modifier:016x} needs {layout_planes} memory planes, buffer has {num_planes}"
+            );
+        }
+        // One VkDeviceMemory is bound for the whole (non-disjoint)
+        // image, so every memory plane must live in the same fd.
+        if fds[..layout_planes].iter().any(|&f| f != fds[0]) {
+            bail!("disjoint multi-fd dmabuf import not supported");
+        }
+
         // Wayland hands us a borrowed RawFd; dup it because Vulkan
         // takes ownership on import success.
         use std::os::fd::FromRawFd;
         let dup = unsafe {
-            libc_dup(*fd).context("dup dmabuf fd")?
+            libc_dup(fds[0]).context("dup dmabuf fd")?
         };
         let owned = unsafe { OwnedFd::from_raw_fd(dup) };
 
@@ -364,8 +428,8 @@ impl TextureCache {
             elem.width as u32,
             elem.height as u32,
             *modifier,
-            *offset as u64,
-            *stride as u64,
+            &offsets[..layout_planes],
+            &strides[..layout_planes],
         )?;
         let descriptor = self.allocate_descriptor(image_data.view)?;
         self.entries.insert(
@@ -591,14 +655,23 @@ fn import_dmabuf_external(
     width: u32,
     height: u32,
     modifier: u64,
-    offset: u64,
-    row_pitch: u64,
+    plane_offsets: &[u32],
+    plane_strides: &[u32],
 ) -> Result<DmabufImageData> {
     let device = &stack.device;
-    let plane_layouts = [vk::SubresourceLayout::default()
-        .offset(offset)
-        .size(0)
-        .row_pitch(row_pitch)];
+    // One entry per memory plane of the modifier (the caller sized
+    // the slices from the driver's modifier query). size must be 0
+    // and arrayPitch/depthPitch are ignored per the VU.
+    let plane_layouts: Vec<vk::SubresourceLayout> = plane_offsets
+        .iter()
+        .zip(plane_strides)
+        .map(|(&offset, &stride)| {
+            vk::SubresourceLayout::default()
+                .offset(offset as u64)
+                .size(0)
+                .row_pitch(stride as u64)
+        })
+        .collect();
     let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
         .drm_format_modifier(modifier)
         .plane_layouts(&plane_layouts);

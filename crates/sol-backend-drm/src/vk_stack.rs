@@ -62,6 +62,15 @@ pub struct VkStack {
     /// needed by the GBM swap to query the modifier picked by the
     /// driver after image creation.
     pub ext_drm_mod: ash::ext::image_drm_format_modifier::Device,
+    /// DRM modifiers the driver supports for the client-texture
+    /// format (`B8G8R8A8_UNORM`), mapped to the memory-plane count
+    /// each one requires. Queried once at startup; the dmabuf import
+    /// path uses it to (a) reject client-supplied modifiers the
+    /// driver can't create images with — feeding one into
+    /// `VkImageDrmFormatModifierExplicitCreateInfoEXT` unchecked is
+    /// undefined behaviour — and (b) size the plane-layout array
+    /// correctly for multi-memory-plane modifiers.
+    pub texture_modifier_planes: std::collections::HashMap<u64, u32>,
 }
 
 /// Owned wrapper that releases vk resources in the right order on drop.
@@ -194,6 +203,13 @@ impl VkStack {
         let ext_drm_mod =
             ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
 
+        let texture_modifier_planes =
+            query_modifier_planes(&instance, physical, vk::Format::B8G8R8A8_UNORM);
+        tracing::info!(
+            modifiers = texture_modifier_planes.len(),
+            "driver-supported DRM modifiers for the texture format"
+        );
+
         Ok(SharedStack(Arc::new(Self {
             entry,
             instance,
@@ -207,6 +223,7 @@ impl VkStack {
             ext_mem_fd,
             ext_sem_fd,
             ext_drm_mod,
+            texture_modifier_planes,
         })))
     }
 
@@ -251,6 +268,42 @@ impl Drop for VkStack {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+/// Enumerate the DRM format modifiers the driver can create images
+/// with for `format`, with each modifier's memory-plane count.
+/// Standard two-call `VkDrmFormatModifierPropertiesListEXT` dance.
+fn query_modifier_planes(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    format: vk::Format,
+) -> std::collections::HashMap<u64, u32> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    {
+        let mut props2 = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            instance.get_physical_device_format_properties2(physical, format, &mut props2)
+        };
+    }
+    let count = list.drm_format_modifier_count as usize;
+    let mut mods = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+    let written = {
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+            .drm_format_modifier_properties(&mut mods);
+        let mut props2 = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            instance.get_physical_device_format_properties2(physical, format, &mut props2)
+        };
+        list.drm_format_modifier_count as usize
+    };
+    mods.truncate(written);
+    mods.iter()
+        .filter(|m| {
+            m.drm_format_modifier_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        })
+        .map(|m| (m.drm_format_modifier, m.drm_format_modifier_plane_count))
+        .collect()
 }
 
 fn pick_physical(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> {

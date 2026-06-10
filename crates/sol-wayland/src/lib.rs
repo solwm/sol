@@ -3737,12 +3737,29 @@ fn scene_from_buffers<'a>(
                 },
             });
         } else if let Some(dmabuf) = buf.data::<Dmabuf>() {
-            // Single-plane only — multi-plane (YUV, NV12 etc.) is
-            // rejected at import time by `dmabuf_imported`, so any
-            // dmabuf reaching here has exactly one plane.
-            let Some(fd) = dmabuf.handles().next() else { continue };
-            let Some(offset) = dmabuf.offsets().next() else { continue };
-            let Some(stride) = dmabuf.strides().next() else { continue };
+            // Plumb every plane's fd/offset/stride: the renderer
+            // samples plane 0 only (the NV12 plane-0-as-luma tradeoff
+            // documented in `dmabuf_imported`), but the Vulkan import
+            // needs all memory-plane layouts for modifiers that carry
+            // aux planes.
+            let mut fds = [0; sol_core::MAX_DMABUF_PLANES];
+            let mut offsets = [0u32; sol_core::MAX_DMABUF_PLANES];
+            let mut strides = [0u32; sol_core::MAX_DMABUF_PLANES];
+            let mut num_planes = 0usize;
+            for ((fd, off), st) in dmabuf
+                .handles()
+                .zip(dmabuf.offsets())
+                .zip(dmabuf.strides())
+                .take(sol_core::MAX_DMABUF_PLANES)
+            {
+                fds[num_planes] = fd.as_raw_fd();
+                offsets[num_planes] = off;
+                strides[num_planes] = st;
+                num_planes += 1;
+            }
+            if num_planes == 0 {
+                continue;
+            }
             let width = dmabuf.width() as i32;
             let height = dmabuf.height() as i32;
             let fourcc: u32 = dmabuf.format().code as u32;
@@ -3764,11 +3781,12 @@ fn scene_from_buffers<'a>(
                 alpha: *alpha,
                 corner_radius: *corner_radius,
                 content: SceneContent::Dmabuf {
-                    fd: fd.as_raw_fd(),
+                    num_planes,
+                    fds,
+                    offsets,
+                    strides,
                     fourcc,
                     modifier,
-                    offset,
-                    stride,
                 },
             });
         }
