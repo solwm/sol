@@ -46,35 +46,37 @@ pub fn compute_layer_rect(
 
     // Width: stretched if anchored both horizontally; else use
     // set_size; else fallback to a quarter-screen so a forgot-to-
-    // set-size client still shows up for diagnostics.
+    // set-size client still shows up for diagnostics. Margins and
+    // size are raw client int32s — saturate everywhere so extreme
+    // values produce a clamped rect instead of overflowing.
     let w = if a.contains(Anchor::LEFT) && a.contains(Anchor::RIGHT) {
-        (screen.w - m.left - m.right).max(0)
+        screen.w.saturating_sub(m.left).saturating_sub(m.right).max(0)
     } else if size.w != 0 {
-        size.w
+        size.w.max(0)
     } else {
         screen.w / 4
     };
     let h = if a.contains(Anchor::TOP) && a.contains(Anchor::BOTTOM) {
-        (screen.h - m.top - m.bottom).max(0)
+        screen.h.saturating_sub(m.top).saturating_sub(m.bottom).max(0)
     } else if size.h != 0 {
-        size.h
+        size.h.max(0)
     } else {
         screen.h / 4
     };
 
     let x = if a.contains(Anchor::LEFT) {
-        screen.x + m.left
+        screen.x.saturating_add(m.left)
     } else if a.contains(Anchor::RIGHT) {
-        screen.x + screen.w - w - m.right
+        (screen.x + screen.w).saturating_sub(w).saturating_sub(m.right)
     } else {
-        screen.x + (screen.w - w) / 2
+        screen.x + screen.w.saturating_sub(w) / 2
     };
     let y = if a.contains(Anchor::TOP) {
-        screen.y + m.top
+        screen.y.saturating_add(m.top)
     } else if a.contains(Anchor::BOTTOM) {
-        screen.y + screen.h - h - m.bottom
+        (screen.y + screen.h).saturating_sub(h).saturating_sub(m.bottom)
     } else {
-        screen.y + (screen.h - h) / 2
+        screen.y + screen.h.saturating_sub(h) / 2
     };
 
     crate::Rect { x, y, w, h }
@@ -142,10 +144,10 @@ pub fn usable_area(mapped: &[MappedLayer], screen: crate::Rect) -> crate::Rect {
         }
     }
     crate::Rect {
-        x: screen.x + r_l,
-        y: screen.y + r_t,
-        w: (screen.w - r_l - r_r).max(0),
-        h: (screen.h - r_t - r_b).max(0),
+        x: screen.x.saturating_add(r_l),
+        y: screen.y.saturating_add(r_t),
+        w: screen.w.saturating_sub(r_l).saturating_sub(r_r).max(0),
+        h: screen.h.saturating_sub(r_t).saturating_sub(r_b).max(0),
     }
 }
 
