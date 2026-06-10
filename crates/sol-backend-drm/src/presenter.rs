@@ -1252,6 +1252,16 @@ impl Drop for DrmPresenter {
                 tracing::info!("restored prior CRTC state");
             }
         }
+        // The CRTC no longer scans out of our BOs; release the
+        // framebuffer objects we added. The kernel would reap them on
+        // fd close anyway, but freeing here keeps teardown honest the
+        // day the presenter is rebuilt in-process (mode change,
+        // hotplug) instead of once per process.
+        for (_, fb) in self.fb_cache.drain() {
+            if let Err(e) = self.drm.destroy_framebuffer(fb) {
+                tracing::warn!(error = ?e, "destroy_framebuffer on drop failed");
+            }
+        }
     }
 }
 
