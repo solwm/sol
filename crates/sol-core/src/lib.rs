@@ -63,6 +63,14 @@ pub enum SceneContent<'a> {
         strides: [u32; MAX_DMABUF_PLANES],
         fourcc: u32,
         modifier: u64,
+        /// Bumped on every commit that signals a pixel change —
+        /// the dmabuf counterpart of `Shm::upload_seq`. The GPU
+        /// samples the buffer directly so no upload depends on it,
+        /// but the blur cache needs it as a content hint: a
+        /// wallpaper client re-rendering *in place* into the same
+        /// dmabuf never changes fd/key, and hashing those alone
+        /// leaves the frosted backdrop permanently stale.
+        commit_seq: u64,
     },
     /// Frosted-glass backdrop: the presenter samples the already-rendered
     /// framebuffer at this element's screen rect, runs `passes` rounds of

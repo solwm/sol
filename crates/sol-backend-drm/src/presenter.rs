@@ -117,6 +117,11 @@ pub struct DrmPresenter {
 
     /// Blur-cache state. Same shape as the pre-rewrite version.
     blur_ready_this_frame: bool,
+    /// True once `blur.run` has written the blur chain at least once.
+    /// Guards the signature-based cache against declaring a
+    /// never-rendered FBO valid (e.g. backdrop present but zero
+    /// background elements since startup).
+    blur_fbo_holds_pixels: bool,
     last_bg_sig: u64,
     last_blur_params: (u32, u32),
 }
@@ -229,6 +234,7 @@ impl DrmPresenter {
             pending_flip: false,
             pending_render: false,
             blur_ready_this_frame: false,
+            blur_fbo_holds_pixels: false,
             last_bg_sig: 0,
             last_blur_params: (0, 0),
         };
@@ -541,7 +547,13 @@ impl DrmPresenter {
             })
             .unwrap_or((0, 0));
         let scene_has_backdrop = scene_blur_params.0 > 0;
+        // `blur_fbo_holds_pixels` guards the cache against "signature
+        // matches but the FBO was never rendered": with zero
+        // background elements the capture pre-pass doesn't run, and
+        // sampling (or caching) the capture image would read
+        // uninitialized VRAM.
         let blur_cache_valid = scene_has_backdrop
+            && self.blur_fbo_holds_pixels
             && bg_sig == self.last_bg_sig
             && scene_blur_params == self.last_blur_params;
         self.blur_ready_this_frame = blur_cache_valid;
@@ -603,8 +615,9 @@ impl DrmPresenter {
             && self.blur.is_some();
         if need_bg_capture {
             self.draw_background_capture(scene, timing)?;
-        }
-        if scene_has_backdrop && !blur_cache_valid {
+            // Blur only ever runs over a freshly captured background —
+            // running it without the capture pre-pass would blur (and
+            // then cache) an uninitialized image.
             if let Some(blur) = self.blur.as_mut() {
                 blur.run(
                     self.command_buffer,
@@ -614,10 +627,11 @@ impl DrmPresenter {
                     timing,
                 );
                 self.blur_ready_this_frame = true;
+                self.blur_fbo_holds_pixels = true;
             }
         }
         // Make sure the final-blur FBO is sampleable for the main draw.
-        if scene_has_backdrop {
+        if scene_has_backdrop && self.blur_ready_this_frame {
             if let Some(blur) = self.blur.as_mut() {
                 let final_fbo = blur.final_fbo_mut(scene_blur_params.0);
                 transition_blur(
@@ -827,6 +841,13 @@ impl DrmPresenter {
             }
 
             if let SceneContent::BlurredBackdrop { passes, radius } = &elem.content {
+                // No blurred pixels this frame (no background elements,
+                // or blur unavailable) — drawing would sample an
+                // uninitialized FBO. The window above the backdrop
+                // shows the clear color through its transparency.
+                if !self.blur_ready_this_frame {
+                    continue;
+                }
                 if bound != Bound::Backdrop {
                     unsafe {
                         device.cmd_bind_pipeline(
@@ -1287,7 +1308,10 @@ fn compute_bg_signature(elems: &[sol_core::SceneElement<'_>]) -> u64 {
         e.dst_height.to_bits().hash(&mut h);
         match &e.content {
             SceneContent::Shm { upload_seq, .. } => upload_seq.hash(&mut h),
-            SceneContent::Dmabuf { fds, .. } => fds[0].hash(&mut h),
+            // commit_seq, not the fd: a wallpaper re-rendering in
+            // place keeps the same fd forever, and the backdrop would
+            // never pick up the new pixels.
+            SceneContent::Dmabuf { commit_seq, .. } => commit_seq.hash(&mut h),
             SceneContent::BlurredBackdrop { .. } => {}
         }
     }

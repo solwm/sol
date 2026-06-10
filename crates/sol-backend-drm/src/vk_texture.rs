@@ -367,6 +367,7 @@ impl TextureCache {
             strides,
             fourcc: _,
             modifier,
+            commit_seq: _,
         } = &elem.content
         else {
             unreachable!();

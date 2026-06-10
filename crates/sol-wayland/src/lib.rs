@@ -527,14 +527,15 @@ pub struct State {
     pub output_manager_state: OutputManagerState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub xdg_decoration_state: XdgDecorationState,
-    /// Per-dmabuf-`wl_buffer` cache key, keyed by the buffer's
+    /// Per-dmabuf-`wl_buffer` cache entry, keyed by the buffer's
     /// `ObjectId`. Mirrors `shm_cache` but for dmabufs: smithay holds
     /// the `Dmabuf` userdata; we keep our compositor-owned cache key
     /// alongside so the renderer's texture cache stays unique across
-    /// recycled wl_buffer wire ids. Populated in
-    /// `DmabufHandler::dmabuf_imported`; removed by
-    /// `BufferHandler::buffer_destroyed`.
-    pub dmabuf_cache: std::collections::HashMap<ObjectId, u64>,
+    /// recycled wl_buffer wire ids, plus a commit_seq content hint
+    /// (the dmabuf counterpart of shm's upload_seq) for the blur
+    /// cache. Populated in `DmabufHandler::dmabuf_imported`; removed
+    /// by `BufferHandler::buffer_destroyed`.
+    pub dmabuf_cache: std::collections::HashMap<ObjectId, DmabufCacheEntry>,
     /// libseat session handle. Used by VT-switch keybinds and by the
     /// backend's Enable/Disable transition logic. None in headless.
     pub session: Option<session::SharedSession>,
@@ -974,6 +975,17 @@ impl Cursor {
     }
 }
 
+/// Value side of `State::dmabuf_cache`.
+#[derive(Debug)]
+pub struct DmabufCacheEntry {
+    /// Compositor-minted, never-recycled texture-cache key.
+    pub cache_key: u64,
+    /// Bumped on every commit that signals a pixel change (attach or
+    /// damage), mirroring `ShmCacheEntry::upload_seq`. Fed to the
+    /// renderer as the blur cache's content hint.
+    pub commit_seq: u64,
+}
+
 #[derive(Debug)]
 pub struct Globals {
     pub compositor: GlobalId,
@@ -1205,12 +1217,12 @@ impl BufferHandler for State {
             self.pending_texture_evictions.push(entry.cache_key);
             return;
         }
-        if let Some(key) = self.dmabuf_cache.remove(&id) {
+        if let Some(entry) = self.dmabuf_cache.remove(&id) {
             // Same eviction path as SHM: alacritty / Chrome create a
             // new dmabuf on every tile resize, so without this the
             // imported `VkImage` + `VkDeviceMemory` for each old
             // buffer would leak until sol exits.
-            self.pending_texture_evictions.push(key);
+            self.pending_texture_evictions.push(entry.cache_key);
         }
     }
 }
@@ -1249,7 +1261,10 @@ impl DmabufHandler for State {
         let key = next_buffer_cache_key();
         match notifier.successful::<State>() {
             Ok(buffer) => {
-                self.dmabuf_cache.insert(buffer.id(), key);
+                self.dmabuf_cache.insert(
+                    buffer.id(),
+                    DmabufCacheEntry { cache_key: key, commit_seq: 0 },
+                );
                 tracing::debug!(
                     cache_key = key,
                     "dmabuf_imported: wl_buffer created"
@@ -2013,6 +2028,12 @@ fn commit_surface(state: &mut State, surface: &WlSurface) {
             if crate::shm::is_shm_buffer(buf) {
                 let entry = state.shm_cache.entry(buf.id()).or_default();
                 entry.upload_seq.fetch_add(1, Ordering::Relaxed);
+            } else if let Some(entry) = state.dmabuf_cache.get_mut(&buf.id()) {
+                // Same gate for dmabufs: the GPU samples them in place
+                // so no upload depends on this, but the blur cache
+                // uses it as its content hint (an in-place-rendering
+                // wallpaper never changes fd or key).
+                entry.commit_seq += 1;
             }
         }
     }
@@ -3764,7 +3785,9 @@ fn scene_from_buffers<'a>(
             let height = dmabuf.height() as i32;
             let fourcc: u32 = dmabuf.format().code as u32;
             let modifier: u64 = dmabuf.format().modifier.into();
-            let Some(&key) = state.dmabuf_cache.get(&buf.id()) else { continue };
+            let Some(entry) = state.dmabuf_cache.get(&buf.id()) else { continue };
+            let key = entry.cache_key;
+            let commit_seq = entry.commit_seq;
             let (ux, uy, uw, uh) = compute_uv(*vsrc, width, height);
             scene.elements.push(SceneElement {
                 buffer_key: key,
@@ -3787,6 +3810,7 @@ fn scene_from_buffers<'a>(
                     strides,
                     fourcc,
                     modifier,
+                    commit_seq,
                 },
             });
         }
