@@ -2981,6 +2981,7 @@ fn send_pending_configures(state: &mut State) {
             todo.push((i, target.0, target.1, is_fs));
         }
     }
+    let mut configured_now = vec![false; state.mapped_toplevels.len()];
     for (i, w, h, is_fs) in todo {
         let win = &state.mapped_toplevels[i];
         let Ok(surface) = win.surface.upgrade() else { continue };
@@ -3016,6 +3017,7 @@ fn send_pending_configures(state: &mut State) {
         let serial = toplevel.send_configure();
         state.mapped_toplevels[i].pending_size = Some((w, h));
         state.mapped_toplevels[i].pending_fullscreen = is_fs;
+        configured_now[i] = true;
         tracing::debug!(
             tile_index = i,
             width = w,
@@ -3036,8 +3038,15 @@ fn send_pending_configures(state: &mut State) {
     // Settle these inline now: pending_size already matches the target
     // dims, so the existing buffer is correct for the new rect — kick
     // off the position tween directly.
-    for win in state.mapped_toplevels.iter_mut() {
-        if !win.pending_layout {
+    //
+    // Tiles configured in the pass above must NOT settle here: their
+    // pending_size equals the target by construction the moment the
+    // configure is recorded, but the client hasn't acked or committed
+    // a buffer at the new size yet — settling now would bypass the
+    // resize hold and tween the old-size buffer (the close-then-expand
+    // stretch glitch the pending_layout flag exists to prevent).
+    for (i, win) in state.mapped_toplevels.iter_mut().enumerate() {
+        if !win.pending_layout || configured_now[i] {
             continue;
         }
         let target_dims = (win.rect.w, win.rect.h);
