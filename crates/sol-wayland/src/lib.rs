@@ -3528,6 +3528,23 @@ fn emit_subsurface_tree(
     parent_y: f32,
     alpha: f32,
 ) {
+    emit_subsurface_tree_bounded(out, parent, parent_x, parent_y, alpha, 0)
+}
+
+fn emit_subsurface_tree_bounded(
+    out: &mut Vec<Placed>,
+    parent: &WlSurface,
+    parent_x: f32,
+    parent_y: f32,
+    alpha: f32,
+    depth: u8,
+) {
+    // The protocol forbids subsurface ancestry cycles, but the child
+    // list is our own client-driven mirror — bound the walk so a
+    // corrupt chain can't overflow the stack.
+    if depth > 16 {
+        return;
+    }
     // Snapshot the child list so we don't re-enter `with_states` for
     // the parent while recursing into children — smithay's surface
     // mutex is per-surface, but locking the parent and a child
@@ -3588,7 +3605,7 @@ fn emit_subsurface_tree(
                 corner_radius: 0.0,
             });
         }
-        emit_subsurface_tree(out, &child, child_x, child_y, alpha);
+        emit_subsurface_tree_bounded(out, &child, child_x, child_y, alpha, depth + 1);
     }
 }
 
@@ -4155,6 +4172,20 @@ fn has_active_animation(state: &State) -> bool {
 /// the end. Returns `None` if the chain leads to a non-mapped root
 /// or terminates without one.
 fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
+    popup_screen_origin_bounded(state, popup, 0)
+}
+
+fn popup_screen_origin_bounded(
+    state: &State,
+    popup: &WlSurface,
+    depth: u8,
+) -> Option<(f32, f32)> {
+    // xdg-shell forbids popup parent cycles, but the link is
+    // client-supplied — bound the walk (same limit as
+    // root_focus_target) so a crafted cycle can't overflow the stack.
+    if depth > 16 {
+        return None;
+    }
     let parent = compositor::with_sol_data(popup, |sd| sd.xdg_popup_parent.clone())
         .flatten()?
         .upgrade()
@@ -4167,7 +4198,7 @@ fn popup_screen_origin(state: &State, popup: &WlSurface) -> Option<(f32, f32)> {
             .find(|w| w.surface.upgrade().ok().as_ref() == Some(&parent))
             .map(|w| (w.render_rect.x, w.render_rect.y)),
         SurfaceRole::XdgPopup { mapped: true, offset, .. } => {
-            let (gx, gy) = popup_screen_origin(state, &parent)?;
+            let (gx, gy) = popup_screen_origin_bounded(state, &parent, depth + 1)?;
             Some((gx + offset.0 as f32, gy + offset.1 as f32))
         }
         SurfaceRole::LayerSurface { mapped: true, .. } => {
@@ -6703,6 +6734,15 @@ fn root_focus_target(surface: &WlSurface) -> Option<WlSurface> {
 }
 
 fn surface_in_subtree(root: &WlSurface, target: &WlSurface) -> bool {
+    surface_in_subtree_bounded(root, target, 0)
+}
+
+fn surface_in_subtree_bounded(root: &WlSurface, target: &WlSurface, depth: u8) -> bool {
+    // Same depth bound as emit_subsurface_tree: the child list is a
+    // client-driven mirror, so don't trust it to be acyclic.
+    if depth > 16 {
+        return false;
+    }
     let Some(children) = compositor::with_sol_data(root, |sd| {
         sd.subsurface_children
             .iter()
@@ -6715,7 +6755,7 @@ fn surface_in_subtree(root: &WlSurface, target: &WlSurface) -> bool {
         if &child == target {
             return true;
         }
-        if surface_in_subtree(&child, target) {
+        if surface_in_subtree_bounded(&child, target, depth + 1) {
             return true;
         }
     }
