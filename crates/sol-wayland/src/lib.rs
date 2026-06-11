@@ -5957,12 +5957,19 @@ fn setup_event_loop(
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
 
+    let render_stop_signal = event_loop.get_signal();
     event_loop
-        .run(None, &mut compositor, |comp| {
+        .run(None, &mut compositor, move |comp| {
             if comp.state.needs_render {
                 comp.state.needs_render = false;
                 if let Err(e) = render_tick(comp) {
                     tracing::error!(error = %e, "render failed");
+                    // A lost device never recovers on this VkDevice —
+                    // stop instead of error-logging at refresh rate
+                    // while holding the display hostage.
+                    if e.is::<sol_core::FatalRenderError>() {
+                        render_stop_signal.stop();
+                    }
                 }
             }
             let _ = comp.display.flush_clients();

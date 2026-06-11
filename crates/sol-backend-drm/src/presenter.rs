@@ -514,10 +514,24 @@ impl DrmPresenter {
         // `pending_flip` the GPU has already finished.
         let t_wait = Instant::now();
         unsafe {
-            self.stack
+            // DEVICE_LOST here means the GPU reset under us. Nothing
+            // this process records can succeed again on this VkDevice
+            // — propagate a hard error so the event loop exits and the
+            // Drop chain restores the CRTC, instead of warn-looping
+            // forever while holding the display.
+            if let Err(e) = self
+                .stack
                 .device
                 .wait_for_fences(&[self.frame_fence], true, u64::MAX)
-                .ok();
+            {
+                if e == vk::Result::ERROR_DEVICE_LOST {
+                    return Err(anyhow::Error::new(sol_core::FatalRenderError).context(
+                        "VK_ERROR_DEVICE_LOST waiting on the frame fence; \
+                         GPU reset — shutting down the renderer",
+                    ));
+                }
+                tracing::warn!(error = ?e, "wait_for_fences (frame fence)");
+            }
             let _ = self.stack.device.reset_fences(&[self.frame_fence]);
         }
         timing.cpu_wait_fence_ns += t_wait.elapsed().as_nanos() as u64;

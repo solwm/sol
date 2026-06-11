@@ -26,6 +26,22 @@ pub enum PixelFormat {
 /// protocol (and per DRM AddFB2).
 pub const MAX_DMABUF_PLANES: usize = 4;
 
+/// Marker error for unrecoverable renderer conditions
+/// (`VK_ERROR_DEVICE_LOST` after a GPU reset, primarily). Travels
+/// inside the anyhow chain; the compositor's event loop downcasts for
+/// it to decide between "log and keep going" and "shut down cleanly
+/// while the Drop chain can still restore the CRTC".
+#[derive(Debug)]
+pub struct FatalRenderError;
+
+impl std::fmt::Display for FatalRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fatal render error; renderer cannot continue")
+    }
+}
+
+impl std::error::Error for FatalRenderError {}
+
 /// Where a scene element's pixel data actually lives. SHM buffers are
 /// CPU-mapped and the server blits/uploads from the borrowed slice. Dmabuf
 /// buffers live on the GPU; the server imports the fd as a `VkImage` on
