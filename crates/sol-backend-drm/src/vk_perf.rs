@@ -76,16 +76,15 @@ impl GpuTimings {
     /// phase totals into `timing`. No-op on the first frame. Caller
     /// must have already waited on the previous submit's fence (we
     /// already do, at the top of `render_scene`), so results are
-    /// available immediately — we pass `WITH_AVAILABILITY` to detect
-    /// the rare case where they aren't.
+    /// available immediately. No WAIT flag for the same reason, and
+    /// no WITH_AVAILABILITY: if a result somehow isn't ready, ash
+    /// maps VK_NOT_READY to `Err` and we skip this frame's GPU
+    /// timings below.
     pub fn collect_previous(&mut self, timing: &mut RenderTiming) {
         if !self.have_previous {
             return;
         }
-        // Five u64 slots: four timestamps + one availability word per
-        // query when WITH_AVAILABILITY is set. We pass it AS WAIT-free
-        // because the fence we already waited on guarantees the GPU
-        // wrote them.
+        // Four u64 slots, one timestamp each.
         let mut data: [u64; TS_COUNT as usize] = [0; TS_COUNT as usize];
         let res = unsafe {
             self.stack.device.get_query_pool_results(

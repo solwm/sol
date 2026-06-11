@@ -397,7 +397,6 @@ pub struct State {
     /// Always `None` outside of `render_tick_inner`.
     pub pending_fence_fd: Option<std::os::fd::OwnedFd>,
     pub started: Instant,
-    pub next_serial: u32,
     pub cursor: Cursor,
     /// Cloned handle to the libinput context (Arc internally, so the
     /// clone is cheap). Smithay's `LibinputInputBackend` owns the
@@ -1011,11 +1010,6 @@ impl State {
     pub fn elapsed_ms(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
     }
-    pub fn next_serial(&mut self) -> u32 {
-        self.next_serial = self.next_serial.wrapping_add(1);
-        self.next_serial
-    }
-
     /// Grab keyboard focus on first map of a toplevel — the window
     /// the user just spawned (or that just popped up via Alt+Enter
     /// while another terminal had focus) is what they want to type
@@ -5779,7 +5773,6 @@ fn setup_event_loop(
         needs_render: false,
         pending_fence_fd: None,
         started: Instant::now(),
-        next_serial: 0,
         cursor,
         libinput: libinput_handle,
         seat_state,

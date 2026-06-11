@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 calloop.workspace = true
 wayland-server.workspace = true
