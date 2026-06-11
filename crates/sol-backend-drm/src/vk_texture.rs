@@ -33,6 +33,10 @@ pub struct TextureEntry {
     pub view: vk::ImageView,
     pub memory: vk::DeviceMemory,
     pub descriptor: vk::DescriptorSet,
+    /// Pool `descriptor` was allocated from — frees must go back to
+    /// the originating pool now that the cache grows new pools on
+    /// exhaustion.
+    pub descriptor_pool: vk::DescriptorPool,
     pub width: i32,
     pub height: i32,
     /// Last `SceneContent::Shm::upload_seq` we copied for this entry.
@@ -80,7 +84,11 @@ pub struct PendingUpload {
 pub struct TextureCache {
     stack: SharedStack,
     pub entries: HashMap<u64, TextureEntry>,
-    descriptor_pool: vk::DescriptorPool,
+    /// Descriptor pools, oldest first; allocations come from the last
+    /// one and a fresh pool is pushed when it runs out. Old pools
+    /// stick around because long-lived sets (blur FBOs, cached
+    /// textures) still live in them.
+    descriptor_pools: Vec<vk::DescriptorPool>,
     set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
     pending: Vec<PendingUpload>,
@@ -93,17 +101,13 @@ pub struct TextureCache {
 }
 
 impl TextureCache {
-    /// Pool capacity — generous enough that even a busy session with
-    /// dozens of clients + the blur FBOs (which also pull from this
-    /// pool) stays under the limit. Going past this count panics the
-    /// allocate; we'll add growth if it ever comes up.
+    /// Per-pool capacity — generous enough that even a busy session
+    /// with dozens of clients + the blur FBOs (which also pull from
+    /// this pool) fits in one. When a pool does run out, a new one is
+    /// pushed and allocation continues there.
     const POOL_CAPACITY: u32 = 256;
 
-    pub fn new(
-        stack: SharedStack,
-        set_layout: vk::DescriptorSetLayout,
-        sampler: vk::Sampler,
-    ) -> Result<Self> {
+    fn create_pool(stack: &SharedStack) -> Result<vk::DescriptorPool> {
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(Self::POOL_CAPACITY)];
@@ -111,16 +115,24 @@ impl TextureCache {
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .max_sets(Self::POOL_CAPACITY)
             .pool_sizes(&pool_sizes);
-        let descriptor_pool = unsafe {
+        unsafe {
             stack
                 .device
                 .create_descriptor_pool(&pool_info, None)
-                .context("create_descriptor_pool (texture cache)")?
-        };
+                .context("create_descriptor_pool (texture cache)")
+        }
+    }
+
+    pub fn new(
+        stack: SharedStack,
+        set_layout: vk::DescriptorSetLayout,
+        sampler: vk::Sampler,
+    ) -> Result<Self> {
+        let descriptor_pools = vec![Self::create_pool(&stack)?];
         Ok(Self {
             stack,
             entries: HashMap::new(),
-            descriptor_pool,
+            descriptor_pools,
             set_layout,
             sampler,
             pending: Vec::new(),
@@ -131,21 +143,40 @@ impl TextureCache {
     /// Allocate a fresh descriptor set + immediately point it at the
     /// given image view. Used by the texture cache for client buffers
     /// and by the blur module for the capture / ping / pong FBOs.
+    /// Returns the set together with the pool it came from (frees
+    /// must target the originating pool). Grows a new pool when the
+    /// current one is exhausted.
     pub fn allocate_descriptor(
-        &self,
+        &mut self,
         view: vk::ImageView,
-    ) -> Result<vk::DescriptorSet> {
+    ) -> Result<(vk::DescriptorSet, vk::DescriptorPool)> {
         let layouts = [self.set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        let sets = unsafe {
-            self.stack
-                .device
-                .allocate_descriptor_sets(&alloc_info)
-                .context("allocate_descriptor_sets")?
+        let set = loop {
+            let pool = *self
+                .descriptor_pools
+                .last()
+                .expect("at least one descriptor pool always exists");
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            match unsafe { self.stack.device.allocate_descriptor_sets(&alloc_info) } {
+                Ok(sets) => break (sets[0], pool),
+                Err(
+                    vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL,
+                ) => {
+                    tracing::info!(
+                        pools = self.descriptor_pools.len() + 1,
+                        "descriptor pool exhausted; growing"
+                    );
+                    let fresh = Self::create_pool(&self.stack)?;
+                    self.descriptor_pools.push(fresh);
+                    // Loop retries against the fresh pool, which
+                    // cannot itself be exhausted.
+                }
+                Err(e) => return Err(e).context("allocate_descriptor_sets"),
+            }
         };
-        let set = sets[0];
+        let (set, pool) = set;
         let image_info = [vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -158,7 +189,7 @@ impl TextureCache {
         unsafe {
             self.stack.device.update_descriptor_sets(&writes, &[]);
         }
-        Ok(set)
+        Ok((set, pool))
     }
 
     /// Drop the cached entry for `key`. Caller must have already
@@ -173,7 +204,7 @@ impl TextureCache {
         };
         unsafe {
             let device = &self.stack.device;
-            let _ = device.free_descriptor_sets(self.descriptor_pool, &[entry.descriptor]);
+            let _ = device.free_descriptor_sets(entry.descriptor_pool, &[entry.descriptor]);
             device.destroy_image_view(entry.view, None);
             device.destroy_image(entry.image, None);
             device.free_memory(entry.memory, None);
@@ -285,7 +316,7 @@ impl TextureCache {
             self.evict(elem.buffer_key);
             let entry =
                 create_shm_image(&self.stack, elem.width as u32, elem.height as u32)?;
-            let descriptor = self.allocate_descriptor(entry.view)?;
+            let (descriptor, descriptor_pool) = self.allocate_descriptor(entry.view)?;
             self.entries.insert(
                 elem.buffer_key,
                 TextureEntry {
@@ -293,6 +324,7 @@ impl TextureCache {
                     view: entry.view,
                     memory: entry.memory,
                     descriptor,
+                    descriptor_pool,
                     width: elem.width,
                     height: elem.height,
                     uploaded_seq: 0,
@@ -438,7 +470,7 @@ impl TextureCache {
             &offsets[..layout_planes],
             &strides[..layout_planes],
         )?;
-        let descriptor = self.allocate_descriptor(image_data.view)?;
+        let (descriptor, descriptor_pool) = self.allocate_descriptor(image_data.view)?;
         self.entries.insert(
             elem.buffer_key,
             TextureEntry {
@@ -446,6 +478,7 @@ impl TextureCache {
                 view: image_data.view,
                 memory: image_data.memory,
                 descriptor,
+                descriptor_pool,
                 width: elem.width,
                 height: elem.height,
                 uploaded_seq: 0,
@@ -555,9 +588,9 @@ impl Drop for TextureCache {
             for k in keys {
                 self.evict(k);
             }
-            self.stack
-                .device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
+            for pool in self.descriptor_pools.drain(..) {
+                self.stack.device.destroy_descriptor_pool(pool, None);
+            }
         }
     }
 }

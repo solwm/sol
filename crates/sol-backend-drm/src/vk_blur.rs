@@ -42,7 +42,7 @@ pub struct BlurChain {
 impl BlurChain {
     pub fn new(
         stack: SharedStack,
-        cache: &TextureCache,
+        cache: &mut TextureCache,
         full_w: u32,
         full_h: u32,
     ) -> Result<Self> {
@@ -189,7 +189,7 @@ impl Drop for BlurChain {
 
 fn create_fbo(
     stack: &SharedStack,
-    cache: &TextureCache,
+    cache: &mut TextureCache,
     width: u32,
     height: u32,
 ) -> Result<BlurFbo> {
@@ -230,7 +230,7 @@ fn create_fbo(
             layer_count: 1,
         });
     let view = unsafe { device.create_image_view(&view_info, None)? };
-    let descriptor = cache.allocate_descriptor(view).map_err(|e| {
+    let (descriptor, _pool) = cache.allocate_descriptor(view).map_err(|e| {
         unsafe {
             device.destroy_image_view(view, None);
             device.destroy_image(image, None);

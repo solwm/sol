@@ -161,12 +161,12 @@ impl DrmPresenter {
         let stack = VkStack::new(drm_rdev)?;
         let swap = GbmSwap::new(stack.clone(), drm_fd.clone(), width, height)?;
         let pipelines = Pipelines::new(stack.clone())?;
-        let textures = TextureCache::new(
+        let mut textures = TextureCache::new(
             stack.clone(),
             pipelines.sampled_set_layout,
             pipelines.linear_sampler,
         )?;
-        let blur = match BlurChain::new(stack.clone(), &textures, width, height) {
+        let blur = match BlurChain::new(stack.clone(), &mut textures, width, height) {
             Ok(b) => Some(b),
             Err(e) => {
                 tracing::warn!(error = %e, "blur chain init failed; inactive-window blur disabled");
