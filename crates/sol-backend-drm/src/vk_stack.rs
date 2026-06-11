@@ -86,7 +86,14 @@ impl std::ops::Deref for SharedStack {
 }
 
 impl VkStack {
-    pub fn new() -> Result<SharedStack> {
+    /// `drm_rdev` is the `st_rdev` of the DRM node we're scanning out
+    /// on (from fstat of the libseat-opened fd). When given, physical
+    /// device selection matches against `VK_EXT_physical_device_drm`
+    /// so rendering happens on the same GPU that GBM allocates the
+    /// scan-out BOs from — on multi-GPU machines the old
+    /// first-discrete-GPU heuristic could pick a device that can't
+    /// import them at all.
+    pub fn new(drm_rdev: Option<u64>) -> Result<SharedStack> {
         // Dynamically load libvulkan.so.1. The user is expected to have
         // a vulkan-icd-loader installed (Arch's `vulkan-icd-loader`,
         // Debian's `libvulkan1`); the actual ICD (mesa-vulkan-radv,
@@ -111,7 +118,7 @@ impl VkStack {
                 .context("create_instance")?
         };
 
-        let (physical, queue_family) = pick_physical(&instance)
+        let (physical, queue_family) = pick_physical(&instance, drm_rdev)
             .context("pick physical device")?;
 
         let mem_props =
@@ -306,7 +313,10 @@ fn query_modifier_planes(
         .collect()
 }
 
-fn pick_physical(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> {
+fn pick_physical(
+    instance: &ash::Instance,
+    drm_rdev: Option<u64>,
+) -> Result<(vk::PhysicalDevice, u32)> {
     let physicals = unsafe {
         instance
             .enumerate_physical_devices()
@@ -324,52 +334,89 @@ fn pick_physical(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> 
         ash::ext::queue_family_foreign::NAME,
     ];
 
-    // Two-pass: prefer DISCRETE_GPU on the first pass, fall back to
-    // INTEGRATED_GPU on the second. Avoids picking llvmpipe (CPU
-    // software rasterizer) when a real GPU is present.
-    for prefer_discrete in [true, false] {
-        for &p in &physicals {
-            let props = unsafe { instance.get_physical_device_properties(p) };
-            let is_discrete = matches!(
-                props.device_type,
-                vk::PhysicalDeviceType::DISCRETE_GPU
-            );
-            if prefer_discrete && !is_discrete {
-                continue;
-            }
-            // Reject software/CPU devices outright; the comp's whole
-            // point is hardware acceleration.
-            if matches!(props.device_type, vk::PhysicalDeviceType::CPU) {
-                continue;
-            }
-            // Required extensions present?
-            let avail = unsafe {
-                match instance.enumerate_device_extension_properties(p) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
-            };
-            let has_all = required_exts.iter().all(|need| {
-                avail.iter().any(|e| {
-                    let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
-                    name == *need
-                })
-            });
-            if !has_all {
-                continue;
-            }
-            // Need a graphics queue family.
-            let families = unsafe {
-                instance.get_physical_device_queue_family_properties(p)
-            };
-            let q = families.iter().enumerate().find(|(_, f)| {
-                f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-            });
-            let Some((idx, _)) = q else {
-                continue;
-            };
-            return Ok((p, idx as u32));
+    // One candidate per usable device: graphics queue + required
+    // extensions, never CPU/llvmpipe (the comp's whole point is
+    // hardware acceleration).
+    struct Candidate {
+        physical: vk::PhysicalDevice,
+        queue_family: u32,
+        discrete: bool,
+        drm_match: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for &p in &physicals {
+        let props = unsafe { instance.get_physical_device_properties(p) };
+        if matches!(props.device_type, vk::PhysicalDeviceType::CPU) {
+            continue;
         }
+        let avail = unsafe {
+            match instance.enumerate_device_extension_properties(p) {
+                Ok(v) => v,
+                Err(_) => continue,
+            }
+        };
+        let has_ext = |need: &CStr| {
+            avail.iter().any(|e| {
+                let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+                name == need
+            })
+        };
+        if !required_exts.iter().all(|need| has_ext(need)) {
+            continue;
+        }
+        let families =
+            unsafe { instance.get_physical_device_queue_family_properties(p) };
+        let q = families
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.queue_flags.contains(vk::QueueFlags::GRAPHICS));
+        let Some((idx, _)) = q else {
+            continue;
+        };
+        // Does this VkPhysicalDevice sit on the DRM node we scan out
+        // on? Compare primary/render major:minor from
+        // VK_EXT_physical_device_drm against the libseat fd's rdev.
+        let drm_match = match drm_rdev {
+            Some(rdev) if has_ext(ash::ext::physical_device_drm::NAME) => {
+                let mut drm_props = vk::PhysicalDeviceDrmPropertiesEXT::default();
+                let mut props2 =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
+                unsafe { instance.get_physical_device_properties2(p, &mut props2) };
+                let (maj, min) =
+                    (rustix::fs::major(rdev) as i64, rustix::fs::minor(rdev) as i64);
+                (drm_props.has_primary != 0
+                    && (drm_props.primary_major, drm_props.primary_minor) == (maj, min))
+                    || (drm_props.has_render != 0
+                        && (drm_props.render_major, drm_props.render_minor) == (maj, min))
+            }
+            _ => false,
+        };
+        candidates.push(Candidate {
+            physical: p,
+            queue_family: idx as u32,
+            discrete: matches!(props.device_type, vk::PhysicalDeviceType::DISCRETE_GPU),
+            drm_match,
+        });
+    }
+
+    // The device wired to the KMS node wins outright; otherwise keep
+    // the old discrete-then-integrated heuristic.
+    if let Some(c) = candidates.iter().find(|c| c.drm_match) {
+        return Ok((c.physical, c.queue_family));
+    }
+    if drm_rdev.is_some() && !candidates.is_empty() {
+        tracing::warn!(
+            "no Vulkan device reports the scan-out DRM node via \
+             VK_EXT_physical_device_drm; falling back to the discrete-GPU \
+             heuristic (dmabuf import may fail on multi-GPU machines)"
+        );
+    }
+    if let Some(c) = candidates
+        .iter()
+        .find(|c| c.discrete)
+        .or_else(|| candidates.first())
+    {
+        return Ok((c.physical, c.queue_family));
     }
 
     bail!(

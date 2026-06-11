@@ -156,7 +156,9 @@ impl DrmPresenter {
             }
         };
 
-        let stack = VkStack::new()?;
+        // Tie Vulkan device selection to the node we scan out on.
+        let drm_rdev = rustix::fs::fstat(&drm_fd).ok().map(|s| s.st_rdev);
+        let stack = VkStack::new(drm_rdev)?;
         let swap = GbmSwap::new(stack.clone(), drm_fd.clone(), width, height)?;
         let pipelines = Pipelines::new(stack.clone())?;
         let textures = TextureCache::new(
