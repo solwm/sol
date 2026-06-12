@@ -234,7 +234,7 @@ impl TextureCache {
         self.pending.clear();
         for elem in &scene.elements {
             let res = match &elem.content {
-                SceneContent::Shm { .. } => self.prepare_shm(elem),
+                SceneContent::Shm { .. } => self.prepare_shm(elem, timing),
                 SceneContent::Dmabuf { .. } => {
                     if self.failed_imports.contains(&elem.buffer_key) {
                         continue;
@@ -269,12 +269,17 @@ impl TextureCache {
         Ok(())
     }
 
-    fn prepare_shm(&mut self, elem: &SceneElement<'_>) -> Result<()> {
+    fn prepare_shm(
+        &mut self,
+        elem: &SceneElement<'_>,
+        timing: &mut RenderTiming,
+    ) -> Result<()> {
         let SceneContent::Shm {
             pixels,
             stride,
             format: _,
             upload_seq,
+            trust_seq,
         } = &elem.content
         else {
             unreachable!();
@@ -295,13 +300,20 @@ impl TextureCache {
         // instead of 240. Future work direction (per-surface damage
         // tracking + sub-rect uploads, dmabuf explicit-sync, …)
         // lives in the same memory note.
-        if elem.buffer_key == CURSOR_SCENE_KEY {
+        // `trust_seq` extends the skip to background-layer surfaces
+        // (wallpaper) — the compositor only sets it where the seq is
+        // a complete content signal, so the NVIDIA glitch class the
+        // universal skip hit can't apply.
+        if elem.buffer_key == CURSOR_SCENE_KEY || *trust_seq {
             if let Some(e) = self.entries.get(&elem.buffer_key) {
                 if !e.is_dmabuf
                     && e.width == elem.width
                     && e.height == elem.height
                     && e.uploaded_seq == upload_seq
                 {
+                    timing.n_shm_uploads_skipped += 1;
+                    timing.n_shm_upload_skipped_bytes +=
+                        (elem.width as u64) * (elem.height as u64) * 4;
                     return Ok(());
                 }
             }

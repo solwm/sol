@@ -819,6 +819,10 @@ pub struct Metrics {
     pub n_descriptor_binds: u64,
     pub n_shm_uploads: u64,
     pub n_shm_upload_bytes: u64,
+    /// Uploads avoided by the seq-skip (cursor + trusted background
+    /// layers), and the bytes that would otherwise have been copied.
+    pub n_shm_uploads_skipped: u64,
+    pub n_shm_upload_skipped_bytes: u64,
     /// Running maximum of any single SHM upload's byte count since the
     /// last perf-log emit. Reset to 0 each time the perf log line
     /// fires (so the displayed value reflects the largest upload in
@@ -911,6 +915,8 @@ impl Metrics {
         self.n_descriptor_binds += t.n_descriptor_binds as u64;
         self.n_shm_uploads += t.n_shm_uploads as u64;
         self.n_shm_upload_bytes += t.n_shm_upload_bytes;
+        self.n_shm_uploads_skipped += t.n_shm_uploads_skipped as u64;
+        self.n_shm_upload_skipped_bytes += t.n_shm_upload_skipped_bytes;
         if t.n_shm_upload_max_bytes > self.n_shm_upload_max_bytes_running {
             self.n_shm_upload_max_bytes_running = t.n_shm_upload_max_bytes;
         }
@@ -3677,7 +3683,10 @@ fn scene_from_buffers<'a>(
     // so it always lands above the border pass — which is what we
     // want (cursor on top).
     scene.border_anchor = border_anchor;
-    for p in placed {
+    for (idx, p) in placed.iter().enumerate() {
+        // Background-layer elements (wallpaper) get the seq-trusted
+        // upload skip — see SceneContent::Shm::trust_seq.
+        let is_background = idx < background_count;
         let (buf, rect, vsrc, alpha, corner_radius) = match p {
             Placed::Buffer { buf, rect, vsrc, alpha, corner_radius } => {
                 (buf, rect, vsrc, alpha, corner_radius)
@@ -3749,6 +3758,7 @@ fn scene_from_buffers<'a>(
                     stride: meta.stride,
                     format: meta.format,
                     upload_seq,
+                    trust_seq: is_background,
                 },
             });
         } else if let Some(dmabuf) = buf.data::<Dmabuf>() {
@@ -3836,6 +3846,9 @@ fn scene_from_buffers<'a>(
                 stride: cursor.width * 4,
                 format: sol_core::PixelFormat::Argb8888,
                 upload_seq: cursor.upload_seq,
+                // The cursor sentinel has its own dedicated skip
+                // keyed on CURSOR_SCENE_KEY.
+                trust_seq: false,
             },
         });
     }
@@ -5179,6 +5192,7 @@ fn render_tick_inner(comp: &mut Compositor) -> Result<()> {
                         stride,
                         format,
                         upload_seq: _,
+                        trust_seq: _,
                     } => {
                         canvas.blit_argb(
                             e.x.round() as i32,
@@ -5948,6 +5962,12 @@ fn setup_event_loop(
     }
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
+        // Auto-reap spawned children (keybind/debug-ctl spawns,
+        // exec-once). POSIX: SIG_IGN on SIGCHLD means the kernel
+        // discards exit status instead of leaving zombies; we never
+        // wait() on children, so without this every closed terminal
+        // lingers as <defunct> until sol exits.
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
     }
 
     let render_stop_signal = event_loop.get_signal();

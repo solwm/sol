@@ -61,6 +61,15 @@ pub enum SceneContent<'a> {
         /// stays plumbed because re-enabling a broader skip is one
         /// of the open future-work items.
         upload_seq: u64,
+        /// True when the compositor vouches that `upload_seq` fully
+        /// captures content changes for this element, making the
+        /// seq-equality upload skip safe. Set for background-layer
+        /// surfaces (wallpaper-class — the dominant upload mass, and
+        /// daemons that commit once and never touch the pool again).
+        /// Regular toplevels stay `false`: the universal seq-skip
+        /// glitched on NVIDIA (see the vk_texture note) and was
+        /// reverted; this is the narrow, provably-safe slice of it.
+        trust_seq: bool,
     },
     Dmabuf {
         /// Number of planes actually present in the buffer (1..=4).
@@ -296,6 +305,12 @@ pub struct RenderTiming {
     /// wallpaper) — the former is a count problem, the latter a size
     /// problem with very different fixes.
     pub n_shm_upload_max_bytes: u64,
+    /// Uploads avoided this frame by the seq-skip (cursor sentinel +
+    /// trusted background layers): how many, and how many bytes the
+    /// memcpy+copy would have moved. The bytes counter is the direct
+    /// measure of what the wallpaper skip is saving.
+    pub n_shm_uploads_skipped: u32,
+    pub n_shm_upload_skipped_bytes: u64,
     /// Number of dmabufs imported *this frame* (first sight). Steady
     /// state should be 0 — non-zero every frame means the cache is
     /// thrashing.

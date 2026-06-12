@@ -284,6 +284,8 @@ struct MetricsDump {
     n_descriptor_binds: u64,
     n_shm_uploads: u64,
     n_shm_upload_bytes: u64,
+    n_shm_uploads_skipped: u64,
+    n_shm_upload_skipped_bytes: u64,
     n_dmabuf_imports_new: u64,
     /// Latest sample of texture-cache occupancy + swap-slot state.
     last_textures_cached_total: u32,
@@ -419,6 +421,8 @@ fn snapshot_response(comp: &Compositor) -> String {
         n_descriptor_binds: m.n_descriptor_binds,
         n_shm_uploads: m.n_shm_uploads,
         n_shm_upload_bytes: m.n_shm_upload_bytes,
+        n_shm_uploads_skipped: m.n_shm_uploads_skipped,
+        n_shm_upload_skipped_bytes: m.n_shm_upload_skipped_bytes,
         n_dmabuf_imports_new: m.n_dmabuf_imports_new,
         last_textures_cached_total: m.last_textures_cached_total,
         last_textures_cached_dmabuf: m.last_textures_cached_dmabuf,
