@@ -43,7 +43,7 @@ use sol_core::{PixelFormat, RenderTiming, Scene, SceneBorder, SceneContent};
 
 use crate::vk_blur::{BlurChain, set_viewport_scissor, transition as transition_blur, bytes_of};
 use crate::vk_perf::GpuTimings;
-use crate::vk_pipe::{BackdropPC, Pipelines, QuadPC, SolidPC};
+use crate::vk_pipe::{FrostedPC, Pipelines, QuadPC, SolidPC};
 use crate::vk_stack::{SharedStack, VkStack};
 use crate::vk_swap::GbmSwap;
 use crate::vk_texture::TextureCache;
@@ -828,9 +828,15 @@ impl DrmPresenter {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Bound {
             Quad,
-            Backdrop,
+            Frosted,
         }
         let mut bound = Bound::Quad;
+        // Set when a BlurredBackdrop element was seen: the next
+        // textured element (its window — collect_scene pushes them
+        // adjacent) composites over the blurred bg in-shader via the
+        // frosted pipeline instead of two blended draws. See
+        // frosted.frag for the NVIDIA RMW rationale.
+        let mut pending_frost: Option<vk::DescriptorSet> = None;
 
         for (idx, elem) in scene.elements.iter().enumerate() {
             if !borders_drawn && idx == border_anchor && !scene.borders.is_empty() {
@@ -868,28 +874,36 @@ impl DrmPresenter {
                 borders_drawn = true;
             }
 
-            if let SceneContent::BlurredBackdrop { passes, radius } = &elem.content {
+            if let SceneContent::BlurredBackdrop { passes, radius: _ } = &elem.content {
                 // No blurred pixels this frame (no background elements,
-                // or blur unavailable) — drawing would sample an
-                // uninitialized FBO. The window above the backdrop
-                // shows the clear color through its transparency.
+                // or blur unavailable) — the window falls back to the
+                // plain blended quad over whatever is beneath.
                 if !self.blur_ready_this_frame {
                     continue;
                 }
-                if bound != Bound::Backdrop {
+                // Don't draw anything here: arm the frosted composite
+                // for the window element that follows.
+                pending_frost = self
+                    .blur
+                    .as_ref()
+                    .map(|b| b.final_fbo(*passes).descriptor);
+                timing.n_backdrop_draws += 1;
+                continue;
+            }
+
+            if let Some(bg_descriptor) = pending_frost.take() {
+                if bound != Bound::Frosted {
                     unsafe {
                         device.cmd_bind_pipeline(
                             self.command_buffer,
                             vk::PipelineBindPoint::GRAPHICS,
-                            self.pipelines.backdrop.pipeline,
+                            self.pipelines.frosted.pipeline,
                         );
                     }
                     timing.n_pipeline_binds += 1;
-                    bound = Bound::Backdrop;
+                    bound = Bound::Frosted;
                 }
-                if let Err(e) = self.draw_backdrop_element(elem, *passes, *radius, timing) {
-                    tracing::warn!(error = %e, "backdrop draw skipped");
-                }
+                self.draw_frosted_element(elem, bg_descriptor, fb_w, fb_h, timing);
                 continue;
             }
 
@@ -1050,17 +1064,24 @@ impl DrmPresenter {
         timing.n_textured_draws += 1;
     }
 
-    fn draw_backdrop_element(
+    /// Frosted composite: draw `elem` (an inactive window) blended
+    /// over the blurred background **in-shader**, writing opaque
+    /// pixels. The blurred bg is sampled at the output pixel position
+    /// (gl_FragCoord / fb_size), so no UV plumbing for the bg is
+    /// needed. Replaces the old backdrop-quad + blended-window pair —
+    /// both were fractional-alpha read-modify-write draws, which
+    /// NVIDIA corrupts in the bottom-right of the framebuffer.
+    fn draw_frosted_element(
         &self,
         elem: &sol_core::SceneElement<'_>,
-        passes: u32,
-        _radius: f32,
+        bg_descriptor: vk::DescriptorSet,
+        fb_w: f32,
+        fb_h: f32,
         timing: &mut RenderTiming,
-    ) -> Result<()> {
-        let Some(blur) = self.blur.as_ref() else {
-            anyhow::bail!("blur unavailable");
+    ) {
+        let Some(entry) = self.textures.get(elem.buffer_key) else {
+            return;
         };
-        let final_fbo = blur.final_fbo(passes);
         let dst_w = if elem.dst_width > 0.0 {
             elem.dst_width
         } else {
@@ -1071,37 +1092,47 @@ impl DrmPresenter {
         } else {
             elem.height as f32
         };
-        let fb_w = self.width as f32;
-        let fb_h = self.height as f32;
+        let opaque = match &elem.content {
+            SceneContent::Shm {
+                format: PixelFormat::Argb8888,
+                ..
+            } => 0.0,
+            SceneContent::Shm {
+                format: PixelFormat::Xrgb8888,
+                ..
+            } => 1.0,
+            SceneContent::Dmabuf { fourcc, .. } => {
+                if (*fourcc & 0xFF) as u8 == b'X' {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            SceneContent::BlurredBackdrop { .. } => return,
+        };
         let (rx, ry, rw, rh) = ndc_rect(elem.x, elem.y, dst_w, dst_h, fb_w, fb_h);
-        // Vulkan-native UVs: (top-left origin), so the screen-rect
-        // sub-rect maps directly to the blur tex coordinates without
-        // any V-flip — every image we sample (scan-out, capture,
-        // ping/pong, client buffers) is stored top-row-first.
-        let pc = BackdropPC {
+        let pc = FrostedPC {
             rect: [rx, ry, rw, rh],
-            uv: [
-                elem.x / fb_w,
-                elem.y / fb_h,
-                dst_w / fb_w,
-                dst_h / fb_h,
-            ],
+            uv: [elem.uv_x, elem.uv_y, elem.uv_w, elem.uv_h],
             size: [dst_w, dst_h],
             radius: elem.corner_radius.max(0.0),
             alpha: elem.alpha.clamp(0.0, 1.0),
+            opaque,
+            _pad: 0.0,
+            fb_size: [fb_w, fb_h],
         };
         unsafe {
             self.stack.device.cmd_bind_descriptor_sets(
                 self.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.pipelines.backdrop.layout,
+                self.pipelines.frosted.layout,
                 0,
-                &[final_fbo.descriptor],
+                &[entry.descriptor, bg_descriptor],
                 &[],
             );
             self.stack.device.cmd_push_constants(
                 self.command_buffer,
-                self.pipelines.backdrop.layout,
+                self.pipelines.frosted.layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytes_of(&pc),
@@ -1111,8 +1142,7 @@ impl DrmPresenter {
                 .cmd_draw(self.command_buffer, 4, 1, 0, 0);
         }
         timing.n_descriptor_binds += 1;
-        timing.n_backdrop_draws += 1;
-        Ok(())
+        timing.n_textured_draws += 1;
     }
 
     /// The smithay DRM device fd this presenter scans out on. The

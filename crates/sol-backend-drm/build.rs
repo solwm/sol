@@ -23,6 +23,7 @@ fn main() {
         ("solid.frag", "fragment"),
         ("blur.frag", "fragment"),
         ("backdrop.frag", "fragment"),
+        ("frosted.frag", "fragment"),
     ];
 
     for (name, stage) in entries {

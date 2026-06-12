@@ -37,6 +37,8 @@ const SOLID_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/solid.fr
 const BLUR_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur.frag.spv"));
 const BACKDROP_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/backdrop.frag.spv"));
+const FROSTED_FRAG_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/frosted.frag.spv"));
 
 /// Per-draw push constants for `quad.frag`. Match the GLSL block layout
 /// (std140-ish, manual offsets via `layout(offset=N)`).
@@ -81,6 +83,23 @@ pub struct BackdropPC {
     pub alpha: f32,
 }
 
+/// Push constants for `frosted.frag` — the in-shader composite of an
+/// inactive window over the blurred background. Field offsets match
+/// the GLSL block: `fb_size` sits at offset 56 (vec2 needs 8-byte
+/// alignment, hence the explicit pad after `opaque`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FrostedPC {
+    pub rect: [f32; 4],
+    pub uv: [f32; 4],
+    pub size: [f32; 2],
+    pub radius: f32,
+    pub alpha: f32,
+    pub opaque: f32,
+    pub _pad: f32,
+    pub fb_size: [f32; 2],
+}
+
 pub struct GraphicsPipeline {
     pub pipeline: vk::Pipeline,
     pub layout: vk::PipelineLayout,
@@ -94,6 +113,9 @@ pub struct Pipelines {
     pub solid: GraphicsPipeline,
     pub blur: GraphicsPipeline,
     pub backdrop: GraphicsPipeline,
+    /// In-shader frosted composite (window ⊕ blurred bg, opaque
+    /// write). Two descriptor sets: 0 = window texture, 1 = blur FBO.
+    pub frosted: GraphicsPipeline,
     quad_vert: vk::ShaderModule,
 }
 
@@ -146,7 +168,7 @@ impl Pipelines {
             quad_vert,
             QUAD_FRAG_SPV,
             std::mem::size_of::<QuadPC>() as u32,
-            Some(sampled_set_layout),
+            &[sampled_set_layout],
             BlendMode::SrcAlpha,
         )?;
         let solid = build_pipeline(
@@ -154,7 +176,7 @@ impl Pipelines {
             quad_vert,
             SOLID_FRAG_SPV,
             std::mem::size_of::<SolidPC>() as u32,
-            None,
+            &[],
             BlendMode::SrcAlpha,
         )?;
         let blur = build_pipeline(
@@ -162,7 +184,7 @@ impl Pipelines {
             quad_vert,
             BLUR_FRAG_SPV,
             std::mem::size_of::<BlurPC>() as u32,
-            Some(sampled_set_layout),
+            &[sampled_set_layout],
             BlendMode::Opaque,
         )?;
         // Backdrop must NOT blend: NVIDIA has a raster-order defect
@@ -178,7 +200,18 @@ impl Pipelines {
             quad_vert,
             BACKDROP_FRAG_SPV,
             std::mem::size_of::<BackdropPC>() as u32,
-            Some(sampled_set_layout),
+            &[sampled_set_layout],
+            BlendMode::Opaque,
+        )?;
+        // Frosted composite: window texture (set 0) over blurred bg
+        // (set 1), computed in-shader, written opaque — no blended RMW
+        // anywhere in the frosted path (NVIDIA raster-order defect).
+        let frosted = build_pipeline(
+            &stack,
+            quad_vert,
+            FROSTED_FRAG_SPV,
+            std::mem::size_of::<FrostedPC>() as u32,
+            &[sampled_set_layout, sampled_set_layout],
             BlendMode::Opaque,
         )?;
 
@@ -190,6 +223,7 @@ impl Pipelines {
             solid,
             blur,
             backdrop,
+            frosted,
             quad_vert,
         })
     }
@@ -199,7 +233,7 @@ impl Drop for Pipelines {
     fn drop(&mut self) {
         unsafe {
             let device = &self.stack.device;
-            for gp in [&self.quad, &self.solid, &self.blur, &self.backdrop] {
+            for gp in [&self.quad, &self.solid, &self.blur, &self.backdrop, &self.frosted] {
                 device.destroy_pipeline(gp.pipeline, None);
                 device.destroy_pipeline_layout(gp.layout, None);
             }
@@ -238,7 +272,7 @@ fn build_pipeline(
     vs: vk::ShaderModule,
     fs_spv: &[u8],
     push_constant_size: u32,
-    sampled_layout: Option<vk::DescriptorSetLayout>,
+    set_layouts: &[vk::DescriptorSetLayout],
     blend: BlendMode,
 ) -> Result<GraphicsPipeline> {
     let device = &stack.device;
@@ -301,15 +335,10 @@ fn build_pipeline(
     let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dyn_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
 
-    // Pipeline layout: one descriptor set (or zero) + push constant range
-    // covering both vertex and fragment stages so we can write `pc.rect`
-    // from the vertex shader and `pc.size` from the fragment shader
-    // through the same block.
-    let set_layouts: &[vk::DescriptorSetLayout] = if let Some(l) = sampled_layout.as_ref() {
-        std::slice::from_ref(l)
-    } else {
-        &[]
-    };
+    // Pipeline layout: the caller's descriptor sets + a push constant
+    // range covering both vertex and fragment stages so we can write
+    // `pc.rect` from the vertex shader and `pc.size` from the fragment
+    // shader through the same block.
     let pc_ranges = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
