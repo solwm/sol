@@ -5490,21 +5490,37 @@ fn setup_event_loop(
     // feedback's main_device dev_t comes from the DRM device path;
     // headless mode (no DRM device) advertises a dummy 0 since no
     // dmabuf clients can do anything useful without a render node
-    // anyway. Format set is XRGB8888 + ARGB8888 with INVALID
-    // (driver-implicit) and LINEAR modifiers — same as pre-PR-9, the
-    // maximally-compatible choice for the renderer's Vulkan importer.
+    // anyway.
+    //
+    // Format set: XRGB8888 + ARGB8888 with INVALID (driver-implicit)
+    // and LINEAR for the EGL path, PLUS every modifier the Vulkan
+    // importer queried from the driver. The explicit list is what
+    // makes Vulkan-WSI clients (vkgears, wgpu apps) allocate with a
+    // known tiling — on the implicit path NVIDIA hands out
+    // block-linear buffers tagged Invalid, the importer can't know
+    // the real layout, and the content renders as shredded lines.
     let mut dmabuf_state = DmabufState::new();
     let dmabuf_main_device: libc::dev_t = drm_device_path
         .as_ref()
         .and_then(|p| rustix::fs::stat(p).ok())
         .map(|s| s.st_rdev as libc::dev_t)
         .unwrap_or(0);
-    let dmabuf_formats = [
+    let mut dmabuf_formats = vec![
         DmabufFormat { code: Fourcc::Xrgb8888, modifier: Modifier::Invalid },
         DmabufFormat { code: Fourcc::Argb8888, modifier: Modifier::Invalid },
         DmabufFormat { code: Fourcc::Xrgb8888, modifier: Modifier::Linear },
         DmabufFormat { code: Fourcc::Argb8888, modifier: Modifier::Linear },
     ];
+    if let BackendState::Drm(p) = &backend {
+        for m in p.supported_texture_modifiers() {
+            let m = Modifier::from(m);
+            if matches!(m, Modifier::Invalid | Modifier::Linear) {
+                continue; // already in the base list
+            }
+            dmabuf_formats.push(DmabufFormat { code: Fourcc::Xrgb8888, modifier: m });
+            dmabuf_formats.push(DmabufFormat { code: Fourcc::Argb8888, modifier: m });
+        }
+    }
     let dmabuf_feedback = DmabufFeedbackBuilder::new(dmabuf_main_device, dmabuf_formats)
         .build()
         .context("build dmabuf feedback")?;

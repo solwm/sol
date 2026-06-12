@@ -1103,6 +1103,16 @@ impl DrmPresenter {
         Ok(())
     }
 
+    /// DRM modifiers the Vulkan importer can create sampled images
+    /// with (queried from the driver at startup). The compositor
+    /// advertises these in its dmabuf feedback so clients allocate
+    /// with an explicit, supported modifier — the implicit
+    /// `Modifier::Invalid` path leaves the true tiling unknown and
+    /// renders garbage for Vulkan-WSI clients on NVIDIA.
+    pub fn supported_texture_modifiers(&self) -> Vec<u64> {
+        self.stack.texture_modifier_planes.keys().copied().collect()
+    }
+
     fn submit_render(
         &mut self,
         slot_idx: usize,
