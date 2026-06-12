@@ -830,6 +830,8 @@ pub struct Metrics {
     /// not tracked separately — add if needed.
     pub n_shm_upload_max_bytes_running: u64,
     pub n_dmabuf_imports_new: u64,
+    /// Producer fences submits waited on (explicit dmabuf sync).
+    pub n_dmabuf_fence_waits: u64,
     /// Last sample of the texture-cache size (gauge, not counter).
     pub last_textures_cached_total: u32,
     pub last_textures_cached_dmabuf: u32,
@@ -921,6 +923,7 @@ impl Metrics {
             self.n_shm_upload_max_bytes_running = t.n_shm_upload_max_bytes;
         }
         self.n_dmabuf_imports_new += t.n_dmabuf_imports_new as u64;
+        self.n_dmabuf_fence_waits += t.n_dmabuf_fence_waits as u64;
         self.last_textures_cached_total = t.n_textures_cached_total;
         self.last_textures_cached_dmabuf = t.n_textures_cached_dmabuf;
         self.last_slot_scanned = t.slot_scanned;

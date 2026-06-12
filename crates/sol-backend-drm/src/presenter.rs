@@ -99,6 +99,14 @@ pub struct DrmPresenter {
     /// declined to create an exportable semaphore — we run the
     /// synchronous fallback in that case.
     sync_semaphore: Option<vk::Semaphore>,
+    /// Reusable binary semaphores for dmabuf producer fences: each
+    /// frame, sync-file fds from `TextureCache::take_wait_fences` are
+    /// imported (TEMPORARY) into these and the submit waits on them at
+    /// FRAGMENT_SHADER, so sampling a client buffer can't race the
+    /// client's own GPU writes. Safe to reuse every frame: the
+    /// previous submit's fence has been waited before we get here, so
+    /// any prior temporary payload was consumed.
+    dmabuf_wait_sems: Vec<vk::Semaphore>,
     /// GPU-side phase timing collector. `None` if the device reports
     /// `timestamp_period == 0` (no graphics-queue timestamp support).
     gpu_timings: Option<GpuTimings>,
@@ -230,6 +238,7 @@ impl DrmPresenter {
             command_buffer,
             frame_fence,
             sync_semaphore,
+            dmabuf_wait_sems: Vec::new(),
             gpu_timings,
             fb_cache: HashMap::new(),
             in_flight_slot: None,
@@ -608,15 +617,18 @@ impl DrmPresenter {
         // SHADER_READ_ONLY and TRANSFER_DST.
         self.textures.record_uploads(self.command_buffer, timing);
         // NOTE: we deliberately do *not* issue a per-frame FOREIGN_EXT
-        // acquire barrier on client dmabuf imports. Implicit-sync on
-        // dma-bufs is handled inside the Vulkan importer (Mesa and
-        // NVIDIA both honour the dma-buf fence on first read after
-        // creation), and adding an extra acquire per frame turned out
-        // to (a) serialise on NVIDIA in a way that interacts badly
-        // with the SHM upload-skip path — both wlroots and smithay
-        // omit this barrier for the same reason. The scan-out
-        // FOREIGN_EXT release/acquire below is still in place; that
-        // one is necessary for tearing-free output.
+        // acquire barrier on client dmabuf imports — it serialised on
+        // NVIDIA, and both wlroots and smithay omit it. Cross-client
+        // write/read ordering is handled explicitly instead: each
+        // dmabuf whose content advanced this frame contributes a
+        // sync-file producer fence (DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+        // exported in prepare_uploads) that this submit waits on at
+        // FRAGMENT_SHADER. Relying on driver implicit sync alone only
+        // held for the first read after creation; re-used buffers
+        // raced the client's renderer and tore (clear color bleeding
+        // through the wallpaper's last rows during motion). The
+        // scan-out FOREIGN_EXT release/acquire below is still in
+        // place; that one is necessary for tearing-free output.
         if let Some(g) = self.gpu_timings.as_ref() {
             g.cmd_after_uploads(self.command_buffer);
         }
@@ -1103,6 +1115,47 @@ impl DrmPresenter {
         Ok(())
     }
 
+    /// Drain the texture cache's exported producer fences and import
+    /// each into a pooled binary semaphore (TEMPORARY payload). The
+    /// returned semaphores go into this submit's wait list. Failures
+    /// degrade to implicit sync for that buffer, never to an error.
+    fn import_dmabuf_wait_fences(&mut self) -> Vec<vk::Semaphore> {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let fds = self.textures.take_wait_fences();
+        let mut out = Vec::with_capacity(fds.len());
+        for (i, fd) in fds.into_iter().enumerate() {
+            if self.dmabuf_wait_sems.len() <= i {
+                match unsafe {
+                    self.stack
+                        .device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                } {
+                    Ok(s) => self.dmabuf_wait_sems.push(s),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "create dmabuf wait semaphore failed");
+                        break;
+                    }
+                }
+            }
+            let sem = self.dmabuf_wait_sems[i];
+            let raw = fd.into_raw_fd();
+            let import = vk::ImportSemaphoreFdInfoKHR::default()
+                .semaphore(sem)
+                .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                .fd(raw);
+            match unsafe { self.stack.ext_sem_fd.import_semaphore_fd(&import) } {
+                Ok(()) => out.push(sem),
+                Err(e) => {
+                    // Ownership only transfers on success — close it.
+                    drop(unsafe { OwnedFd::from_raw_fd(raw) });
+                    tracing::warn!(error = ?e, "import dmabuf fence failed");
+                }
+            }
+        }
+        out
+    }
+
     /// DRM modifiers the Vulkan importer can create sampled images
     /// with (queried from the driver at startup). The compositor
     /// advertises these in its dmabuf feedback so clients allocate
@@ -1120,6 +1173,13 @@ impl DrmPresenter {
     ) -> Result<Option<OwnedFd>> {
         let cb_array = [self.command_buffer];
 
+        // Import this frame's dmabuf producer fences as wait
+        // semaphores: the GPU stalls fragment work until every
+        // client buffer we sample has actually finished rendering.
+        let wait_sems = self.import_dmabuf_wait_fences();
+        let wait_stages =
+            vec![vk::PipelineStageFlags::FRAGMENT_SHADER; wait_sems.len()];
+
         if let Some(sem) = self.sync_semaphore {
             // Fast path: signal the exportable semaphore, dup the FD,
             // hand it back so the wayland-side calloop can defer the
@@ -1127,6 +1187,8 @@ impl DrmPresenter {
             let signals = [sem];
             let submit = vk::SubmitInfo::default()
                 .command_buffers(&cb_array)
+                .wait_semaphores(&wait_sems)
+                .wait_dst_stage_mask(&wait_stages)
                 .signal_semaphores(&signals);
             let t_submit = Instant::now();
             unsafe {
@@ -1190,7 +1252,10 @@ impl DrmPresenter {
             }
         } else {
             // Synchronous fallback: submit, fence-wait, flip inline.
-            let submit = vk::SubmitInfo::default().command_buffers(&cb_array);
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&cb_array)
+                .wait_semaphores(&wait_sems)
+                .wait_dst_stage_mask(&wait_stages);
             let t_submit = Instant::now();
             unsafe {
                 self.stack
@@ -1273,6 +1338,9 @@ impl Drop for DrmPresenter {
             // alive until the last component drops.
             let _ = self.stack.device.device_wait_idle();
             if let Some(sem) = self.sync_semaphore {
+                self.stack.device.destroy_semaphore(sem, None);
+            }
+            for sem in self.dmabuf_wait_sems.drain(..) {
                 self.stack.device.destroy_semaphore(sem, None);
             }
             self.stack.device.destroy_fence(self.frame_fence, None);

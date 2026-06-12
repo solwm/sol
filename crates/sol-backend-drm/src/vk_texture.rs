@@ -98,6 +98,15 @@ pub struct TextureCache {
     /// frame for as long as the buffer stays in the scene. Cleared by
     /// `evict` when the buffer dies.
     failed_imports: std::collections::HashSet<u64>,
+    /// Sync-file fds exported from dmabufs whose content advanced
+    /// this frame (commit_seq changed) — each carries the producer's
+    /// pending GPU writes. The presenter imports them as submit wait
+    /// semaphores so our sampling can't race the client's rendering.
+    /// NVIDIA does not reliably honour dma-buf implicit sync for
+    /// sampled imports of *re-used* buffers; the symptom was the
+    /// clear color bleeding through the wallpaper's last-written
+    /// rows (and the blur backdrop built from them) during motion.
+    pending_wait_fences: Vec<OwnedFd>,
 }
 
 impl TextureCache {
@@ -137,6 +146,7 @@ impl TextureCache {
             sampler,
             pending: Vec::new(),
             failed_imports: std::collections::HashSet::new(),
+            pending_wait_fences: Vec::new(),
         })
     }
 
@@ -417,14 +427,30 @@ impl TextureCache {
             strides,
             fourcc: _,
             modifier,
-            commit_seq: _,
+            commit_seq,
         } = &elem.content
         else {
             unreachable!();
         };
+        // New content since we last sampled this buffer (or first
+        // sight): export the producer's pending-write fence so the
+        // presenter's submit waits for the client's GPU to finish —
+        // see `pending_wait_fences`. `uploaded_seq` doubles as the
+        // last commit_seq we synced against for dmabuf entries.
+        let content_advanced = match self.entries.get(&elem.buffer_key) {
+            Some(e) if e.is_dmabuf => e.uploaded_seq != *commit_seq,
+            _ => true,
+        };
+        if content_advanced {
+            if let Some(fence) = export_dmabuf_read_fence(fds[0]) {
+                self.pending_wait_fences.push(fence);
+                timing.n_dmabuf_fence_waits += 1;
+            }
+        }
         // Already imported and matches dimensions? Skip.
-        if let Some(e) = self.entries.get(&elem.buffer_key) {
+        if let Some(e) = self.entries.get_mut(&elem.buffer_key) {
             if e.is_dmabuf && e.width == elem.width && e.height == elem.height {
+                e.uploaded_seq = *commit_seq;
                 return Ok(());
             }
         }
@@ -493,7 +519,7 @@ impl TextureCache {
                 descriptor_pool,
                 width: elem.width,
                 height: elem.height,
-                uploaded_seq: 0,
+                uploaded_seq: *commit_seq,
                 is_dmabuf: true,
                 staging: None,
             },
@@ -590,6 +616,59 @@ impl TextureCache {
     pub fn get(&self, key: u64) -> Option<&TextureEntry> {
         self.entries.get(&key)
     }
+
+    /// Drain the producer fences exported during `prepare_uploads`.
+    /// The presenter imports each into a wait semaphore for this
+    /// frame's submit.
+    pub fn take_wait_fences(&mut self) -> Vec<OwnedFd> {
+        std::mem::take(&mut self.pending_wait_fences)
+    }
+}
+
+/// Export a sync-file fd carrying every pending *write* fence on the
+/// dmabuf (`DMA_BUF_SYNC_READ`: "I want to read; give me the writers").
+/// Returns `None` (with a once-per-process warning) on kernels or
+/// drivers that don't support `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` —
+/// behaviour then degrades to the old implicit-sync hope, not an error.
+fn export_dmabuf_read_fence(fd: std::os::fd::RawFd) -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    #[repr(C)]
+    struct DmaBufExportSyncFile {
+        flags: u32,
+        fd: i32,
+    }
+    const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+    // _IOWR('b', 2, struct dma_buf_export_sync_file) — dma-buf core
+    // ioctl, kernel >= 5.18.
+    const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u64 = 0xC008_6202;
+    unsafe extern "C" {
+        fn ioctl(fd: i32, request: u64, arg: *mut core::ffi::c_void) -> i32;
+    }
+    let mut arg = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    let r = unsafe {
+        ioctl(
+            fd,
+            DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+            &mut arg as *mut _ as *mut core::ffi::c_void,
+        )
+    };
+    if r != 0 || arg.fd < 0 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "DMA_BUF_IOCTL_EXPORT_SYNC_FILE unavailable; sampling \
+                 client dmabufs relies on driver implicit sync (may tear \
+                 on NVIDIA)"
+            );
+        }
+        return None;
+    }
+    Some(unsafe { OwnedFd::from_raw_fd(arg.fd) })
 }
 
 impl Drop for TextureCache {

@@ -315,6 +315,10 @@ pub struct RenderTiming {
     /// state should be 0 — non-zero every frame means the cache is
     /// thrashing.
     pub n_dmabuf_imports_new: u32,
+    /// Producer fences this frame's submit waited on (one per dmabuf
+    /// whose content advanced — explicit sync against the client's
+    /// in-flight GPU work).
+    pub n_dmabuf_fence_waits: u32,
     /// Total entries in the texture cache at end of frame, split by
     /// backing kind. Slow-moving — useful as a trend signal.
     pub n_textures_cached_total: u32,

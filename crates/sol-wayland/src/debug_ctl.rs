@@ -287,6 +287,7 @@ struct MetricsDump {
     n_shm_uploads_skipped: u64,
     n_shm_upload_skipped_bytes: u64,
     n_dmabuf_imports_new: u64,
+    n_dmabuf_fence_waits: u64,
     /// Latest sample of texture-cache occupancy + swap-slot state.
     last_textures_cached_total: u32,
     last_textures_cached_dmabuf: u32,
@@ -424,6 +425,7 @@ fn snapshot_response(comp: &Compositor) -> String {
         n_shm_uploads_skipped: m.n_shm_uploads_skipped,
         n_shm_upload_skipped_bytes: m.n_shm_upload_skipped_bytes,
         n_dmabuf_imports_new: m.n_dmabuf_imports_new,
+        n_dmabuf_fence_waits: m.n_dmabuf_fence_waits,
         last_textures_cached_total: m.last_textures_cached_total,
         last_textures_cached_dmabuf: m.last_textures_cached_dmabuf,
         last_slot_scanned: m.last_slot_scanned,
