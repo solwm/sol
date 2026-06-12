@@ -516,6 +516,19 @@ pub struct State {
     /// the format/feedback table, the per-buffer `Dispatch<WlBuffer,
     /// Dmabuf>` impl. Created in `setup_event_loop` before `Globals`.
     pub dmabuf_state: DmabufState,
+    /// Smithay's linux-drm-syncobj-v1 state — explicit sync. `None`
+    /// in headless mode or when the DRM device lacks
+    /// `drmSyncobjEventfd`. Without this protocol, NVIDIA clients
+    /// (Vulkan WSI, wgpu apps) attach no fences anywhere: their
+    /// buffers arrive while the client GPU is still writing them and
+    /// sampling tears (the dark lower-region "cursed region" baked
+    /// into the blur cache). With it, commits carry an acquire point
+    /// and a pre-commit blocker holds the transaction until the
+    /// client's GPU is done.
+    pub syncobj_state: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
+    /// Loop handle for sources registered from State-side hooks (the
+    /// syncobj blocker eventfd). Mirrors `Compositor::loop_handle`.
+    pub loop_handle: Option<LoopHandle<'static, Compositor>>,
     /// Smithay's wl_output + zxdg_output_manager_v1 wiring. The
     /// `Output` carries the mode/scale/transform/location state and
     /// drives event emission on bind; `OutputManagerState` owns the
@@ -1282,6 +1295,19 @@ impl DmabufHandler for State {
 
 smithay::delegate_dmabuf!(State);
 
+// linux-drm-syncobj-v1 explicit sync. The global only exists when the
+// DRM device supports drmSyncobjEventfd (see setup_event_loop); the
+// acquire-point blocker is wired in `CompositorHandler::new_surface`.
+impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
+    fn drm_syncobj_state(
+        &mut self,
+    ) -> Option<&mut smithay::wayland::drm_syncobj::DrmSyncobjState> {
+        self.syncobj_state.as_mut()
+    }
+}
+
+smithay::delegate_drm_syncobj!(State);
+
 // Smithay output wiring. `delegate_output!` claims the wl_output +
 // zxdg_output_manager_v1 + zxdg_output_v1 Dispatch impls; smithay
 // drives the geometry / mode / scale / done event sequence on bind
@@ -1388,6 +1414,49 @@ impl CompositorHandler for State {
                 .data_map
                 .insert_if_missing_threadsafe(|| Mutex::new(SolSurfaceData::default()));
         });
+        // Explicit-sync acquire: when the client attached a syncobj
+        // acquire point to this commit, hold the transaction until
+        // the client's GPU signals it. Without the hold we'd sample
+        // a buffer that's still being rendered (NVIDIA attaches no
+        // implicit fences, so nothing downstream can save us).
+        if self.syncobj_state.is_some() {
+            smithay_compositor::add_pre_commit_hook::<State, _>(surface, |state, _dh, surface| {
+                use smithay::backend::renderer::sync::Fence as _;
+                let acquire = smithay_compositor::with_states(surface, |s| {
+                    s.cached_state
+                        .get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>()
+                        .pending()
+                        .acquire_point
+                        .clone()
+                });
+                let Some(acquire) = acquire else { return };
+                if acquire.is_signaled() {
+                    return;
+                }
+                let Some(handle) = state.loop_handle.clone() else { return };
+                match acquire.generate_blocker() {
+                    Ok((blocker, source)) => {
+                        smithay_compositor::add_blocker(surface, blocker);
+                        let client = surface.client();
+                        let res = handle.insert_source(source, move |_, _, comp| {
+                            let dh = comp.state.display_handle.clone();
+                            if let Some(client) = client.as_ref() {
+                                comp.state
+                                    .client_compositor_state(client)
+                                    .blocker_cleared(&mut comp.state, &dh);
+                            }
+                            Ok(())
+                        });
+                        if let Err(e) = res {
+                            tracing::warn!(error = %e, "insert syncobj blocker source failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "syncobj blocker creation failed");
+                    }
+                }
+            });
+        }
     }
     fn new_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) {
         // Mark the child's role and link it into the parent's
@@ -5530,6 +5599,28 @@ fn setup_event_loop(
     let dmabuf_global = dmabuf_state
         .create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
 
+    // Explicit sync (linux-drm-syncobj-v1): mandatory for correct
+    // NVIDIA operation — without it their drivers attach no fences at
+    // all and sampled client buffers tear. Gated on the device
+    // actually supporting drmSyncobjEventfd, per the protocol's
+    // implementation guidance.
+    let syncobj_state = match &backend {
+        BackendState::Drm(p) => {
+            let dev = p.device_fd();
+            if smithay::wayland::drm_syncobj::supports_syncobj_eventfd(&dev) {
+                tracing::info!("explicit sync enabled (linux-drm-syncobj-v1)");
+                Some(smithay::wayland::drm_syncobj::DrmSyncobjState::new::<State>(&dh, dev))
+            } else {
+                tracing::warn!(
+                    "drmSyncobjEventfd unsupported; explicit sync disabled \
+                     (expect client-buffer tearing on NVIDIA)"
+                );
+                None
+            }
+        }
+        _ => None,
+    };
+
     let globals = Globals {
         compositor: compositor_global,
         shm: shm_global,
@@ -5841,6 +5932,8 @@ fn setup_event_loop(
         compositor_state,
         shm_cache: std::collections::HashMap::new(),
         dmabuf_state,
+        syncobj_state,
+        loop_handle: Some(event_loop.handle()),
         dmabuf_cache: std::collections::HashMap::new(),
         output,
         output_manager_state,

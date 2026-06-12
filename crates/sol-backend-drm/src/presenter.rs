@@ -1115,6 +1115,13 @@ impl DrmPresenter {
         Ok(())
     }
 
+    /// The smithay DRM device fd this presenter scans out on. The
+    /// frontend needs it to import client syncobj timelines for the
+    /// linux-drm-syncobj-v1 explicit-sync protocol.
+    pub fn device_fd(&self) -> smithay::backend::drm::DrmDeviceFd {
+        self.drm_fd.clone()
+    }
+
     /// Drain the texture cache's exported producer fences and import
     /// each into a pooled binary semaphore (TEMPORARY payload). The
     /// returned semaphores go into this submit's wait list. Failures
