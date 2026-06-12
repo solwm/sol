@@ -165,13 +165,21 @@ impl Pipelines {
             Some(sampled_set_layout),
             BlendMode::Opaque,
         )?;
+        // Backdrop must NOT blend: NVIDIA has a raster-order defect
+        // where fractional-alpha read-modify-write draws in the
+        // bottom-right of the framebuffer blend against stale/cleared
+        // destination pixels instead of what was already drawn — the
+        // "cursed dark L-shape region" behind frosted inactive
+        // windows. The backdrop's content is opaque blurred wallpaper
+        // anyway; writing it opaque sidesteps the RMW path entirely
+        // (same workaround as niri-sol's manual-blend offscreen).
         let backdrop = build_pipeline(
             &stack,
             quad_vert,
             BACKDROP_FRAG_SPV,
             std::mem::size_of::<BackdropPC>() as u32,
             Some(sampled_set_layout),
-            BlendMode::SrcAlpha,
+            BlendMode::Opaque,
         )?;
 
         Ok(Self {

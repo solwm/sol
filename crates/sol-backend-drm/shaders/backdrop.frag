@@ -2,9 +2,19 @@
 
 // Frosted-backdrop fragment shader. Samples the already-blurred FBO at
 // the element's screen-rect UV and paints it underneath an inactive
-// toplevel, with the same rounded-rect mask the textured quad uses so
-// the backdrop and the window line up. `alpha` lets the caller fade
-// the backdrop in/out (e.g. during a workspace crossfade).
+// toplevel.
+//
+// The backdrop pipeline runs with blending DISABLED — NVIDIA's
+// fractional-alpha read-modify-write path corrupts the bottom-right
+// of the framebuffer (blends against stale/cleared destination
+// pixels), visible as a dark cross-window region behind frosted
+// inactive windows. Writing opaque pixels sidesteps the RMW path
+// entirely (same workaround as niri-sol's manual-blend offscreen).
+// Consequences, both accepted: the rounded-corner mask is gone (the
+// ~radius px outside the window's rounding show frosted instead of
+// sharp wallpaper, and the window's own mask still shapes the visible
+// window), and `pc.alpha` fades degrade to full-strength frost (the
+// fading window above still animates normally).
 
 layout(push_constant) uniform PC {
     layout(offset = 0)  vec4 rect;
@@ -21,17 +31,6 @@ layout(location = 1) in vec2 v_pos;
 
 layout(location = 0) out vec4 o_color;
 
-float rounded_alpha() {
-    vec2 pos = v_pos * pc.size;
-    vec2 half_size = pc.size * 0.5;
-    vec2 q = abs(pos - half_size) - (half_size - vec2(pc.radius));
-    float d = length(max(q, vec2(0.0)))
-            + min(max(q.x, q.y), 0.0)
-            - pc.radius;
-    return clamp(0.5 - d, 0.0, 1.0);
-}
-
 void main() {
-    float a = pc.alpha * rounded_alpha();
-    o_color = vec4(texture(u_tex, v_uv).rgb, a);
+    o_color = vec4(texture(u_tex, v_uv).rgb, 1.0);
 }
