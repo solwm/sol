@@ -110,6 +110,9 @@ pub struct DrmPresenter {
     /// GPU-side phase timing collector. `None` if the device reports
     /// `timestamp_period == 0` (no graphics-queue timestamp support).
     gpu_timings: Option<GpuTimings>,
+    /// Frame-capture dashcam (vk_capture). Armed/disarmed at runtime
+    /// via debug-ctl; `None` costs nothing on the render path.
+    capture: Option<crate::vk_capture::CaptureRing>,
 
     /// Cache mapping `bo.handle().into()` → DRM framebuffer handle so
     /// `add_framebuffer` runs once per BO. Same shape as the pre-rewrite
@@ -240,6 +243,7 @@ impl DrmPresenter {
             sync_semaphore,
             dmabuf_wait_sems: Vec::new(),
             gpu_timings,
+            capture: None,
             fb_cache: HashMap::new(),
             in_flight_slot: None,
             pending_flip: false,
@@ -547,6 +551,12 @@ impl DrmPresenter {
         }
         timing.cpu_wait_fence_ns += t_wait.elapsed().as_nanos() as u64;
 
+        // The previous frame's capture blit has provably completed
+        // (we just waited its fence) — fold it into the CPU ring.
+        if let Some(c) = self.capture.as_mut() {
+            c.collect();
+        }
+
         // Read back the *previous* frame's GPU timestamps now that its
         // submit has drained. One-frame lag baked in: this frame's
         // `gpu_*_ns` reflect the previous frame. For steady-state
@@ -679,6 +689,18 @@ impl DrmPresenter {
         let t_draw = Instant::now();
         self.draw_main_pass(scene, slot_idx, timing)?;
         timing.draw_ns += t_draw.elapsed().as_nanos() as u64;
+
+        // Frame capture: blit a downscaled copy of the finished frame
+        // out of the slot before it's released for scan-out. The slot
+        // layout round-trips through TRANSFER_SRC and back, so the
+        // release below stays oblivious.
+        if let Some(c) = self.capture.as_mut() {
+            if c.want_frame() {
+                let scene_json = scene_elements_json(scene);
+                let src = self.swap.slots[slot_idx].image;
+                c.record(self.command_buffer, src, timing, scene_json);
+            }
+        }
 
         // Release the slot to FOREIGN ownership for kernel scan-out.
         // Pairs with the acquire above on the next cycle and tells
@@ -1152,6 +1174,45 @@ impl DrmPresenter {
         self.drm_fd.clone()
     }
 
+    /// Arm the frame-capture dashcam. `every`: capture every Nth
+    /// rendered frame into the RAM ring; `persist_hz`: how often a
+    /// captured frame is also streamed to disk (0 disables the
+    /// streaming tier); `ring_seconds`: how much history `mark()`
+    /// preserves.
+    pub fn capture_start(
+        &mut self,
+        every: u32,
+        persist_hz: f32,
+        ring_seconds: f32,
+    ) -> Result<String> {
+        let ring = crate::vk_capture::CaptureRing::new(
+            self.stack.clone(),
+            self.width,
+            self.height,
+            every,
+            persist_hz,
+            ring_seconds,
+            240.0,
+        )?;
+        let status = ring.status();
+        self.capture = Some(ring);
+        Ok(status)
+    }
+
+    pub fn capture_stop(&mut self) -> bool {
+        self.capture.take().is_some()
+    }
+
+    /// Dump the RAM ring to disk. Returns frames written, or None if
+    /// capture isn't armed.
+    pub fn capture_mark(&mut self) -> Option<usize> {
+        self.capture.as_mut().map(|c| c.mark())
+    }
+
+    pub fn capture_status(&self) -> Option<String> {
+        self.capture.as_ref().map(|c| c.status())
+    }
+
     /// Drain the texture cache's exported producer fences and import
     /// each into a pooled binary semaphore (TEMPORARY payload). The
     /// returned semaphores go into this submit's wait list. Failures
@@ -1521,6 +1582,41 @@ fn record_scanout_acquire(
 /// with `record_scanout_acquire` on the next cycle) makes the driver
 /// signal the dma-buf fence after our render completes, so the
 /// kernel only starts reading once the GPU writes are visible.
+/// Hand-rolled JSON description of the scene for the capture
+/// sidecar: per element kind, screen rect, alpha, buffer key, and
+/// whether it's a background-layer element. This is what lets the
+/// triage script check invariants ("no clear-color pixels inside an
+/// opaque window's rect") instead of eyeballing pixels.
+fn scene_elements_json(scene: &Scene) -> String {
+    let mut out = String::with_capacity(scene.elements.len() * 96 + 2);
+    out.push('[');
+    for (i, e) in scene.elements.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let kind = match &e.content {
+            SceneContent::Shm { .. } => "shm",
+            SceneContent::Dmabuf { .. } => "dmabuf",
+            SceneContent::BlurredBackdrop { .. } => "backdrop",
+        };
+        let w = if e.dst_width > 0.0 { e.dst_width } else { e.width as f32 };
+        let h = if e.dst_height > 0.0 { e.dst_height } else { e.height as f32 };
+        out.push_str(&format!(
+            "{{\"kind\":\"{}\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1},\"alpha\":{:.3},\"key\":{},\"bg\":{}}}",
+            kind,
+            e.x,
+            e.y,
+            w,
+            h,
+            e.alpha,
+            e.buffer_key,
+            i < scene.background_count,
+        ));
+    }
+    out.push(']');
+    out
+}
+
 fn record_scanout_release(
     device: &ash::Device,
     cb: vk::CommandBuffer,

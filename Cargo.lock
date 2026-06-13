@@ -982,6 +982,7 @@ dependencies = [
  "calloop",
  "drm",
  "gbm",
+ "png",
  "rustix 0.38.44",
  "smithay",
  "sol-core",

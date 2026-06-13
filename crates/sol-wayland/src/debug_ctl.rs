@@ -219,6 +219,31 @@ enum Command {
     },
     Snapshot,
     Shutdown,
+    /// Arm the frame-capture dashcam (DRM backend only).
+    CaptureStart {
+        /// Capture every Nth rendered frame into the RAM ring.
+        #[serde(default = "default_capture_every")]
+        every: u32,
+        /// Streaming tier rate in Hz (0 = ring-only).
+        #[serde(default = "default_capture_hz")]
+        persist_hz: f32,
+        /// Seconds of history `capture_mark` preserves.
+        #[serde(default = "default_capture_ring_seconds")]
+        ring_seconds: f32,
+    },
+    CaptureStop,
+    CaptureMark,
+    CaptureStatus,
+}
+
+fn default_capture_every() -> u32 {
+    2
+}
+fn default_capture_hz() -> f32 {
+    10.0
+}
+fn default_capture_ring_seconds() -> f32 {
+    2.0
 }
 
 #[derive(Serialize)]
@@ -226,6 +251,8 @@ struct Response {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<MetricsDump>,
 }
@@ -360,6 +387,38 @@ fn dispatch(line: &str, comp: &mut Compositor) -> String {
             }
             resp
         }
+        Command::CaptureStart { every, persist_hz, ring_seconds } => {
+            match &mut comp.backend {
+                crate::BackendState::Drm(p) => {
+                    match p.capture_start(every, persist_hz, ring_seconds) {
+                        Ok(status) => ok_msg(status),
+                        Err(e) => err_response(format!("capture_start: {e}")),
+                    }
+                }
+                _ => err_response("capture requires the DRM backend".into()),
+            }
+        }
+        Command::CaptureStop => match &mut comp.backend {
+            crate::BackendState::Drm(p) => {
+                let was = p.capture_stop();
+                ok_msg(format!("capture {}", if was { "stopped" } else { "was not running" }))
+            }
+            _ => err_response("capture requires the DRM backend".into()),
+        },
+        Command::CaptureMark => match &mut comp.backend {
+            crate::BackendState::Drm(p) => match p.capture_mark() {
+                Some(n) => ok_msg(format!("dumped {n} ring frames")),
+                None => err_response("capture not armed".into()),
+            },
+            _ => err_response("capture requires the DRM backend".into()),
+        },
+        Command::CaptureStatus => match &comp.backend {
+            crate::BackendState::Drm(p) => match p.capture_status() {
+                Some(s) => ok_msg(s),
+                None => ok_msg("capture not armed".into()),
+            },
+            _ => err_response("capture requires the DRM backend".into()),
+        },
     }
 }
 
@@ -374,11 +433,28 @@ fn parse_dir(s: &str) -> Result<config::Direction, String> {
 }
 
 fn ok_response() -> String {
-    serde_json::to_string(&Response { ok: true, error: None, metrics: None }).unwrap()
+    serde_json::to_string(&Response { ok: true, error: None, message: None, metrics: None })
+        .unwrap()
+}
+
+fn ok_msg(msg: String) -> String {
+    serde_json::to_string(&Response {
+        ok: true,
+        error: None,
+        message: Some(msg),
+        metrics: None,
+    })
+    .unwrap()
 }
 
 fn err_response(msg: String) -> String {
-    serde_json::to_string(&Response { ok: false, error: Some(msg), metrics: None }).unwrap()
+    serde_json::to_string(&Response {
+        ok: false,
+        error: Some(msg),
+        message: None,
+        metrics: None,
+    })
+    .unwrap()
 }
 
 fn snapshot_response(comp: &Compositor) -> String {
@@ -438,5 +514,11 @@ fn snapshot_response(comp: &Compositor) -> String {
         mapped_toplevels: comp.state.mapped_toplevels.len(),
         mapped_dialogs: comp.state.mapped_dialogs.len(),
     };
-    serde_json::to_string(&Response { ok: true, error: None, metrics: Some(dump) }).unwrap()
+    serde_json::to_string(&Response {
+        ok: true,
+        error: None,
+        message: None,
+        metrics: Some(dump),
+    })
+    .unwrap()
 }

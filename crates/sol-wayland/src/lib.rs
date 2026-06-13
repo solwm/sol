@@ -390,6 +390,10 @@ pub struct State {
     /// nothing actually paces off it there.
     pub screen_refresh_mhz: i32,
     pub needs_render: bool,
+    /// Set by the `capture_mark` keybind; consumed by `render_tick`,
+    /// which forwards it to the DRM presenter's capture ring (the
+    /// keybind dispatch only sees `&mut State`, not the backend).
+    pub capture_mark_requested: bool,
     /// Owned fence FD produced by the most recent DRM render, parked
     /// here in transit between `render_tick_inner` (which can't
     /// register a calloop source while it holds `&mut comp.backend`)
@@ -4981,6 +4985,18 @@ fn focus_border(state: &State) -> Vec<sol_core::SceneBorder> {
 }
 
 fn render_tick(comp: &mut Compositor) -> Result<()> {
+    // Forward a pending capture-mark keypress to the presenter's
+    // ring before anything else — the user wants the frames that led
+    // *up to* this moment, so dump before this tick renders new ones.
+    if comp.state.capture_mark_requested {
+        comp.state.capture_mark_requested = false;
+        if let BackendState::Drm(p) = &mut comp.backend {
+            match p.capture_mark() {
+                Some(n) => tracing::info!(frames = n, "capture_mark keybind: ring dumped"),
+                None => tracing::warn!("capture_mark keybind: capture not armed"),
+            }
+        }
+    }
     // If a page flip is already in flight, skip this tick and re-arm
     // `needs_render` so the next loop iteration retries once the flip
     // lands. Pre-idle-skip the page-flip handler set `needs_render`
@@ -5895,6 +5911,7 @@ fn setup_event_loop(
         screen_height,
         screen_refresh_mhz,
         needs_render: false,
+        capture_mark_requested: false,
         pending_fence_fd: None,
         started: Instant::now(),
         cursor,
@@ -6358,6 +6375,12 @@ fn apply_input(state: &mut State, ev: InputEvent<LibinputInputBackend>) {
                         }
                         config::Action::ToggleZoom => {
                             toggle_zoom(state);
+                        }
+                        config::Action::CaptureMark => {
+                            // The presenter lives on Compositor, not
+                            // State — flag it; render_tick forwards.
+                            state.capture_mark_requested = true;
+                            state.needs_render = true;
                         }
                         config::Action::ResizeMode => {
                             state.resize_mode = true;

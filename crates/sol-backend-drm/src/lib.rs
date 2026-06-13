@@ -34,6 +34,7 @@ use smithay::utils::DeviceFd;
 
 mod presenter;
 mod vk_blur;
+mod vk_capture;
 mod vk_perf;
 mod vk_pipe;
 mod vk_stack;

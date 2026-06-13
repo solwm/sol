@@ -243,7 +243,9 @@ fn import_dmabuf_image(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        // TRANSFER_SRC: the capture ring blits a downscaled copy of
+        // the finished frame out of the scan-out image (vk_capture).
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut modifier_info)

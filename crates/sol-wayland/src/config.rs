@@ -338,6 +338,10 @@ pub enum Action {
     /// so the user can rapid-fire adjustments without accidentally
     /// typing into whatever's focused.
     ResizeMode,
+    /// Dump the frame-capture ring to disk (the "I just saw a glitch"
+    /// button — see vk_capture in the DRM backend). No-op unless
+    /// capture was armed via debug-ctl.
+    CaptureMark,
     /// Ask the focused toplevel to close via `xdg_toplevel.close`.
     /// The client decides what to do (terminals exit, text editors
     /// may prompt to save, etc.). If a client ignores the request
@@ -876,6 +880,7 @@ fn parse_action(kind: &str, args: &str) -> Result<Action> {
         "toggle_zoom" => Ok(Action::ToggleZoom),
         "toggle_fullscreen" => Ok(Action::ToggleFullscreen),
         "resize_mode" => Ok(Action::ResizeMode),
+        "capture_mark" => Ok(Action::CaptureMark),
         "close_window" => Ok(Action::CloseWindow),
         "workspace" => Ok(Action::Workspace(parse_workspace_num(args)?)),
         "move_to_workspace" => Ok(Action::MoveToWorkspace(parse_workspace_num(args)?)),
