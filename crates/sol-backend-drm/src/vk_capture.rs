@@ -451,6 +451,7 @@ fn spawn_writer(dir: std::path::PathBuf) -> mpsc::Sender<WriteJob> {
                 let row = format!(
                     concat!(
                         "{{\"frame\":{},\"t_ms\":{:.3},\"file\":\"{}\",",
+                        "\"src\":[{},{}],\"cap\":[{},{}],",
                         "\"cpu_ns\":{{\"textures\":{},\"blur\":{},\"draw\":{}}},",
                         "\"gpu_ns\":{{\"uploads\":{},\"blur\":{},\"draw\":{},\"total\":{}}},",
                         "\"shm_upload_bytes\":{},\"shm_skipped_bytes\":{},",
