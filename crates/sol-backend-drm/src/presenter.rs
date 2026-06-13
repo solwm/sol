@@ -863,7 +863,18 @@ impl DrmPresenter {
         for (idx, elem) in scene.elements.iter().enumerate() {
             if !borders_drawn && idx == border_anchor && !scene.borders.is_empty() {
                 unsafe { device.cmd_end_rendering(self.command_buffer) };
+                // Render-pass instances do NOT implicitly synchronize
+                // attachment access against each other. Without this
+                // barrier the borders pass (and the resumed main pass
+                // below) can read-modify-write the attachment before
+                // this pass's writes are visible — on NVIDIA's tiler
+                // the blend reads the *cleared* value for the
+                // last-flushed (bottom) tiles, which shows through any
+                // fractional-alpha draw as clear-color bleed. See
+                // doc/nvidia-rendering.md.
+                self.color_attachment_rmw_barrier(slot_idx);
                 self.draw_solid_borders_pass(slot_idx, &scene.borders, timing);
+                self.color_attachment_rmw_barrier(slot_idx);
                 // Re-begin the colour attachment for the rest of the
                 // scene. LOAD = LOAD so we keep what we drew.
                 let attachment = vk::RenderingAttachmentInfo::default()
@@ -947,9 +958,40 @@ impl DrmPresenter {
 
         // Border fallback: anchor was past the last element / not set.
         if !borders_drawn && !scene.borders.is_empty() {
+            self.color_attachment_rmw_barrier(slot_idx);
             self.draw_solid_borders_pass(slot_idx, &scene.borders, timing);
         }
         Ok(())
+    }
+
+    /// Memory dependency between two render-pass instances that touch
+    /// the same scan-out image. The border interleave splits the main
+    /// pass into separate `begin_rendering`/`end_rendering` instances;
+    /// blending in a later instance read-modify-writes the attachment,
+    /// and that read isn't ordered against the earlier instance's
+    /// writes without this barrier. Same layout in/out (we stay in
+    /// COLOR_ATTACHMENT_OPTIMAL) — it's purely an execution + memory
+    /// dependency, not a transition.
+    fn color_attachment_rmw_barrier(&self, slot_idx: usize) {
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(self.swap.slots[slot_idx].image)
+            .subresource_range(color_range_scanout());
+        let dep =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+        unsafe {
+            self.stack
+                .device
+                .cmd_pipeline_barrier2(self.command_buffer, &dep)
+        };
     }
 
     fn draw_solid_borders_pass(
