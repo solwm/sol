@@ -101,13 +101,52 @@ pixels.
 show frosted rather than sharp wallpaper (~`corner_radius` px), and the
 backdrop no longer fades independently during workspace crossfades.
 
-**Known residual:** minor traces of the defect can still appear from
-the remaining fractional-alpha blended draws — subsurfaces of inactive
-windows, focus-border fades, open/close animations, the software
-cursor. If they ever bother anyone, the same treatment applies:
-composite in-shader against a sampled background, write opaque. The
-ultimate version is niri-sol's: route every fractional-alpha tile
-through an offscreen and never blend against the framebuffer at all.
+**This was a partial fix on a wrong diagnosis.** Removing blended draws
+made the artifact rarer, which *looked* like progress and reinforced
+the "blended-RMW hardware defect" theory. But it persisted: with blur
+off entirely (plain transparent quad, no frosted path at all) the
+clear-color bleed still appeared at the bottom of inactive windows
+during motion. niri-sol's manual-blend-offscreen genuinely is the GL
+analogue of this defect, but our renderer had a second, more basic bug
+underneath — see Layer 4.
+
+## Layer 4: the actual root cause — missing render-pass barrier
+
+**Symptom:** identical to Layer 3, but reproducible with blur off and
+any fractional `inactive_alpha`. The frame-capture dashcam
+(`bench/triage.py`) was decisive here: it found the bleed pixels were
+the **exact** clear color (`#05050A`, tolerance 2), not torn or stale
+*content*. Exact clear value = the cleared framebuffer read back before
+anything was drawn over it — which points at a pass-ordering bug, not a
+buffer-sync or hardware-blend bug.
+
+**Cause:** `draw_main_pass` doesn't render in one pass. The focus-border
+interleave splits it into three sequential dynamic-rendering instances
+on the *same* scan-out image — clear+wallpaper+early windows, then
+borders (LOAD), then the remaining windows (LOAD) — with **no memory
+dependency between them**. Vulkan render-pass instances do not
+implicitly synchronize attachment access against each other; an
+explicit barrier is required. Without it, the alpha blend in a later
+instance read-modify-writes the attachment before the earlier
+instance's writes are visible. On NVIDIA's tiler the blend reads the
+cleared value for the last-flushed (bottom) tiles. Opaque draws hid it
+(dst blend factor `ONE_MINUS_SRC_ALPHA` = 0 when alpha = 1); only
+fractional alpha weighted the stale read in — exactly the
+`inactive_alpha` bisection. Invisible on Mesa, whose tiler/ROP flush
+masks the UB.
+
+**Fix:** a `COLOR_ATTACHMENT_OUTPUT` self-dependency barrier
+(`presenter.rs::color_attachment_rmw_barrier`) at each pass boundary in
+`draw_main_pass`. Verified objectively: same provocation, same triage
+parameters, 20 clear-bleed findings → 0. Costs ~nothing (three barriers
+per frame; CPU tick 0.09 ms, GPU 0.60 ms, still 240 fps).
+
+**Lesson:** "rarer after the change" is not "fixed," and a plausible
+prior (the documented niri-sol hardware defect) delayed finding the
+real bug. The exact-clear-color observation — only possible once the
+capture tooling existed — is what finally discriminated a Vulkan
+synchronization bug from a hardware blend quirk. Reach for objective
+pixel evidence before committing to a hardware-quirk explanation.
 
 ## Debugging notes for next time
 
